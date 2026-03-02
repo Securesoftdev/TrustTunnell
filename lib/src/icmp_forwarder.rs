@@ -332,10 +332,7 @@ impl datagram_pipe::Sink for IcmpSink {
             .allow_private_network_connections
             && !net_utils::is_global_ip(&peer_ip)
         {
-            debug!(
-                "Dropping ICMP to non-routable destination: {}",
-                peer_ip
-            );
+            debug!("Dropping ICMP to non-routable destination: {}", peer_ip);
             return Ok(datagram_pipe::SendStatus::Dropped);
         }
 

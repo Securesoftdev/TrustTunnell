@@ -593,7 +593,8 @@ pub(crate) const fn is_global_ipv6(ip: &Ipv6Addr) -> bool {
     }
 }
 
-/// Converts an IPv6-mapped IPv4 address (`::ffff:a.b.c.d`) to a plain `IpAddr::V4`.
+/// Converts an IPv4-mapped (`::ffff:a.b.c.d`) or IPv4-compatible (`::a.b.c.d`)
+/// IPv6 address to a plain `IpAddr::V4`.
 ///
 /// When the endpoint listens on `[::]` with `IPV6_V6ONLY=false`, the OS presents
 /// incoming IPv4 connections as IPv6-mapped addresses. This function unmaps them so
@@ -603,7 +604,7 @@ pub(crate) const fn is_global_ipv6(ip: &Ipv6Addr) -> bool {
 #[inline]
 pub(crate) fn unmap_ipv6(ip: IpAddr) -> IpAddr {
     match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        IpAddr::V6(v6) => extract_ipv4_from_ipv6(&v6).map(IpAddr::V4).unwrap_or(ip),
         v4 => v4,
     }
 }
@@ -613,12 +614,8 @@ pub(crate) fn unmap_ipv6(ip: IpAddr) -> IpAddr {
 const fn extract_ipv4_from_ipv6(ip: &Ipv6Addr) -> Option<Ipv4Addr> {
     let seg = ip.segments();
     // IPv4-mapped: ::ffff:x.x.x.x  →  [0,0,0,0,0,0xffff,hi,lo]
-    let is_mapped = seg[0] == 0
-        && seg[1] == 0
-        && seg[2] == 0
-        && seg[3] == 0
-        && seg[4] == 0
-        && seg[5] == 0xffff;
+    let is_mapped =
+        seg[0] == 0 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0xffff;
     // IPv4-compatible (deprecated): ::x.x.x.x  →  [0,0,0,0,0,0,hi,lo]
     // Exclude :: (unspecified) and ::1 (loopback) which are native IPv6.
     let is_compat = seg[0] == 0
@@ -853,8 +850,7 @@ mod tests {
     #[test]
     fn is_global_ip_blocks_ipv4_compatible_private() {
         // ::192.168.1.1 — IPv4-compatible (deprecated) private address
-        let compat_private: IpAddr =
-            IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0xc0a8, 0x0101));
+        let compat_private: IpAddr = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0xc0a8, 0x0101));
         assert!(!is_global_ip(&compat_private));
 
         // ::10.0.0.1 — IPv4-compatible 10.x
@@ -941,5 +937,13 @@ mod tests {
         use std::net::IpAddr;
         let v4: IpAddr = "1.2.3.4".parse().unwrap();
         assert_eq!(super::unmap_ipv6(v4), v4);
+    }
+
+    #[test]
+    fn test_unmap_ipv6_ipv4_compatible() {
+        use std::net::{IpAddr, Ipv6Addr};
+        // IPv4-compatible address ::192.168.1.1
+        let compat: IpAddr = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0xc0a8, 0x0101));
+        assert_eq!(super::unmap_ipv6(compat), IpAddr::from([192, 168, 1, 1]));
     }
 }
