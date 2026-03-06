@@ -51,6 +51,7 @@ fn compose_main_table(settings: &Settings, credentials_path: &str, rules_path: &
     } else {
         doc.remove("ping_path");
     }
+    doc["auth_failure_status_code"] = value(*settings.get_auth_failure_status_code() as i64);
 
     doc.to_string()
 }

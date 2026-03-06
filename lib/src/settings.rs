@@ -34,6 +34,8 @@ pub enum ValidationError {
     RulesFile(String),
     /// No credentials configured while listening on a public address
     NoCredentialsOnPublicAddress,
+    /// Invalid auth failure status code
+    InvalidAuthFailureStatusCode(u16),
 }
 
 impl Debug for ValidationError {
@@ -51,6 +53,11 @@ impl Debug for ValidationError {
                 f,
                 "No credentials configured (credentials_file is missing) while listening on a public address. \
                 This is a security risk. Either configure credentials or use a loopback address (127.0.0.1 or ::1)"
+            ),
+            Self::InvalidAuthFailureStatusCode(code) => write!(
+                f,
+                "Invalid auth_failure_status_code: {}. Supported values: 407, 405",
+                code
             ),
         }
     }
@@ -190,6 +197,12 @@ pub struct Settings {
     /// Optional path prefix for speedtest requests on main hosts.
     #[serde(default = "Settings::default_speedtest_path")]
     pub(crate) speedtest_path: Option<String>,
+
+    /// HTTP status code returned on authentication failure.
+    /// Supported values: 407 (Proxy Authentication Required) or 405 (Method Not Allowed).
+    #[serde(default = "Settings::default_auth_failure_status_code")]
+    pub(crate) auth_failure_status_code: u16,
+
     /// Default maximum number of simultaneous HTTP/1 and HTTP/2 connections per client credentials.
     /// TrustTunnel clients open 8 HTTP/2 connections by default, so set this to
     /// `8 * <max_devices>` to limit the number of simultaneously connected devices.
@@ -527,6 +540,12 @@ impl Settings {
             return Err(ValidationError::NoCredentialsOnPublicAddress);
         }
 
+        if self.auth_failure_status_code != 407 && self.auth_failure_status_code != 405 {
+            return Err(ValidationError::InvalidAuthFailureStatusCode(
+                self.auth_failure_status_code,
+            ));
+        }
+
         Ok(())
     }
 
@@ -576,6 +595,10 @@ impl Settings {
 
     pub fn default_ping_path() -> Option<String> {
         Some("/ping".to_string())
+    }
+
+    pub fn default_auth_failure_status_code() -> u16 {
+        407
     }
 
     fn validate_request_path(name: &str, path: &Option<String>) -> Result<(), ValidationError> {
@@ -632,6 +655,7 @@ impl Default for Settings {
             speedtest_path: None,
             default_max_http2_conns_per_client: None,
             default_max_http3_conns_per_client: None,
+            auth_failure_status_code: Settings::default_auth_failure_status_code(),
             built: false,
         }
     }
@@ -891,6 +915,7 @@ impl SettingsBuilder {
                 speedtest_path: Settings::default_speedtest_path(),
                 default_max_http2_conns_per_client: None,
                 default_max_http3_conns_per_client: None,
+                auth_failure_status_code: Settings::default_auth_failure_status_code(),
                 built: true,
             },
         }
@@ -1021,6 +1046,12 @@ impl SettingsBuilder {
     /// Set the default maximum HTTP/3 connections per client credentials
     pub fn default_max_http3_conns_per_client(mut self, x: Option<u32>) -> Self {
         self.settings.default_max_http3_conns_per_client = x;
+        self
+    }
+
+    /// Set the HTTP status code for authentication failures (407 or 405)
+    pub fn auth_failure_status_code(mut self, x: u16) -> Self {
+        self.settings.auth_failure_status_code = x;
         self
     }
 
@@ -1637,4 +1668,43 @@ where
 
 fn demangle_toml_string(x: String) -> String {
     x.replace('"', "").trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_auth_failure_status_code_is_407() {
+        let settings = Settings::default();
+        assert_eq!(settings.auth_failure_status_code, 407);
+    }
+
+    #[test]
+    fn auth_failure_status_code_407_valid() {
+        let mut settings = Settings::default();
+        settings.auth_failure_status_code = 407;
+        settings.listen_address = (Ipv4Addr::LOCALHOST, 8443).into();
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn auth_failure_status_code_405_valid() {
+        let mut settings = Settings::default();
+        settings.auth_failure_status_code = 405;
+        settings.listen_address = (Ipv4Addr::LOCALHOST, 8443).into();
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn auth_failure_status_code_200_invalid() {
+        let mut settings = Settings::default();
+        settings.auth_failure_status_code = 200;
+        settings.listen_address = (Ipv4Addr::LOCALHOST, 8443).into();
+        let err = settings.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ValidationError::InvalidAuthFailureStatusCode(200)
+        ));
+    }
 }

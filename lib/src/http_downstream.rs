@@ -22,7 +22,6 @@ const HEALTH_CHECK_AUTHORITY: &str = "_check";
 const UDP_AUTHORITY: &str = "_udp2";
 const ICMP_AUTHORITY: &str = "_icmp";
 
-const AUTHORIZATION_FAILURE_STATUS_CODE: StatusCode = StatusCode::PROXY_AUTHENTICATION_REQUIRED;
 const AUTHORIZATION_FAILURE_EXTRA_HEADER: (&str, &str) =
     ("proxy-authenticate", "Basic realm=Authorization Required");
 
@@ -40,11 +39,13 @@ pub(crate) struct HttpDownstream {
 struct TcpConnection {
     stream: Box<dyn http_codec::Stream>,
     id: log_utils::IdChain<u64>,
+    auth_failure_status_code: StatusCode,
 }
 
 struct DatagramMultiplexer {
     stream: Box<dyn http_codec::Stream>,
     id: log_utils::IdChain<u64>,
+    auth_failure_status_code: StatusCode,
 }
 
 struct DatagramEncoder<D> {
@@ -61,6 +62,7 @@ struct DatagramDecoder<D> {
 struct PendingRequest {
     stream: Box<dyn http_codec::Stream>,
     id: log_utils::IdChain<u64>,
+    auth_failure_status_code: StatusCode,
 }
 
 impl HttpDownstream {
@@ -112,9 +114,13 @@ impl Downstream for HttpDownstream {
             match channel {
                 net_utils::Channel::Tunnel => {
                     log_id!(trace, stream_id, "HTTP downstream: tunnel request");
+                    let auth_failure_status_code =
+                        StatusCode::from_u16(self.context.settings.auth_failure_status_code)
+                            .unwrap_or(StatusCode::PROXY_AUTHENTICATION_REQUIRED);
                     return Ok(Some(Box::new(PendingRequest {
                         stream,
                         id: stream_id,
+                        auth_failure_status_code,
                     })));
                 }
                 net_utils::Channel::Ping => {
@@ -202,7 +208,7 @@ impl downstream::PendingRequest for TcpConnection {
     }
 
     fn fail_request(self: Box<Self>, error: tunnel::ConnectionError) {
-        fail_request_with_error(self.stream, error);
+        fail_request_with_error(self.stream, error, self.auth_failure_status_code);
     }
 }
 
@@ -262,6 +268,7 @@ impl downstream::PendingRequest for PendingRequest {
                         DatagramMultiplexer {
                             stream: self.stream,
                             id: self.id,
+                            auth_failure_status_code: self.auth_failure_status_code,
                         },
                     )),
                 ))
@@ -275,13 +282,14 @@ impl downstream::PendingRequest for PendingRequest {
                 Box::new(TcpConnection {
                     stream: self.stream,
                     id: self.id,
+                    auth_failure_status_code: self.auth_failure_status_code,
                 }),
             ))),
         }
     }
 
     fn fail_request(self: Box<Self>, error: tunnel::ConnectionError) {
-        fail_request_with_error(self.stream, error);
+        fail_request_with_error(self.stream, error, self.auth_failure_status_code);
     }
 }
 
@@ -325,7 +333,7 @@ impl downstream::PendingRequest for DatagramMultiplexer {
     }
 
     fn fail_request(self: Box<Self>, error: tunnel::ConnectionError) {
-        fail_request_with_error(self.stream, error);
+        fail_request_with_error(self.stream, error, self.auth_failure_status_code);
     }
 }
 
@@ -395,9 +403,12 @@ impl<D: Send> datagram_pipe::Sink for DatagramEncoder<D> {
     }
 }
 
-fn tunnel_error_to_status_code(error: &tunnel::ConnectionError) -> StatusCode {
+fn tunnel_error_to_status_code(
+    error: &tunnel::ConnectionError,
+    auth_failure_status_code: StatusCode,
+) -> StatusCode {
     match error {
-        tunnel::ConnectionError::Authentication(_) => AUTHORIZATION_FAILURE_STATUS_CODE,
+        tunnel::ConnectionError::Authentication(_) => auth_failure_status_code,
         _ => BAD_STATUS_CODE,
     }
 }
@@ -405,16 +416,23 @@ fn tunnel_error_to_status_code(error: &tunnel::ConnectionError) -> StatusCode {
 fn tunnel_error_to_warn_header(
     error: &tunnel::ConnectionError,
     hostname: &str,
+    auth_failure_status_code: StatusCode,
 ) -> Vec<(String, String)> {
     match error {
         tunnel::ConnectionError::Io(_) => vec![(
             WARNING_HEADER_NAME.to_string(),
             "300 - Connection failed for some reason".to_string(),
         )],
-        tunnel::ConnectionError::Authentication(_) => vec![(
-            AUTHORIZATION_FAILURE_EXTRA_HEADER.0.to_string(),
-            AUTHORIZATION_FAILURE_EXTRA_HEADER.1.to_string(),
-        )],
+        tunnel::ConnectionError::Authentication(_) => {
+            if auth_failure_status_code == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+                vec![(
+                    AUTHORIZATION_FAILURE_EXTRA_HEADER.0.to_string(),
+                    AUTHORIZATION_FAILURE_EXTRA_HEADER.1.to_string(),
+                )]
+            } else {
+                vec![]
+            }
+        }
         tunnel::ConnectionError::Timeout => {
             vec![(WARNING_HEADER_NAME.to_string(), format!("302 - {}", error))]
         }
@@ -447,9 +465,21 @@ fn fail_request(
     }
 }
 
-fn fail_request_with_error(stream: Box<dyn http_codec::Stream>, error: tunnel::ConnectionError) {
-    let extra_headers = tunnel_error_to_warn_header(&error, request_hostname(stream.request()));
-    fail_request(stream, tunnel_error_to_status_code(&error), extra_headers);
+fn fail_request_with_error(
+    stream: Box<dyn http_codec::Stream>,
+    error: tunnel::ConnectionError,
+    auth_failure_status_code: StatusCode,
+) {
+    let extra_headers = tunnel_error_to_warn_header(
+        &error,
+        request_hostname(stream.request()),
+        auth_failure_status_code,
+    );
+    fail_request(
+        stream,
+        tunnel_error_to_status_code(&error, auth_failure_status_code),
+        extra_headers,
+    );
 }
 
 fn request_hostname(request: &dyn http_codec::PendingRequest) -> &str {
@@ -457,4 +487,55 @@ fn request_hostname(request: &dyn http_codec::PendingRequest) -> &str {
         .authority()
         .map(http::uri::Authority::as_str)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tunnel_error_to_status_code_default_407() {
+        let status_code = StatusCode::PROXY_AUTHENTICATION_REQUIRED;
+        let error = tunnel::ConnectionError::Authentication("bad creds".into());
+        assert_eq!(
+            tunnel_error_to_status_code(&error, status_code),
+            StatusCode::PROXY_AUTHENTICATION_REQUIRED
+        );
+    }
+
+    #[test]
+    fn tunnel_error_to_status_code_configured_405() {
+        let status_code = StatusCode::METHOD_NOT_ALLOWED;
+        let error = tunnel::ConnectionError::Authentication("bad creds".into());
+        assert_eq!(
+            tunnel_error_to_status_code(&error, status_code),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+    }
+
+    #[test]
+    fn tunnel_error_to_status_code_non_auth_error_unaffected() {
+        let error = tunnel::ConnectionError::Timeout;
+        assert_eq!(
+            tunnel_error_to_status_code(&error, StatusCode::METHOD_NOT_ALLOWED),
+            BAD_STATUS_CODE
+        );
+    }
+
+    #[test]
+    fn warn_header_includes_proxy_authenticate_for_407() {
+        let status_code = StatusCode::PROXY_AUTHENTICATION_REQUIRED;
+        let error = tunnel::ConnectionError::Authentication("bad creds".into());
+        let headers = tunnel_error_to_warn_header(&error, "example.com", status_code);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, "proxy-authenticate");
+    }
+
+    #[test]
+    fn warn_header_empty_for_405() {
+        let status_code = StatusCode::METHOD_NOT_ALLOWED;
+        let error = tunnel::ConnectionError::Authentication("bad creds".into());
+        let headers = tunnel_error_to_warn_header(&error, "example.com", status_code);
+        assert!(headers.is_empty());
+    }
 }

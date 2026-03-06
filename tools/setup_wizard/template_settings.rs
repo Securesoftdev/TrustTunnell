@@ -76,6 +76,9 @@ ping_enable = {}
 
 {}
 ping_path = "{}"
+
+{}
+auth_failure_status_code = {}
 "#,
         Settings::doc_listen_address().to_toml_comment(),
         crate::library_settings::DEFAULT_CREDENTIALS_PATH,
@@ -106,6 +109,8 @@ ping_path = "{}"
         Settings::default_ping_enable(),
         Settings::doc_ping_path().to_toml_comment(),
         Settings::default_ping_path().unwrap(),
+        Settings::doc_auth_failure_status_code().to_toml_comment(),
+        Settings::default_auth_failure_status_code(),
     )
 });
 
