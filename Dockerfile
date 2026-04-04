@@ -1,42 +1,47 @@
 # syntax=docker/dockerfile:1
-FROM python:3.13-slim-bullseye AS build
+
+FROM rust:1.85-bookworm AS build
 ARG ENDPOINT_DIR_NAME="TrustTunnel"
-ARG RUST_DEFAULT_VERSION="1.85"
-WORKDIR /home
-# Install needed packets
-RUN apt update && \
-    apt install -y build-essential cmake curl make git libclang-dev
-# Install Rust and Cargo
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain $RUST_DEFAULT_VERSION -y
-ENV PATH="/root/.cargo/bin:$PATH"
-# Copy source files
-WORKDIR $ENDPOINT_DIR_NAME
-COPY deeplink/ ./deeplink
-COPY endpoint/ ./endpoint
-COPY lib/ ./lib
-COPY macros/ ./macros
-COPY tools/ ./tools
+WORKDIR /home/${ENDPOINT_DIR_NAME}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    clang \
+    libclang-dev \
+    pkg-config \
+    perl \
+    make \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY Cargo.toml Cargo.lock rust-toolchain.toml Makefile ./
-# Build
-RUN make endpoint/build
-RUN make endpoint/build-wizard
+COPY deeplink ./deeplink
+COPY endpoint ./endpoint
+COPY lib ./lib
+COPY macros ./macros
+COPY tools ./tools
 
-# Copy binaries
+RUN cargo build --release --bin trusttunnel_endpoint --bin setup_wizard --bin classic_agent
+
 FROM debian:bookworm-slim AS trusttunnel-endpoint
-ARG ENDPOINT_DIR_NAME="TrustTunnel"
-ARG LOG_LEVEL="info"
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates iproute2 && rm -rf /var/lib/apt/lists/*
-COPY --from=build /home/$ENDPOINT_DIR_NAME/target/release/setup_wizard /bin/
-COPY --from=build /home/$ENDPOINT_DIR_NAME/target/release/trusttunnel_endpoint /bin/
-COPY --chmod=755  /docker-entrypoint.sh /scripts/
-WORKDIR /trusttunnel_endpoint
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    iproute2 \
+    && rm -rf /var/lib/apt/lists/*
 
-# Persist endpoint state/configuration under this directory:
-# - vpn.toml
-# - hosts.toml
-# - credentials.toml
-# - rules.toml
-# - certs/
+COPY --from=build /home/TrustTunnel/target/release/setup_wizard /bin/
+COPY --from=build /home/TrustTunnel/target/release/trusttunnel_endpoint /bin/
+COPY --chmod=755 /docker-entrypoint.sh /scripts/
+
+WORKDIR /trusttunnel_endpoint
 VOLUME /trusttunnel_endpoint/
 ENTRYPOINT ["/scripts/docker-entrypoint.sh"]
 
+FROM debian:bookworm-slim AS trusttunnel-classic-agent
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /home/TrustTunnel/target/release/classic_agent /bin/
+WORKDIR /runtime
+ENTRYPOINT ["/bin/classic_agent"]
