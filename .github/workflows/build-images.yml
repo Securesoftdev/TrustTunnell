@@ -16,13 +16,62 @@ on:
     types: [opened, reopened, synchronize]
   workflow_dispatch:
 
+env:
+  REGISTRY: docker.io
+  IMAGE_NAMESPACE: jah0x
+
 jobs:
   docker-images:
     runs-on: ubuntu-latest
-    if: "!startsWith(github.event.head_commit.message, 'skipci:')"
+    if: github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'skipci:')
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
-      - name: Build endpoint image target
-        run: docker build --target trusttunnel-endpoint .
-      - name: Build classic agent image target
-        run: docker build --target trusttunnel-classic-agent .
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ env.IMAGE_NAMESPACE }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract endpoint image metadata
+        id: endpoint-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/trusttunnel-endpoint
+          tags: |
+            type=sha,format=short,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build endpoint image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: trusttunnel-endpoint
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.endpoint-meta.outputs.tags }}
+          labels: ${{ steps.endpoint-meta.outputs.labels }}
+
+      - name: Extract classic agent image metadata
+        id: classic-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/trusttunnel-classic-agent
+          tags: |
+            type=sha,format=short,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build classic agent image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: trusttunnel-classic-agent
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.classic-meta.outputs.tags }}
+          labels: ${{ steps.classic-meta.outputs.labels }}
