@@ -445,3 +445,35 @@ Stay tuned for this feature in upcoming releases.
 ## License
 
 This project is licensed under the Apache 2.0 License. See [LICENSE](LICENSE) for details.
+
+## Production container image targets
+
+Repository Docker build has two production targets:
+
+- Endpoint image target: `trusttunnel-endpoint`
+- Classic agent image target: `trusttunnel-classic-agent`
+
+Build commands:
+
+```sh
+docker build --target trusttunnel-endpoint -t trusttunnel-endpoint:local .
+docker build --target trusttunnel-classic-agent -t trusttunnel-classic-agent:local .
+```
+
+Classic agent required environment variables:
+
+- `LK_INTERNAL_BASE_URL`
+- `INTERNAL_AGENT_TOKEN`
+- `NODE_ID`
+- `TRUSTTUNNEL_TCP_ADDR`
+
+Classic agent optional environment variables:
+
+- `RUNTIME_CREDENTIALS_PATH` (default `credentials.toml`)
+- `AGENT_STATE_PATH` (default `agent_state.json`)
+- `SNAPSHOT_POLL_INTERVAL_SECS` (default `15`)
+- `HEARTBEAT_INTERVAL_SECS` (default `30`)
+- `TRUSTTUNNEL_APPLY_CMD` (command executed after runtime credentials update)
+- `LK_SNAPSHOT_PATH` (default `/internal/vpn/classic/accounts`)
+- `LK_SYNC_REPORT_PATH` (default `/internal/vpn/classic/sync-report`)
+- `LK_HEARTBEAT_PATH` (default `/internal/vpn/classic/heartbeat`)

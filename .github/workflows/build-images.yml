@@ -1,0 +1,28 @@
+name: Build production images
+
+on:
+  push:
+    branches:
+      - "*"
+    paths:
+      - 'Dockerfile'
+      - 'docker-entrypoint.sh'
+      - 'Makefile'
+      - 'endpoint/**'
+      - 'lib/**'
+      - 'tools/**'
+      - '.github/workflows/build-images.yml'
+  pull_request:
+    types: [opened, reopened, synchronize]
+  workflow_dispatch:
+
+jobs:
+  docker-images:
+    runs-on: ubuntu-latest
+    if: "!startsWith(github.event.head_commit.message, 'skipci:')"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build endpoint image target
+        run: docker build --target trusttunnel-endpoint .
+      - name: Build classic agent image target
+        run: docker build --target trusttunnel-classic-agent .

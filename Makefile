@@ -58,6 +58,21 @@ endpoint/gen_client_config:
 endpoint/clean:
 	cargo clean
 
+.PHONY: classic-agent/build
+## Build the classic sidecar/agent
+classic-agent/build:
+	cargo build $(CARGO_BUILD_TYPE) --bin classic_agent
+
+.PHONY: docker/build-endpoint-image
+## Build production endpoint image
+docker/build-endpoint-image:
+	docker build --target trusttunnel-endpoint -t trusttunnel-endpoint:local .
+
+.PHONY: docker/build-classic-agent-image
+## Build production classic agent image
+docker/build-classic-agent-image:
+	docker build --target trusttunnel-classic-agent -t trusttunnel-classic-agent:local .
+
 .PHONY: lint
 lint: lint-md lint-rust
 
