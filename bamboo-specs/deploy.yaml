@@ -278,6 +278,22 @@ Deploy artifacts:
             gh release upload ${TAG} ../build_linux/trusttunnel-v${VERSION}-linux-aarch64-dbgsym.tar.gz
             gh release upload ${TAG} ../build_macos/trusttunnel-v${VERSION}-macos-universal.tar.gz
             gh release upload ${TAG} ../build_macos/trusttunnel-v${VERSION}-macos-universal-dbgsym.tar.gz
+
+            DOCKER_IMAGE_REPO="trusttunnel/trusttunnel-endpoint"
+            DOCKER_IMAGE_VERSION_TAG="${DOCKER_IMAGE_REPO}:${TAG}"
+            DOCKER_IMAGE_LATEST_TAG="${DOCKER_IMAGE_REPO}:latest"
+
+            set +x
+            echo "${bamboo.trusttunnelDockerHubPassword}" | docker login -u "${bamboo.trusttunnelDockerHubUsername}" --password-stdin
+            set -x
+
+            docker buildx create --name trusttunnel-builder --use || docker buildx use trusttunnel-builder
+            docker buildx build \
+                --target trusttunnel-endpoint \
+                --platform linux/amd64,linux/arm64 \
+                -t "${DOCKER_IMAGE_VERSION_TAG}" \
+                -t "${DOCKER_IMAGE_LATEST_TAG}" \
+                --push .
   requirements:
     - adg-privileged-docker
   artifact-subscriptions:
