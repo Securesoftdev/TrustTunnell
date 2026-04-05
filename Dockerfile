@@ -29,8 +29,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /home/TrustTunnel/target/release/setup_wizard /bin/
-COPY --from=build /home/TrustTunnel/target/release/trusttunnel_endpoint /bin/
+COPY --from=build /home/TrustTunnel/target/release/setup_wizard /usr/local/bin/
+COPY --from=build /home/TrustTunnel/target/release/trusttunnel_endpoint /usr/local/bin/
+RUN ln -s /usr/local/bin/trusttunnel_endpoint /usr/local/bin/trusttunnel-endpoint \
+    && ln -s /usr/local/bin/setup_wizard /bin/setup_wizard \
+    && ln -s /usr/local/bin/trusttunnel_endpoint /bin/trusttunnel_endpoint
 COPY --chmod=755 /docker-entrypoint.sh /scripts/
 
 WORKDIR /trusttunnel_endpoint
