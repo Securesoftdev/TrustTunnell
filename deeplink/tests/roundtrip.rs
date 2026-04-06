@@ -1,4 +1,4 @@
-use trusttunnel_deeplink::{decode, encode, DeepLinkConfig, Protocol};
+use trusttunnel_deeplink::{decode, encode, DeepLinkConfig, DeepLinkError, Protocol};
 
 #[test]
 fn test_roundtrip_minimal_config() {
@@ -273,4 +273,100 @@ fn test_invalid_hex_client_random_prefix() {
         .build();
 
     assert!(result.is_err());
+}
+
+#[test]
+fn test_roundtrip_with_server_display_name() {
+    let config = DeepLinkConfig::builder()
+        .hostname("vpn.example.com".to_string())
+        .addresses(vec!["1.2.3.4:443".to_string()])
+        .username("user".to_string())
+        .password("pass".to_string())
+        .server_display_name(Some("My VPN Server".to_string()))
+        .build()
+        .unwrap();
+
+    let uri = encode(&config).unwrap();
+    let decoded = decode(&uri).unwrap();
+
+    assert_eq!(
+        decoded.server_display_name,
+        Some("My VPN Server".to_string())
+    );
+}
+
+#[test]
+fn test_roundtrip_with_dns_servers() {
+    let config = DeepLinkConfig::builder()
+        .hostname("vpn.example.com".to_string())
+        .addresses(vec!["1.2.3.4:443".to_string()])
+        .username("user".to_string())
+        .password("pass".to_string())
+        .dns_servers(vec![
+            "1.1.1.1".to_string(),
+            "tls://dns.example.com".to_string(),
+            "https://dns.example.com/dns-query".to_string(),
+        ])
+        .build()
+        .unwrap();
+
+    let uri = encode(&config).unwrap();
+    let decoded = decode(&uri).unwrap();
+
+    assert_eq!(
+        decoded.dns_servers,
+        vec![
+            "1.1.1.1",
+            "tls://dns.example.com",
+            "https://dns.example.com/dns-query"
+        ]
+    );
+}
+
+#[test]
+fn test_roundtrip_without_new_optional_fields() {
+    let config = DeepLinkConfig::builder()
+        .hostname("vpn.example.com".to_string())
+        .addresses(vec!["1.2.3.4:443".to_string()])
+        .username("user".to_string())
+        .password("pass".to_string())
+        .build()
+        .unwrap();
+
+    let uri = encode(&config).unwrap();
+    let decoded = decode(&uri).unwrap();
+
+    assert_eq!(decoded.server_display_name, None);
+    assert!(decoded.dns_servers.is_empty());
+}
+
+#[test]
+fn test_unsupported_version_rejected() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use trusttunnel_deeplink::encode_varint;
+
+    // Build a payload with version=99 (unsupported)
+    let mut payload = Vec::new();
+    // Tag 0x00 (Version)
+    payload.extend(encode_varint(0x00).unwrap());
+    let version_bytes = encode_varint(99).unwrap();
+    payload.extend(encode_varint(version_bytes.len() as u64).unwrap());
+    payload.extend(&version_bytes);
+    // Tag 0x01 (Hostname)
+    payload.extend(encode_varint(0x01).unwrap());
+    payload.extend(encode_varint(3).unwrap());
+    payload.extend(b"vpn");
+
+    let encoded = URL_SAFE_NO_PAD.encode(&payload);
+    let uri = format!("tt://?{}", encoded);
+    let result = decode(&uri);
+
+    assert!(result.is_err());
+    assert!(matches!(
+        result.unwrap_err(),
+        DeepLinkError::UnsupportedVersion {
+            found: 99,
+            max_supported: 1
+        }
+    ));
 }

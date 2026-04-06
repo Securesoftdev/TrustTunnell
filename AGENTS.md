@@ -193,6 +193,14 @@ protocol/deep-link format, library API) when relevant.
 
 4. Markdown files MUST pass `markdownlint` (configured in
    `.markdownlint.json`). Run `make lint-md` before submitting docs.
+   **Markdown table formatting (MD060)**: When the Markdownlint MD060 rule
+   triggers, switch to tight table formatting with spaces. Example:
+
+   ```markdown
+   | Column1 | Column2 |
+   | --- | --- |
+   | Value 1 | Value 2 |
+   ```
 
    **Rationale**: consistent documentation formatting.
 

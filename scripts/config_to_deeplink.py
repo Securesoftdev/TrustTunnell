@@ -83,6 +83,10 @@ TAG_CERTIFICATE        = 0x08
 TAG_UPSTREAM_PROTOCOL  = 0x09
 TAG_ANTI_DPI           = 0x0A
 TAG_CLIENT_RANDOM_PREFIX = 0x0B
+TAG_SERVER_DISPLAY_NAME  = 0x0C
+TAG_DNS_SERVERS          = 0x0D
+
+CURRENT_VERSION = 1
 
 PROTOCOL_MAP = {"http2": 0x01, "http3": 0x02}
 
@@ -94,9 +98,22 @@ DEFAULTS = {
 }
 
 
+def encode_string_array(strings: list[str]) -> bytes:
+    """Encode a list of strings as a String[] value (varint-length-prefixed elements)."""
+    buf = bytearray()
+    for s in strings:
+        encoded = s.encode()
+        buf += encode_varint(len(encoded))
+        buf += encoded
+    return bytes(buf)
+
+
 def encode_config(cfg: dict) -> bytes:
     """Encode a parsed TOML config dict into the TLV binary payload."""
     buf = bytearray()
+
+    # Version tag
+    buf += tlv(0x00, encode_varint(CURRENT_VERSION))
 
     # Required string fields
     for tag, key in [
@@ -142,6 +159,15 @@ def encode_config(cfg: dict) -> bytes:
         if proto not in PROTOCOL_MAP:
             raise ValueError(f"unknown upstream_protocol: {proto}")
         buf += tlv(TAG_UPSTREAM_PROTOCOL, bytes([PROTOCOL_MAP[proto]]))
+
+    # server_display_name (optional)
+    if "name" in cfg and cfg["name"]:
+        buf += tlv(TAG_SERVER_DISPLAY_NAME, cfg["name"].encode())
+
+    # dns_servers (optional, String[] encoding)
+    dns = cfg.get("dns_servers")
+    if dns:
+        buf += tlv(TAG_DNS_SERVERS, encode_string_array(dns))
 
     return bytes(buf)
 

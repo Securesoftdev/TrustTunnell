@@ -55,6 +55,10 @@ TAG_CERTIFICATE        = 0x08
 TAG_UPSTREAM_PROTOCOL  = 0x09
 TAG_ANTI_DPI           = 0x0A
 TAG_CLIENT_RANDOM_PREFIX = 0x0B
+TAG_SERVER_DISPLAY_NAME  = 0x0C
+TAG_DNS_SERVERS          = 0x0D
+
+CURRENT_VERSION = 1
 
 PROTOCOL_RMAP = {0x01: "http2", 0x02: "http3"}
 
@@ -137,6 +141,19 @@ def parse_tlv(data: bytes) -> list[tuple[int, bytes]]:
 # Decoder
 # ---------------------------------------------------------------------------
 
+def _decode_string_array(data: bytes) -> list[str]:
+    """Decode a String[] value: sequence of varint-length-prefixed UTF-8 strings."""
+    result: list[str] = []
+    offset = 0
+    while offset < len(data):
+        length, offset = decode_varint(data, offset)
+        if offset + length > len(data):
+            raise ValueError("truncated string in String[] value")
+        result.append(data[offset:offset + length].decode())
+        offset += length
+    return result
+
+
 def decode_config(data: bytes) -> dict:
     """Decode TLV binary payload into a config dict."""
     entries = parse_tlv(data)
@@ -144,7 +161,14 @@ def decode_config(data: bytes) -> dict:
     addresses: list[str] = []
 
     for tag, value in entries:
-        if tag == TAG_HOSTNAME:
+        if tag == 0x00:
+            version, _ = decode_varint(value, 0)
+            if version > CURRENT_VERSION:
+                raise ValueError(
+                    f"unsupported deep link version: {version} "
+                    f"(max supported: {CURRENT_VERSION})"
+                )
+        elif tag == TAG_HOSTNAME:
             cfg["hostname"] = value.decode()
         elif tag == TAG_ADDRESS:
             addresses.append(value.decode())
@@ -169,6 +193,10 @@ def decode_config(data: bytes) -> dict:
             cfg["anti_dpi"] = value[0] != 0
         elif tag == TAG_CLIENT_RANDOM_PREFIX:
             cfg["client_random_prefix"] = value.decode()
+        elif tag == TAG_SERVER_DISPLAY_NAME:
+            cfg["name"] = value.decode()
+        elif tag == TAG_DNS_SERVERS:
+            cfg["dns_servers"] = _decode_string_array(value)
         # Unknown tags are silently ignored per spec.
 
     if addresses:
@@ -217,6 +245,8 @@ _FIELD_ORDER: list[tuple[str, str]] = [
                           "using the system storage."),
     ("upstream_protocol", "Protocol to be used to communicate with the endpoint [http2, http3]"),
     ("anti_dpi",          "Is anti-DPI measures should be enabled"),
+    ("name",              "Human-readable server display name"),
+    ("dns_servers",       "DNS servers to use when connected to this endpoint"),
 ]
 
 

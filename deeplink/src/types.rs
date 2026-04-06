@@ -6,6 +6,7 @@ use std::str::FromStr;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TlvTag {
+    Version = 0x00,
     Hostname = 0x01,
     Address = 0x02,
     CustomSni = 0x03,
@@ -17,6 +18,8 @@ pub enum TlvTag {
     UpstreamProtocol = 0x09,
     AntiDpi = 0x0A,
     ClientRandomPrefix = 0x0B,
+    ServerDisplayName = 0x0C,
+    DnsServers = 0x0D,
 }
 
 impl TlvTag {
@@ -26,6 +29,7 @@ impl TlvTag {
 
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
+            0x00 => Some(TlvTag::Version),
             0x01 => Some(TlvTag::Hostname),
             0x02 => Some(TlvTag::Address),
             0x03 => Some(TlvTag::CustomSni),
@@ -37,6 +41,8 @@ impl TlvTag {
             0x09 => Some(TlvTag::UpstreamProtocol),
             0x0A => Some(TlvTag::AntiDpi),
             0x0B => Some(TlvTag::ClientRandomPrefix),
+            0x0C => Some(TlvTag::ServerDisplayName),
+            0x0D => Some(TlvTag::DnsServers),
             _ => None,
         }
     }
@@ -91,6 +97,8 @@ impl fmt::Display for Protocol {
     }
 }
 
+pub const CURRENT_VERSION: u64 = 1;
+
 /// TrustTunnel deep-link configuration.
 ///
 /// This struct represents all configuration fields that can be encoded into
@@ -109,6 +117,8 @@ pub struct DeepLinkConfig {
     pub certificate: Option<Vec<u8>>,
     pub upstream_protocol: Protocol,
     pub anti_dpi: bool,
+    pub server_display_name: Option<String>,
+    pub dns_servers: Vec<String>,
 }
 
 impl DeepLinkConfig {
@@ -149,6 +159,8 @@ pub struct DeepLinkConfigBuilder {
     certificate: Option<Vec<u8>>,
     upstream_protocol: Option<Protocol>,
     anti_dpi: Option<bool>,
+    server_display_name: Option<String>,
+    dns_servers: Option<Vec<String>>,
 }
 
 impl DeepLinkConfigBuilder {
@@ -207,6 +219,16 @@ impl DeepLinkConfigBuilder {
         self
     }
 
+    pub fn server_display_name(mut self, server_display_name: Option<String>) -> Self {
+        self.server_display_name = server_display_name;
+        self
+    }
+
+    pub fn dns_servers(mut self, dns_servers: Vec<String>) -> Self {
+        self.dns_servers = Some(dns_servers);
+        self
+    }
+
     pub fn build(self) -> Result<DeepLinkConfig> {
         // Validate client_random_prefix is valid hex if provided
         if let Some(ref prefix) = self.client_random_prefix {
@@ -240,6 +262,8 @@ impl DeepLinkConfigBuilder {
             certificate: self.certificate,
             upstream_protocol: self.upstream_protocol.unwrap_or_default(),
             anti_dpi: self.anti_dpi.unwrap_or(false),
+            server_display_name: self.server_display_name,
+            dns_servers: self.dns_servers.unwrap_or_default(),
         };
         config.validate()?;
         Ok(config)
@@ -254,6 +278,7 @@ mod tests {
     fn test_tlv_tag_conversions() {
         assert_eq!(TlvTag::Hostname.as_u8(), 0x01);
         assert_eq!(TlvTag::from_u8(0x01), Some(TlvTag::Hostname));
+        assert_eq!(TlvTag::from_u8(0x00), Some(TlvTag::Version));
         assert_eq!(TlvTag::from_u8(0xFF), None);
     }
 
@@ -330,6 +355,8 @@ mod tests {
             upstream_protocol: Protocol::Http2,
             anti_dpi: false,
             client_random_prefix: None,
+            server_display_name: None,
+            dns_servers: vec![],
         };
 
         assert!(config.validate().is_err());

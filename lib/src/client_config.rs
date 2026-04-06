@@ -7,6 +7,7 @@ use macros::{Getter, RuntimeDoc};
 use once_cell::sync::Lazy;
 use toml_edit::{value, Document};
 
+#[allow(clippy::too_many_arguments)]
 pub fn build(
     client: &String,
     addresses: Vec<String>,
@@ -14,6 +15,8 @@ pub fn build(
     hostsettings: &TlsHostsSettings,
     custom_sni: Option<String>,
     client_random_prefix: Option<String>,
+    name: Option<String>,
+    dns_servers: Vec<String>,
 ) -> ClientConfig {
     let user = username
         .iter()
@@ -47,6 +50,8 @@ pub fn build(
         cert_is_system_verifiable,
         upstream_protocol: "http2".into(),
         anti_dpi: false,
+        name: name.unwrap_or_default(),
+        dns_servers,
     }
 }
 
@@ -80,6 +85,10 @@ pub struct ClientConfig {
     upstream_protocol: String,
     /// Is anti-DPI measures should be enabled
     anti_dpi: bool,
+    /// Human-readable server display name
+    name: String,
+    /// DNS servers to use when connected to this endpoint
+    dns_servers: Vec<String>,
 }
 
 impl ClientConfig {
@@ -101,6 +110,13 @@ impl ClientConfig {
         }
         doc["upstream_protocol"] = value(&self.upstream_protocol);
         doc["anti_dpi"] = value(self.anti_dpi);
+        if !self.name.is_empty() {
+            doc["name"] = value(&self.name);
+        }
+        if !self.dns_servers.is_empty() {
+            let vec = toml_edit::Array::from_iter(self.dns_servers.iter().map(|x| x.as_str()));
+            doc["dns_servers"] = value(vec);
+        }
         doc.to_string()
     }
 
@@ -145,6 +161,12 @@ impl ClientConfig {
             certificate,
             upstream_protocol,
             anti_dpi: self.anti_dpi,
+            server_display_name: if self.name.is_empty() {
+                None
+            } else {
+                Some(self.name.clone())
+            },
+            dns_servers: self.dns_servers.clone(),
         };
 
         trusttunnel_deeplink::encode(&config)
@@ -189,6 +211,12 @@ upstream_protocol = ""
 
 {}
 anti_dpi = false
+
+{}
+name = ""
+
+{}
+dns_servers = []
 "#,
         ClientConfig::doc_hostname().to_toml_comment(),
         ClientConfig::doc_addresses().to_toml_comment(),
@@ -201,6 +229,8 @@ anti_dpi = false
         ClientConfig::doc_certificate().to_toml_comment(),
         ClientConfig::doc_upstream_protocol().to_toml_comment(),
         ClientConfig::doc_anti_dpi().to_toml_comment(),
+        ClientConfig::doc_name().to_toml_comment(),
+        ClientConfig::doc_dns_servers().to_toml_comment(),
     )
 });
 #[cfg(test)]
@@ -222,6 +252,8 @@ mod tests {
                 cert_is_system_verifiable,
                 upstream_protocol: "http2".into(),
                 anti_dpi: false,
+                name: String::new(),
+                dns_servers: vec![],
             }
         }
     }
