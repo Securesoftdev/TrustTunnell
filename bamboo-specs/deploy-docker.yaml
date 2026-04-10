@@ -1,0 +1,73 @@
+---
+version: 2
+triggers: [ ]
+
+plan:
+  project-key: CL
+  key: TTED
+  name: TrustTunnel - Deploy Docker Image
+
+stages:
+  - Build and Push Docker Image:
+      manual: false
+      final: false
+      jobs:
+        - Build and Push Docker Image
+
+Build and Push Docker Image:
+  key: BDI
+  tasks:
+    - checkout:
+        description: Checkout Default Repository
+        force-clean-build: 'true'
+    - script:
+        interpreter: SHELL
+        scripts:
+          - |-
+            #!/bin/bash
+            set -x -e
+
+            VERSION=$(cat endpoint/Cargo.toml | grep "version = " | head -n 1 | sed -e 's/version = "\(.*\)"/\1/')
+            TAG=v${VERSION}
+
+            DOCKER_IMAGE_REPO="trusttunnel/trusttunnel-endpoint"
+            DOCKER_IMAGE_VERSION_TAG="${DOCKER_IMAGE_REPO}:${TAG}"
+            DOCKER_IMAGE_LATEST_TAG="${DOCKER_IMAGE_REPO}:latest"
+
+            set +x
+            echo "${bamboo.trusttunnelDockerHubPassword}" | docker login -u "${bamboo.trusttunnelDockerHubUsername}" --password-stdin
+            set -x
+
+            cat << EOF > buildkitd.toml
+            [worker.oci]
+              max-parallelism = 1
+            EOF
+
+            docker buildx create --name trusttunnel-builder --use --config buildkitd.toml || docker buildx use trusttunnel-builder
+            docker buildx build \
+                --target trusttunnel-endpoint \
+                --platform linux/amd64,linux/arm64 \
+                -t "${DOCKER_IMAGE_VERSION_TAG}" \
+                -t "${DOCKER_IMAGE_LATEST_TAG}" \
+                --push .
+  requirements:
+    - ephemeral-linux
+    - image: registry.int.agrd.dev/linux/debian13-bamboo:latest
+  artifact-subscriptions: [ ]
+  artifacts: [ ]
+
+repositories:
+  - core-libs/vpn-libs-endpoint:
+      scope: global
+
+branches:
+  create: manually
+  delete: never
+  link-to-jira: true
+
+notifications: [ ]
+
+labels: [ ]
+
+other:
+  concurrent-build-plugin: system-default

@@ -5,4 +5,6 @@
 ---
   !include 'deploy.yaml'
 ---
+  !include 'deploy-docker.yaml'
+---
   !include 'lint.yaml'

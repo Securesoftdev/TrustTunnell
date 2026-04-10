@@ -24,6 +24,12 @@ pub enum DeepLinkError {
     #[error("Invalid protocol byte: {0:#04x} (expected 0x01 for http2 or 0x02 for http3)")]
     InvalidProtocol(u8),
 
+    #[error("Unsupported deep link version: {found} (max supported: {max_supported})")]
+    UnsupportedVersion { found: u64, max_supported: u64 },
+
+    #[error("Truncated list entry: expected {expected} bytes but only {got} remaining")]
+    TruncatedListEntry { expected: usize, got: usize },
+
     #[error("Varint value too large: {0} (max: 2^62-1)")]
     VarintOverflow(u64),
 

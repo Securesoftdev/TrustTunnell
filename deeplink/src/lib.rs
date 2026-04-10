@@ -13,7 +13,7 @@ pub mod types;
 pub mod varint;
 
 pub use error::{DeepLinkError, Result};
-pub use types::{DeepLinkConfig, DeepLinkConfigBuilder, Protocol, TlvTag};
+pub use types::{DeepLinkConfig, DeepLinkConfigBuilder, Protocol, TlvTag, CURRENT_VERSION};
 
 // Re-export varint functions for testing
 pub use varint::{decode_varint, encode_varint};

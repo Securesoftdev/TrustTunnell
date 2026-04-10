@@ -3,8 +3,9 @@
 This document describes the deep link URI scheme used to share TrustTunnel
 endpoint configurations between devices and applications.
 
-Status: draft 2.
+Status: version 1
 
+- version 1: Added fields for version, server display name, and DNS upstreams.
 - draft 2: Changed format to tt://? to use case-sensitive URL part (query) instead of case-insensitive (host)
 - draft 1: Initial specification
 
@@ -39,7 +40,7 @@ exported by `trusttunnel_endpoint`.
 Each field is encoded as a **Tag–Length–Value (TLV)** entry:
 
 | Component | Encoding | Description |
-| --------- | -------- | ----------- |
+| --- | --- | --- |
 | **Tag** | TLS varint | Field identifier (see table below) |
 | **Length** | TLS varint | Byte length of the value that follows |
 | **Value** | *Length* bytes | Field-specific payload |
@@ -54,7 +55,7 @@ Tag and Length use the variable-length integer encoding defined in
 length of the integer:
 
 | 2-MSB | Integer size | Usable bits | Max value |
-| ----- | ------------ | ----------- | --------- |
+| --- | --- | --- | --- |
 | `00` | 1 byte | 6 | 63 |
 | `01` | 2 bytes | 14 | 16 383 |
 | `10` | 4 bytes | 30 | 1 073 741 823 |
@@ -64,21 +65,34 @@ Multi-byte varints are in **network byte order** (big-endian). In practice,
 current tags fit in a single byte (`00` prefix) and lengths under 16 384 fit
 in one or two bytes.
 
+### Value Types
+
+| Type | Description |
+| --- | --- |
+| VarInt | TLS variable-length integer (see encoding above) |
+| Bool | 1 byte: `0x01` = true, `0x00` = false |
+| String | UTF-8 encoded bytes |
+| Bytes | Raw binary data |
+| String[] | Length-prefixed sequence of strings: each element is encoded as a VarInt length followed by UTF-8 bytes. The TLV value field contains the concatenation of all length-prefixed elements. |
+
 ### Field Tags
 
-| Tag    | Field                  | Value encoding                                                                                       | Required             |
-|--------|------------------------|------------------------------------------------------------------------------------------------------|----------------------|
-| `0x01` | `hostname`             | UTF-8 string                                                                                         | yes                  |
-| `0x02` | `addresses`            | UTF-8, one `address:port` per entry; multiple entries are encoded as separate TLVs with the same tag | yes                  |
-| `0x03` | `custom_sni`           | UTF-8 string                                                                                         | no                   |
-| `0x04` | `has_ipv6`             | 1 byte: `0x01` = true, `0x00` = false                                                                | no (default `true`)  |
-| `0x05` | `username`             | UTF-8 string                                                                                         | yes                  |
-| `0x06` | `password`             | UTF-8 string                                                                                         | yes                  |
-| `0x0B` | `client_random_prefix` | UTF-8 hex-encoded string in the following format: `prefix[/mask]`                                    | no                   |
-| `0x07` | `skip_verification`    | 1 byte: `0x01` = true, `0x00` = false                                                                | no (default `false`) |
-| `0x08` | `certificate`          | Concatenated DER-encoded certificates (raw binary); omit if the chain is verified by system CAs      | no                   |
-| `0x09` | `upstream_protocol`    | 1 byte: `0x01` = `http2`, `0x02` = `http3`                                                           | no (default `http2`) |
-| `0x0A` | `anti_dpi`             | 1 byte: `0x01` = true, `0x00` = false                                                                | no (default `false`) |
+| Tag | Field | Value type | Value encoding | Required |
+| --- | --- | --- | --- | --- |
+| `0x00` | `version` | VarInt | Deep link format version (see Versioning below) | no (default `0`) |
+| `0x01` | `hostname` | String | UTF-8 string | yes |
+| `0x02` | `addresses` | String | UTF-8, one `address:port` per entry; multiple entries are encoded as separate TLVs with the same tag | yes |
+| `0x03` | `custom_sni` | String | UTF-8 string | no |
+| `0x04` | `has_ipv6` | Bool | 1 byte: `0x01` = true, `0x00` = false | no (default `true`) |
+| `0x05` | `username` | String | UTF-8 string | yes |
+| `0x06` | `password` | String | UTF-8 string | yes |
+| `0x07` | `skip_verification` | Bool | 1 byte: `0x01` = true, `0x00` = false | no (default `false`) |
+| `0x08` | `certificate` | Bytes | Concatenated DER-encoded certificates (raw binary); omit if the chain is verified by system CAs | no |
+| `0x09` | `upstream_protocol` | VarInt | `0x01` = `http2`, `0x02` = `http3` | no (default `http2`) |
+| `0x0A` | `anti_dpi` | Bool | 1 byte: `0x01` = true, `0x00` = false | no (default `false`) |
+| `0x0B` | `client_random_prefix` | String | UTF-8 hex-encoded string in the following format: `prefix[/mask]` | no |
+| `0x0C` | `name` | String | Human-readable server name for display in the client UI | no |
+| `0x0D` | `dns_upstreams` | String[] | List of DNS upstream addresses (e.g. `"1.1.1.1"`, `"tls://dns.example.com"`, `"https://dns.example.com/dns-query"`) | no |
 
 ### Encoding Rules
 
@@ -145,15 +159,15 @@ anti_dpi = false
 
 ## Versioning
 
-The current encoding is **version 0** (implicit). If a breaking change to the
-binary format is needed in the future, a reserved tag `0x00` will be used as a
-version indicator:
+The deep link format carries an explicit version number in tag `0x00`.
 
-| Tag | Field | Value encoding |
-| --- | ----- | -------------- |
-| `0x00` | `version` | 1 byte: format version number |
-
-If the `0x00` tag is absent, parsers MUST assume version 0.
+- If the `0x00` tag is absent, parsers MUST assume **version 0**.
+- The value is encoded as a VarInt.
+- The first explicitly versioned format is **version 1**.
+- A client MUST reject a deep link whose version is higher than the maximum
+  version it supports.
+- A client MUST accept deep links with a version equal to or lower than the
+  maximum version it supports (backward compatibility).
 
 ---
 

@@ -1,7 +1,27 @@
 use crate::error::{DeepLinkError, Result};
-use crate::types::{DeepLinkConfig, Protocol, TlvTag};
+use crate::types::{DeepLinkConfig, Protocol, TlvTag, CURRENT_VERSION};
 use crate::varint::decode_varint;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+/// Decode a String[] value: sequence of varint-length-prefixed UTF-8 strings.
+fn decode_string_array(data: &[u8]) -> Result<Vec<String>> {
+    let mut result = Vec::new();
+    let mut offset = 0;
+    while offset < data.len() {
+        let (len, new_offset) = decode_varint(data, offset)?;
+        offset = new_offset;
+        let len = len as usize;
+        if offset + len > data.len() {
+            return Err(DeepLinkError::TruncatedListEntry {
+                expected: len,
+                got: data.len() - offset,
+            });
+        }
+        result.push(decode_string(&data[offset..offset + len])?);
+        offset += len;
+    }
+    Ok(result)
+}
 
 /// Decode a string from UTF-8 bytes.
 fn decode_string(data: &[u8]) -> Result<String> {
@@ -100,6 +120,8 @@ pub fn decode_tlv_payload(payload: &[u8]) -> Result<DeepLinkConfig> {
     let mut upstream_protocol: Protocol = Protocol::Http2; // default
     let mut anti_dpi: bool = false; // default
     let mut client_random_prefix: Option<String> = None;
+    let mut name: Option<String> = None;
+    let mut dns_upstreams: Vec<String> = Vec::new();
 
     while let Some(field_result) = parser.next_field() {
         let (tag_opt, value) = field_result?;
@@ -111,6 +133,15 @@ pub fn decode_tlv_payload(payload: &[u8]) -> Result<DeepLinkConfig> {
         };
 
         match tag {
+            TlvTag::Version => {
+                let (v, _) = decode_varint(&value, 0)?;
+                if v > CURRENT_VERSION {
+                    return Err(DeepLinkError::UnsupportedVersion {
+                        found: v,
+                        max_supported: CURRENT_VERSION,
+                    });
+                }
+            }
             TlvTag::Hostname => {
                 hostname = Some(decode_string(&value)?);
             }
@@ -159,6 +190,12 @@ pub fn decode_tlv_payload(payload: &[u8]) -> Result<DeepLinkConfig> {
                 })?;
                 client_random_prefix = Some(prefix);
             }
+            TlvTag::Name => {
+                name = Some(decode_string(&value)?);
+            }
+            TlvTag::DnsUpstreams => {
+                dns_upstreams = decode_string_array(&value)?;
+            }
         }
     }
 
@@ -182,6 +219,8 @@ pub fn decode_tlv_payload(payload: &[u8]) -> Result<DeepLinkConfig> {
         certificate,
         upstream_protocol,
         anti_dpi,
+        name,
+        dns_upstreams,
     };
 
     config.validate()?;
@@ -267,9 +306,8 @@ mod tests {
 
     #[test]
     fn test_tlv_parser_unknown_tag() {
-        // Unknown tag 0x0C (12) should be parsed but returned as None
-        // (0x0C is not a known tag, and fits in 1 byte since it's < 0x40)
-        let data = vec![0x0C, 0x03, 0x01, 0x02, 0x03];
+        // Unknown tag 0x0F should be parsed but returned as None
+        let data = vec![0x0F, 0x03, 0x01, 0x02, 0x03];
         let mut parser = TlvParser::new(&data);
 
         let (tag, value) = parser.next_field().unwrap().unwrap();

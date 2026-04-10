@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::types::{DeepLinkConfig, Protocol, TlvTag};
+use crate::types::{DeepLinkConfig, Protocol, TlvTag, CURRENT_VERSION};
 use crate::varint::encode_varint;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 
@@ -28,6 +28,17 @@ fn encode_protocol_field(protocol: Protocol) -> Result<Vec<u8>> {
     encode_tlv(TlvTag::UpstreamProtocol, &[protocol.as_u8()])
 }
 
+/// Encode a String[] value: each element is a varint length followed by UTF-8 bytes.
+fn encode_string_array(strings: &[String]) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    for s in strings {
+        let bytes = s.as_bytes();
+        buf.extend(encode_varint(bytes.len() as u64)?);
+        buf.extend_from_slice(bytes);
+    }
+    Ok(buf)
+}
+
 /// Encode binary payload to base64url (URL-safe base64 without padding).
 fn encode_base64url(payload: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(payload)
@@ -38,6 +49,10 @@ pub fn encode_tlv_payload(config: &DeepLinkConfig) -> Result<Vec<u8>> {
     config.validate()?;
 
     let mut payload = Vec::new();
+
+    // Version tag
+    let version_bytes = encode_varint(CURRENT_VERSION)?;
+    payload.extend(encode_tlv(TlvTag::Version, &version_bytes)?);
 
     // Required fields - order matches Python reference implementation
     payload.extend(encode_string_field(TlvTag::Hostname, &config.hostname)?);
@@ -83,6 +98,17 @@ pub fn encode_tlv_payload(config: &DeepLinkConfig) -> Result<Vec<u8>> {
     // upstream_protocol default is Http2, so only encode if Http3
     if config.upstream_protocol != Protocol::Http2 {
         payload.extend(encode_protocol_field(config.upstream_protocol)?);
+    }
+
+    // name (optional)
+    if let Some(ref name) = config.name {
+        payload.extend(encode_string_field(TlvTag::Name, name)?);
+    }
+
+    // dns_upstreams (optional, String[] encoding)
+    if !config.dns_upstreams.is_empty() {
+        let value = encode_string_array(&config.dns_upstreams)?;
+        payload.extend(encode_tlv(TlvTag::DnsUpstreams, &value)?);
     }
 
     Ok(payload)

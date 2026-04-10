@@ -29,6 +29,8 @@ const PREFIX_LENGTH_PARAM_NAME: &str = "prefix_length";
 const PREFIX_PERCENT_PARAM_NAME: &str = "prefix_percent";
 const PREFIX_MASK_PARAM_NAME: &str = "prefix_mask";
 const FORMAT_PARAM_NAME: &str = "format";
+const NAME_PARAM_NAME: &str = "name";
+const DNS_UPSTREAM_PARAM_NAME: &str = "dns_upstream";
 const SENTRY_DSN_PARAM_NAME: &str = "sentry_dsn";
 const THREADS_NUM_PARAM_NAME: &str = "threads_num";
 const TRUSTTUNNEL_QR_URL: &str = "https://trusttunnel.org/qr.html";
@@ -169,7 +171,19 @@ fn main() {
                 .long("format")
                 .value_parser(["toml", "deeplink"])
                 .default_value("deeplink")
-                .help("Output format for client configuration: 'deeplink' produces tt://? URI, 'toml' produces traditional config file")
+                .help("Output format for client configuration: 'deeplink' produces tt://? URI, 'toml' produces traditional config file"),
+            clap::Arg::new(NAME_PARAM_NAME)
+                .action(clap::ArgAction::Set)
+                .requires(CLIENT_CONFIG_PARAM_NAME)
+                .short('n')
+                .long("name")
+                .help("Human-readable server display name for the client configuration."),
+            clap::Arg::new(DNS_UPSTREAM_PARAM_NAME)
+                .action(clap::ArgAction::Append)
+                .requires(CLIENT_CONFIG_PARAM_NAME)
+                .short('d')
+                .long("dns-upstream")
+                .help("DNS upstream address to include in the client configuration. Can be specified multiple times."),
         ])
         .disable_version_flag(true)
         .get_matches();
@@ -418,6 +432,12 @@ fn main() {
             }
         }
 
+        let name = args.get_one::<String>(NAME_PARAM_NAME).cloned();
+        let dns_upstreams: Vec<String> = args
+            .get_many::<String>(DNS_UPSTREAM_PARAM_NAME)
+            .map(|vals| vals.cloned().collect())
+            .unwrap_or_default();
+
         let client_config = client_config::build(
             username,
             addresses,
@@ -425,6 +445,8 @@ fn main() {
             &tls_hosts_settings,
             custom_sni,
             client_random_prefix,
+            name,
+            dns_upstreams,
         );
 
         let format = args
