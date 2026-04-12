@@ -475,19 +475,51 @@ docker build --target trusttunnel-endpoint -t trusttunnel-endpoint:local .
 docker build --target trusttunnel-classic-agent -t trusttunnel-classic-agent:local .
 ```
 
+Example classic agent run:
+
+```sh
+docker run --rm \
+  -e LK_BASE_URL="https://lk.example.com" \
+  -e LK_SERVICE_TOKEN="<service-token>" \
+  -e NODE_EXTERNAL_ID="node-1" \
+  -e NODE_HOSTNAME="trusttunnel-node-1" \
+  -e NODE_STAGE="prod" \
+  -e NODE_CLUSTER="vpn" \
+  -e NODE_NAMESPACE="default" \
+  -e NODE_ROLLOUT_GROUP="stable" \
+  -e AGENT_POLL_INTERVAL_SEC="15" \
+  -e AGENT_HEARTBEAT_INTERVAL_SEC="30" \
+  -e TRUSTTUNNEL_RUNTIME_DIR="/var/lib/trusttunnel" \
+  -e TRUSTTUNNEL_CREDENTIALS_FILE="credentials.toml" \
+  -e TRUSTTUNNEL_CONFIG_FILE="vpn.toml" \
+  -e TRUSTTUNNEL_HOSTS_FILE="hosts.toml" \
+  -v "$(pwd)/runtime:/var/lib/trusttunnel" \
+  trusttunnel-classic-agent:local
+```
+
 Classic agent required environment variables:
 
-- `LK_INTERNAL_BASE_URL`
-- `INTERNAL_AGENT_TOKEN`
-- `NODE_ID`
-- `TRUSTTUNNEL_TCP_ADDR`
+- `LK_BASE_URL`
+- `LK_SERVICE_TOKEN`
+- `NODE_EXTERNAL_ID`
+- `NODE_HOSTNAME`
+- `NODE_STAGE`
+- `NODE_CLUSTER`
+- `NODE_NAMESPACE`
+- `NODE_ROLLOUT_GROUP`
+- `AGENT_POLL_INTERVAL_SEC`
+- `AGENT_HEARTBEAT_INTERVAL_SEC`
+- `TRUSTTUNNEL_RUNTIME_DIR`
+- `TRUSTTUNNEL_CREDENTIALS_FILE`
+- `TRUSTTUNNEL_CONFIG_FILE`
+- `TRUSTTUNNEL_HOSTS_FILE`
 
 Classic agent optional environment variables:
 
-- `RUNTIME_CREDENTIALS_PATH` (default `credentials.toml`)
+- `NODE_PUBLIC_HOST`
+- `NODE_PUBLIC_PORT`
+- `NODE_DISPLAY_NAME`
 - `AGENT_STATE_PATH` (default `agent_state.json`)
-- `SNAPSHOT_POLL_INTERVAL_SECS` (default `15`)
-- `HEARTBEAT_INTERVAL_SECS` (default `30`)
 - `TRUSTTUNNEL_APPLY_CMD` (command executed after runtime credentials update)
 - `LK_SNAPSHOT_PATH` (default `/internal/vpn/classic/accounts`)
 - `LK_SYNC_REPORT_PATH` (default `/internal/vpn/classic/sync-report`)

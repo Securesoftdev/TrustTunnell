@@ -13,10 +13,21 @@ const DEFAULT_HEARTBEAT_PATH: &str = "/internal/vpn/classic/heartbeat";
 
 #[derive(Clone)]
 struct Config {
-    lk_internal_base_url: String,
-    internal_agent_token: String,
-    node_id: String,
-    trusttunnel_tcp_addr: String,
+    lk_base_url: String,
+    lk_service_token: String,
+    node_external_id: String,
+    node_hostname: String,
+    node_stage: String,
+    node_cluster: String,
+    node_namespace: String,
+    node_rollout_group: String,
+    node_public_host: Option<String>,
+    node_public_port: Option<u16>,
+    node_display_name: Option<String>,
+    trusttunnel_runtime_dir: PathBuf,
+    trusttunnel_credentials_file: PathBuf,
+    trusttunnel_config_file: PathBuf,
+    trusttunnel_hosts_file: PathBuf,
     runtime_credentials_path: PathBuf,
     agent_state_path: PathBuf,
     poll_interval: Duration,
@@ -29,20 +40,35 @@ struct Config {
 
 impl Config {
     fn from_env() -> Result<Self, String> {
-        let lk_internal_base_url = required_env("LK_INTERNAL_BASE_URL")?;
-        let internal_agent_token = required_env("INTERNAL_AGENT_TOKEN")?;
-        let node_id = required_env("NODE_ID")?;
-        let trusttunnel_tcp_addr = required_env("TRUSTTUNNEL_TCP_ADDR")?;
+        let lk_base_url = required_env("LK_BASE_URL")?;
+        let lk_service_token = required_env("LK_SERVICE_TOKEN")?;
+        let node_external_id = required_env("NODE_EXTERNAL_ID")?;
+        let node_hostname = required_env("NODE_HOSTNAME")?;
+        let node_stage = required_env("NODE_STAGE")?;
+        let node_cluster = required_env("NODE_CLUSTER")?;
+        let node_namespace = required_env("NODE_NAMESPACE")?;
+        let node_rollout_group = required_env("NODE_ROLLOUT_GROUP")?;
+        let trusttunnel_runtime_dir: PathBuf = required_env("TRUSTTUNNEL_RUNTIME_DIR")?.into();
+        let trusttunnel_credentials_file: PathBuf =
+            required_env("TRUSTTUNNEL_CREDENTIALS_FILE")?.into();
+        let trusttunnel_config_file: PathBuf = required_env("TRUSTTUNNEL_CONFIG_FILE")?.into();
+        let trusttunnel_hosts_file: PathBuf = required_env("TRUSTTUNNEL_HOSTS_FILE")?.into();
+        let node_public_host = optional_env("NODE_PUBLIC_HOST");
+        let node_public_port = optional_env("NODE_PUBLIC_PORT")
+            .map(|raw| {
+                raw.parse::<u16>()
+                    .map_err(|e| format!("NODE_PUBLIC_PORT must be u16: {e}"))
+            })
+            .transpose()?;
+        let node_display_name = optional_env("NODE_DISPLAY_NAME");
 
-        let runtime_credentials_path = std::env::var("RUNTIME_CREDENTIALS_PATH")
-            .unwrap_or_else(|_| "credentials.toml".to_string())
-            .into();
+        let runtime_credentials_path = trusttunnel_runtime_dir.join(&trusttunnel_credentials_file);
         let agent_state_path = std::env::var("AGENT_STATE_PATH")
             .unwrap_or_else(|_| "agent_state.json".to_string())
             .into();
 
-        let poll_interval = duration_from_env("SNAPSHOT_POLL_INTERVAL_SECS", 15)?;
-        let heartbeat_interval = duration_from_env("HEARTBEAT_INTERVAL_SECS", 30)?;
+        let poll_interval = duration_required_from_env("AGENT_POLL_INTERVAL_SEC")?;
+        let heartbeat_interval = duration_required_from_env("AGENT_HEARTBEAT_INTERVAL_SEC")?;
 
         let snapshot_path = std::env::var("LK_SNAPSHOT_PATH")
             .unwrap_or_else(|_| DEFAULT_SNAPSHOT_PATH.to_string());
@@ -56,10 +82,21 @@ impl Config {
             .and_then(|x| if x.trim().is_empty() { None } else { Some(x) });
 
         Ok(Self {
-            lk_internal_base_url,
-            internal_agent_token,
-            node_id,
-            trusttunnel_tcp_addr,
+            lk_base_url,
+            lk_service_token,
+            node_external_id,
+            node_hostname,
+            node_stage,
+            node_cluster,
+            node_namespace,
+            node_rollout_group,
+            node_public_host,
+            node_public_port,
+            node_display_name,
+            trusttunnel_runtime_dir,
+            trusttunnel_credentials_file,
+            trusttunnel_config_file,
+            trusttunnel_hosts_file,
             runtime_credentials_path,
             agent_state_path,
             poll_interval,
@@ -103,16 +140,38 @@ struct AgentState {
 
 #[derive(Serialize)]
 struct HeartbeatPayload<'a> {
-    node_id: &'a str,
-    trusttunnel_tcp_addr: &'a str,
+    node_external_id: &'a str,
+    node_hostname: &'a str,
+    node_stage: &'a str,
+    node_cluster: &'a str,
+    node_namespace: &'a str,
+    node_rollout_group: &'a str,
+    node_public_host: Option<&'a str>,
+    node_public_port: Option<u16>,
+    node_display_name: Option<&'a str>,
+    trusttunnel_runtime_dir: &'a str,
+    trusttunnel_credentials_file: &'a str,
+    trusttunnel_config_file: &'a str,
+    trusttunnel_hosts_file: &'a str,
     active_path: &'static str,
     modified_enabled: bool,
 }
 
 #[derive(Serialize)]
 struct SyncReportPayload<'a> {
-    node_id: &'a str,
-    trusttunnel_tcp_addr: &'a str,
+    node_external_id: &'a str,
+    node_hostname: &'a str,
+    node_stage: &'a str,
+    node_cluster: &'a str,
+    node_namespace: &'a str,
+    node_rollout_group: &'a str,
+    node_public_host: Option<&'a str>,
+    node_public_port: Option<u16>,
+    node_display_name: Option<&'a str>,
+    trusttunnel_runtime_dir: &'a str,
+    trusttunnel_credentials_file: &'a str,
+    trusttunnel_config_file: &'a str,
+    trusttunnel_hosts_file: &'a str,
     active_path: &'static str,
     modified_enabled: bool,
     version: &'a str,
@@ -231,13 +290,13 @@ impl Agent {
     }
 
     async fn pull_snapshot(&self) -> Result<(SnapshotResponse, Vec<u8>), String> {
-        let endpoint = format_url(&self.cfg.lk_internal_base_url, &self.cfg.snapshot_path);
+        let endpoint = format_url(&self.cfg.lk_base_url, &self.cfg.snapshot_path);
         let response = self
             .client
             .get(endpoint)
-            .header("Authorization", format!("Bearer {}", self.cfg.internal_agent_token))
-            .header("X-Internal-Agent-Token", &self.cfg.internal_agent_token)
-            .query(&[("node_id", self.cfg.node_id.as_str())])
+            .header("Authorization", format!("Bearer {}", self.cfg.lk_service_token))
+            .header("X-Internal-Agent-Token", &self.cfg.lk_service_token)
+            .query(&[("node_external_id", self.cfg.node_external_id.as_str())])
             .send()
             .await
             .map_err(|e| format!("LK snapshot request failed: {e}"))?;
@@ -265,10 +324,21 @@ impl Agent {
         applied: bool,
         details: &str,
     ) -> Result<(), String> {
-        let endpoint = format_url(&self.cfg.lk_internal_base_url, &self.cfg.sync_report_path);
+        let endpoint = format_url(&self.cfg.lk_base_url, &self.cfg.sync_report_path);
         let payload = SyncReportPayload {
-            node_id: &self.cfg.node_id,
-            trusttunnel_tcp_addr: &self.cfg.trusttunnel_tcp_addr,
+            node_external_id: &self.cfg.node_external_id,
+            node_hostname: &self.cfg.node_hostname,
+            node_stage: &self.cfg.node_stage,
+            node_cluster: &self.cfg.node_cluster,
+            node_namespace: &self.cfg.node_namespace,
+            node_rollout_group: &self.cfg.node_rollout_group,
+            node_public_host: self.cfg.node_public_host.as_deref(),
+            node_public_port: self.cfg.node_public_port,
+            node_display_name: self.cfg.node_display_name.as_deref(),
+            trusttunnel_runtime_dir: path_to_string(&self.cfg.trusttunnel_runtime_dir)?,
+            trusttunnel_credentials_file: path_to_string(&self.cfg.trusttunnel_credentials_file)?,
+            trusttunnel_config_file: path_to_string(&self.cfg.trusttunnel_config_file)?,
+            trusttunnel_hosts_file: path_to_string(&self.cfg.trusttunnel_hosts_file)?,
             active_path: "classic",
             modified_enabled: false,
             version: &snapshot.version,
@@ -280,8 +350,8 @@ impl Agent {
         let response = self
             .client
             .post(endpoint)
-            .header("Authorization", format!("Bearer {}", self.cfg.internal_agent_token))
-            .header("X-Internal-Agent-Token", &self.cfg.internal_agent_token)
+            .header("Authorization", format!("Bearer {}", self.cfg.lk_service_token))
+            .header("X-Internal-Agent-Token", &self.cfg.lk_service_token)
             .json(&payload)
             .send()
             .await
@@ -303,10 +373,21 @@ impl Agent {
     }
 
     async fn send_heartbeat(&self) -> Result<(), String> {
-        let endpoint = format_url(&self.cfg.lk_internal_base_url, &self.cfg.heartbeat_path);
+        let endpoint = format_url(&self.cfg.lk_base_url, &self.cfg.heartbeat_path);
         let payload = HeartbeatPayload {
-            node_id: &self.cfg.node_id,
-            trusttunnel_tcp_addr: &self.cfg.trusttunnel_tcp_addr,
+            node_external_id: &self.cfg.node_external_id,
+            node_hostname: &self.cfg.node_hostname,
+            node_stage: &self.cfg.node_stage,
+            node_cluster: &self.cfg.node_cluster,
+            node_namespace: &self.cfg.node_namespace,
+            node_rollout_group: &self.cfg.node_rollout_group,
+            node_public_host: self.cfg.node_public_host.as_deref(),
+            node_public_port: self.cfg.node_public_port,
+            node_display_name: self.cfg.node_display_name.as_deref(),
+            trusttunnel_runtime_dir: path_to_string(&self.cfg.trusttunnel_runtime_dir)?,
+            trusttunnel_credentials_file: path_to_string(&self.cfg.trusttunnel_credentials_file)?,
+            trusttunnel_config_file: path_to_string(&self.cfg.trusttunnel_config_file)?,
+            trusttunnel_hosts_file: path_to_string(&self.cfg.trusttunnel_hosts_file)?,
             active_path: "classic",
             modified_enabled: false,
         };
@@ -314,8 +395,8 @@ impl Agent {
         let response = self
             .client
             .post(endpoint)
-            .header("Authorization", format!("Bearer {}", self.cfg.internal_agent_token))
-            .header("X-Internal-Agent-Token", &self.cfg.internal_agent_token)
+            .header("Authorization", format!("Bearer {}", self.cfg.lk_service_token))
+            .header("X-Internal-Agent-Token", &self.cfg.lk_service_token)
             .json(&payload)
             .send()
             .await
@@ -325,7 +406,10 @@ impl Agent {
             return Err(format!("heartbeat push failed with HTTP {}", response.status()));
         }
 
-        println!("heartbeat sent for node_id={}", self.cfg.node_id);
+        println!(
+            "heartbeat sent for node_external_id={}",
+            self.cfg.node_external_id
+        );
         Ok(())
     }
 
@@ -362,8 +446,8 @@ async fn main() {
     };
 
     println!(
-        "classic-agent started: node_id={} active_path=classic modified_enabled=false",
-        cfg.node_id
+        "classic-agent started: node_external_id={} active_path=classic modified_enabled=false",
+        cfg.node_external_id
     );
 
     let mut agent = match Agent::new(cfg).await {
@@ -473,15 +557,36 @@ fn format_url(base: &str, path: &str) -> String {
 }
 
 fn required_env(name: &str) -> Result<String, String> {
-    std::env::var(name).map_err(|_| format!("required env var {name} is missing"))
+    let raw = std::env::var(name).map_err(|_| format!("required env var {name} is missing"))?;
+    non_empty_value(name, raw)
 }
 
-fn duration_from_env(name: &str, default_secs: u64) -> Result<Duration, String> {
-    let raw = std::env::var(name).unwrap_or_else(|_| default_secs.to_string());
+fn optional_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| non_empty_value(name, raw).ok())
+}
+
+fn non_empty_value(name: &str, raw: String) -> Result<String, String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(format!("required env var {name} must not be empty"));
+    }
+
+    Ok(value.to_string())
+}
+
+fn duration_required_from_env(name: &str) -> Result<Duration, String> {
+    let raw = required_env(name)?;
     let secs = raw
         .parse::<u64>()
         .map_err(|e| format!("{name} must be u64 seconds: {e}"))?;
     Ok(Duration::from_secs(secs))
+}
+
+fn path_to_string(path: &Path) -> Result<&str, String> {
+    path.to_str()
+        .ok_or_else(|| format!("path must be valid UTF-8: {}", path.display()))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -534,5 +639,12 @@ mod tests {
         };
 
         assert!(!validate_checksum(&snapshot, b"{}"));
+    }
+
+    #[test]
+    fn non_empty_value_rejects_whitespace_only() {
+        let err = non_empty_value("ANY_KEY", "   ".to_string()).unwrap_err();
+
+        assert_eq!(err, "required env var ANY_KEY must not be empty");
     }
 }
