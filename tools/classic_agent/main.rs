@@ -264,6 +264,25 @@ impl Agent {
     async fn sync_once(&mut self) -> Result<(), String> {
         let (snapshot, raw_body) = self.pull_snapshot().await?;
 
+        if snapshot.onboarding_state != "active" {
+            let details = format!(
+                "sync apply skipped: onboarding_state={}, expected=active",
+                snapshot.onboarding_state
+            );
+            log_sync_skip(&snapshot, &details);
+            self.last_apply_status = details.clone();
+            self.send_sync_report(&snapshot, false, &details).await?;
+            return Ok(());
+        }
+
+        if !snapshot.sync_required {
+            let details = "sync apply skipped: sync_required=false".to_string();
+            log_sync_skip(&snapshot, &details);
+            self.last_apply_status = details.clone();
+            self.send_sync_report(&snapshot, false, &details).await?;
+            return Ok(());
+        }
+
         if !validate_checksum(&snapshot, &raw_body) {
             let detail = "invalid checksum returned by LK";
             eprintln!("snapshot rejected: {detail}, version={}", snapshot.version);
@@ -806,6 +825,17 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(digest.as_ref())
 }
 
+fn log_sync_skip(snapshot: &SyncPayload, reason: &str) {
+    println!(
+        "sync skip: reason={} version={} checksum={} onboarding_state={} sync_required={}",
+        reason,
+        snapshot.version,
+        snapshot.checksum,
+        snapshot.onboarding_state,
+        snapshot.sync_required
+    );
+}
+
 
 enum RegisterAttemptOutcome {
     Registered,
@@ -869,6 +899,8 @@ mod tests {
         let snapshot = SyncPayload {
             version: "1".to_string(),
             checksum: sha256_hex(raw),
+            onboarding_state: "active".to_string(),
+            sync_required: true,
             accounts: vec![],
         };
 
@@ -880,6 +912,8 @@ mod tests {
         let snapshot = SyncPayload {
             version: "1".to_string(),
             checksum: "deadbeef".to_string(),
+            onboarding_state: "active".to_string(),
+            sync_required: true,
             accounts: vec![],
         };
 

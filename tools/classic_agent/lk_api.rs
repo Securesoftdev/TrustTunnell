@@ -158,6 +158,10 @@ pub struct SyncPayload {
     #[serde(alias = "snapshotVersion")]
     pub version: String,
     pub checksum: String,
+    #[serde(default, alias = "onboardingState")]
+    pub onboarding_state: String,
+    #[serde(default = "default_sync_required", alias = "syncRequired")]
+    pub sync_required: bool,
     #[serde(default, alias = "users")]
     pub accounts: Vec<Account>,
 }
@@ -200,6 +204,10 @@ pub struct Account {
 }
 
 fn default_enabled() -> bool {
+    true
+}
+
+fn default_sync_required() -> bool {
     true
 }
 
@@ -355,10 +363,27 @@ mod tests {
         let payload = SyncPayload {
             version: "".to_string(),
             checksum: "abc".to_string(),
+            onboarding_state: "active".to_string(),
+            sync_required: true,
             accounts: vec![],
         };
 
         assert!(payload.validate_compatibility().is_err());
+    }
+
+    #[test]
+    fn sync_payload_deserializes_sync_branching_fields() {
+        let raw = r#"{
+            "version":"v1",
+            "checksum":"abc",
+            "onboardingState":"paused",
+            "syncRequired":false,
+            "accounts":[]
+        }"#;
+        let payload = serde_json::from_str::<SyncPayload>(raw).unwrap();
+
+        assert_eq!(payload.onboarding_state, "paused");
+        assert!(!payload.sync_required);
     }
 
     #[test]
