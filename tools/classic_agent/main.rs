@@ -1,3 +1,10 @@
+mod lk_api;
+
+use lk_api::{
+    Account, LkApiClient, NodeMetadata, OnboardingPayload, SyncPayload, SyncReportPayload,
+    DEFAULT_HEARTBEAT_PATH, DEFAULT_REGISTER_PATH, DEFAULT_SYNC_PATH_TEMPLATE,
+    DEFAULT_SYNC_REPORT_PATH,
+};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -7,10 +14,6 @@ use tokio::fs;
 use tokio::process::Command;
 use tokio::time::{interval, MissedTickBehavior};
 
-const DEFAULT_SNAPSHOT_PATH: &str = "/internal/vpn/classic/accounts";
-const DEFAULT_SYNC_REPORT_PATH: &str = "/internal/vpn/classic/sync-report";
-const DEFAULT_HEARTBEAT_PATH: &str = "/internal/vpn/classic/heartbeat";
-const DEFAULT_REGISTER_PATH: &str = "/internal/vpn/classic/register";
 const REGISTER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const REGISTER_MAX_BACKOFF: Duration = Duration::from_secs(60);
 
@@ -35,7 +38,7 @@ struct Config {
     agent_state_path: PathBuf,
     poll_interval: Duration,
     heartbeat_interval: Duration,
-    snapshot_path: String,
+    sync_path_template: String,
     sync_report_path: String,
     heartbeat_path: String,
     register_path: String,
@@ -74,8 +77,8 @@ impl Config {
         let poll_interval = duration_required_from_env("AGENT_POLL_INTERVAL_SEC")?;
         let heartbeat_interval = duration_required_from_env("AGENT_HEARTBEAT_INTERVAL_SEC")?;
 
-        let snapshot_path = std::env::var("LK_SNAPSHOT_PATH")
-            .unwrap_or_else(|_| DEFAULT_SNAPSHOT_PATH.to_string());
+        let sync_path_template = std::env::var("LK_SYNC_PATH_TEMPLATE")
+            .unwrap_or_else(|_| DEFAULT_SYNC_PATH_TEMPLATE.to_string());
         let sync_report_path = std::env::var("LK_SYNC_REPORT_PATH")
             .unwrap_or_else(|_| DEFAULT_SYNC_REPORT_PATH.to_string());
         let heartbeat_path = std::env::var("LK_HEARTBEAT_PATH")
@@ -107,35 +110,13 @@ impl Config {
             agent_state_path,
             poll_interval,
             heartbeat_interval,
-            snapshot_path,
+            sync_path_template,
             sync_report_path,
             heartbeat_path,
             register_path,
             apply_cmd,
         })
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct SnapshotResponse {
-    version: String,
-    checksum: String,
-    #[serde(default)]
-    accounts: Vec<Account>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct Account {
-    #[serde(alias = "user", alias = "login", alias = "name")]
-    username: String,
-    #[serde(alias = "token", alias = "credentials", alias = "secret")]
-    password: String,
-    #[serde(default = "default_enabled")]
-    enabled: bool,
-}
-
-fn default_enabled() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -145,51 +126,9 @@ struct AgentState {
     credentials_sha256: String,
 }
 
-#[derive(Serialize)]
-struct HeartbeatPayload<'a> {
-    node_external_id: &'a str,
-    node_hostname: &'a str,
-    node_stage: &'a str,
-    node_cluster: &'a str,
-    node_namespace: &'a str,
-    node_rollout_group: &'a str,
-    node_public_host: Option<&'a str>,
-    node_public_port: Option<u16>,
-    node_display_name: Option<&'a str>,
-    trusttunnel_runtime_dir: &'a str,
-    trusttunnel_credentials_file: &'a str,
-    trusttunnel_config_file: &'a str,
-    trusttunnel_hosts_file: &'a str,
-    active_path: &'static str,
-    modified_enabled: bool,
-}
-
-#[derive(Serialize)]
-struct SyncReportPayload<'a> {
-    node_external_id: &'a str,
-    node_hostname: &'a str,
-    node_stage: &'a str,
-    node_cluster: &'a str,
-    node_namespace: &'a str,
-    node_rollout_group: &'a str,
-    node_public_host: Option<&'a str>,
-    node_public_port: Option<u16>,
-    node_display_name: Option<&'a str>,
-    trusttunnel_runtime_dir: &'a str,
-    trusttunnel_credentials_file: &'a str,
-    trusttunnel_config_file: &'a str,
-    trusttunnel_hosts_file: &'a str,
-    active_path: &'static str,
-    modified_enabled: bool,
-    version: &'a str,
-    checksum: &'a str,
-    applied: bool,
-    details: &'a str,
-}
-
 struct Agent {
     cfg: Config,
-    client: reqwest::Client,
+    lk_api: LkApiClient,
     state: AgentState,
     node_metadata: NodeMetadata,
 }
@@ -202,11 +141,35 @@ impl Agent {
             .map_err(|e| format!("failed to build HTTP client: {e}"))?;
 
         let state = load_state(&cfg.agent_state_path).await.unwrap_or_default();
-        let node_metadata = NodeMetadata::from_config(&cfg)?;
+        let node_metadata = NodeMetadata {
+            node_external_id: cfg.node_external_id.clone(),
+            node_hostname: cfg.node_hostname.clone(),
+            node_stage: cfg.node_stage.clone(),
+            node_cluster: cfg.node_cluster.clone(),
+            node_namespace: cfg.node_namespace.clone(),
+            node_rollout_group: cfg.node_rollout_group.clone(),
+            node_public_host: cfg.node_public_host.clone(),
+            node_public_port: cfg.node_public_port,
+            node_display_name: cfg.node_display_name.clone(),
+            trusttunnel_runtime_dir: path_to_string(&cfg.trusttunnel_runtime_dir)?.to_string(),
+            trusttunnel_credentials_file: path_to_string(&cfg.trusttunnel_credentials_file)?
+                .to_string(),
+            trusttunnel_config_file: path_to_string(&cfg.trusttunnel_config_file)?.to_string(),
+            trusttunnel_hosts_file: path_to_string(&cfg.trusttunnel_hosts_file)?.to_string(),
+        };
+        let lk_api = LkApiClient::new(
+            client,
+            cfg.lk_base_url.clone(),
+            cfg.lk_service_token.clone(),
+            cfg.register_path.clone(),
+            cfg.heartbeat_path.clone(),
+            cfg.sync_report_path.clone(),
+            cfg.sync_path_template.clone(),
+        );
 
         Ok(Self {
             cfg,
-            client,
+            lk_api,
             state,
             node_metadata,
         })
@@ -341,80 +304,26 @@ impl Agent {
         Ok(())
     }
 
-    async fn pull_snapshot(&self) -> Result<(SnapshotResponse, Vec<u8>), String> {
-        let endpoint = format_url(&self.cfg.lk_base_url, &self.cfg.snapshot_path);
-        let response = self
-            .client
-            .get(endpoint)
-            .header("Authorization", format!("Bearer {}", self.cfg.lk_service_token))
-            .header("X-Internal-Agent-Token", &self.cfg.lk_service_token)
-            .query(&[("node_external_id", self.cfg.node_external_id.as_str())])
-            .send()
-            .await
-            .map_err(|e| format!("LK snapshot request failed: {e}"))?;
-
-        if response.status() != StatusCode::OK {
-            return Err(format!(
-                "LK snapshot request returned HTTP {}",
-                response.status()
-            ));
-        }
-
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| format!("failed to read LK snapshot response: {e}"))?;
-        let parsed = serde_json::from_slice::<SnapshotResponse>(&bytes)
-            .map_err(|e| format!("failed to parse LK snapshot JSON: {e}"))?;
-
-        Ok((parsed, bytes.to_vec()))
+    async fn pull_snapshot(&self) -> Result<(SyncPayload, Vec<u8>), String> {
+        self.lk_api.sync(&self.cfg.node_external_id).await
     }
 
     async fn send_sync_report(
         &self,
-        snapshot: &SnapshotResponse,
+        snapshot: &SyncPayload,
         applied: bool,
         details: &str,
     ) -> Result<(), String> {
-        let endpoint = format_url(&self.cfg.lk_base_url, &self.cfg.sync_report_path);
+        let onboarding = OnboardingPayload::from_metadata(&self.node_metadata);
+        onboarding.validate_compatibility()?;
         let payload = SyncReportPayload {
-            node_external_id: &self.cfg.node_external_id,
-            node_hostname: &self.cfg.node_hostname,
-            node_stage: &self.cfg.node_stage,
-            node_cluster: &self.cfg.node_cluster,
-            node_namespace: &self.cfg.node_namespace,
-            node_rollout_group: &self.cfg.node_rollout_group,
-            node_public_host: self.cfg.node_public_host.as_deref(),
-            node_public_port: self.cfg.node_public_port,
-            node_display_name: self.cfg.node_display_name.as_deref(),
-            trusttunnel_runtime_dir: path_to_string(&self.cfg.trusttunnel_runtime_dir)?,
-            trusttunnel_credentials_file: path_to_string(&self.cfg.trusttunnel_credentials_file)?,
-            trusttunnel_config_file: path_to_string(&self.cfg.trusttunnel_config_file)?,
-            trusttunnel_hosts_file: path_to_string(&self.cfg.trusttunnel_hosts_file)?,
-            active_path: "classic",
-            modified_enabled: false,
+            onboarding,
             version: &snapshot.version,
             checksum: &snapshot.checksum,
             applied,
             details,
         };
-
-        let response = self
-            .client
-            .post(endpoint)
-            .header("Authorization", format!("Bearer {}", self.cfg.lk_service_token))
-            .header("X-Internal-Agent-Token", &self.cfg.lk_service_token)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| format!("sync-report push failed: {e}"))?;
-
-        if !response.status().is_success() {
-            return Err(format!(
-                "sync-report push failed with HTTP {}",
-                response.status()
-            ));
-        }
+        self.lk_api.sync_report(&payload).await?;
 
         println!(
             "sync-report sent: version={} checksum={} applied={} details={}",
@@ -425,38 +334,9 @@ impl Agent {
     }
 
     async fn send_heartbeat(&self) -> Result<(), String> {
-        let endpoint = format_url(&self.cfg.lk_base_url, &self.cfg.heartbeat_path);
-        let payload = HeartbeatPayload {
-            node_external_id: &self.cfg.node_external_id,
-            node_hostname: &self.cfg.node_hostname,
-            node_stage: &self.cfg.node_stage,
-            node_cluster: &self.cfg.node_cluster,
-            node_namespace: &self.cfg.node_namespace,
-            node_rollout_group: &self.cfg.node_rollout_group,
-            node_public_host: self.cfg.node_public_host.as_deref(),
-            node_public_port: self.cfg.node_public_port,
-            node_display_name: self.cfg.node_display_name.as_deref(),
-            trusttunnel_runtime_dir: path_to_string(&self.cfg.trusttunnel_runtime_dir)?,
-            trusttunnel_credentials_file: path_to_string(&self.cfg.trusttunnel_credentials_file)?,
-            trusttunnel_config_file: path_to_string(&self.cfg.trusttunnel_config_file)?,
-            trusttunnel_hosts_file: path_to_string(&self.cfg.trusttunnel_hosts_file)?,
-            active_path: "classic",
-            modified_enabled: false,
-        };
-
-        let response = self
-            .client
-            .post(endpoint)
-            .header("Authorization", format!("Bearer {}", self.cfg.lk_service_token))
-            .header("X-Internal-Agent-Token", &self.cfg.lk_service_token)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| format!("heartbeat push failed: {e}"))?;
-
-        if !response.status().is_success() {
-            return Err(format!("heartbeat push failed with HTTP {}", response.status()));
-        }
+        let payload = OnboardingPayload::from_metadata(&self.node_metadata);
+        payload.validate_compatibility()?;
+        self.lk_api.heartbeat(&payload).await?;
 
         println!(
             "heartbeat sent for node_external_id={}",
@@ -466,18 +346,15 @@ impl Agent {
     }
 
     async fn send_register_once(&self) -> Result<RegisterAttemptOutcome, RegisterError> {
-        let endpoint = format_url(&self.cfg.lk_base_url, &self.cfg.register_path);
-        let payload = RegisterPayload::from_metadata(&self.node_metadata);
-
+        let payload = OnboardingPayload::from_metadata(&self.node_metadata);
+        payload
+            .validate_compatibility()
+            .map_err(RegisterError::Permanent)?;
         let response = self
-            .client
-            .post(endpoint)
-            .header("Authorization", format!("Bearer {}", self.cfg.lk_service_token))
-            .header("X-Internal-Agent-Token", &self.cfg.lk_service_token)
-            .json(&payload)
-            .send()
+            .lk_api
+            .register(&payload)
             .await
-            .map_err(|e| RegisterError::Temporary(format!("register request failed: {e}")))?;
+            .map_err(RegisterError::Temporary)?;
 
         let status = response.status();
         if status.is_success() {
@@ -563,7 +440,7 @@ fn render_credentials(accounts: &[Account]) -> String {
     out
 }
 
-fn validate_checksum(snapshot: &SnapshotResponse, raw_body: &[u8]) -> bool {
+fn validate_checksum(snapshot: &SyncPayload, raw_body: &[u8]) -> bool {
     let expected = snapshot.checksum.to_ascii_lowercase();
     if expected.is_empty() {
         return false;
@@ -573,7 +450,7 @@ fn validate_checksum(snapshot: &SnapshotResponse, raw_body: &[u8]) -> bool {
     candidates.iter().any(|x| x == &expected)
 }
 
-fn checksum_candidates(snapshot: &SnapshotResponse, raw_body: &[u8]) -> Vec<String> {
+fn checksum_candidates(snapshot: &SyncPayload, raw_body: &[u8]) -> Vec<String> {
     let mut stable_accounts = snapshot
         .accounts
         .iter()
@@ -638,10 +515,6 @@ async fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn format_url(base: &str, path: &str) -> String {
-    format!("{}{}", base.trim_end_matches('/'), path)
-}
-
 fn required_env(name: &str) -> Result<String, String> {
     let raw = std::env::var(name).map_err(|_| format!("required env var {name} is missing"))?;
     non_empty_value(name, raw)
@@ -680,84 +553,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(digest.as_ref())
 }
 
-#[derive(Clone)]
-struct NodeMetadata {
-    node_external_id: String,
-    node_hostname: String,
-    node_stage: String,
-    node_cluster: String,
-    node_namespace: String,
-    node_rollout_group: String,
-    node_public_host: Option<String>,
-    node_public_port: Option<u16>,
-    node_display_name: Option<String>,
-    trusttunnel_runtime_dir: String,
-    trusttunnel_credentials_file: String,
-    trusttunnel_config_file: String,
-    trusttunnel_hosts_file: String,
-}
-
-impl NodeMetadata {
-    fn from_config(cfg: &Config) -> Result<Self, String> {
-        Ok(Self {
-            node_external_id: cfg.node_external_id.clone(),
-            node_hostname: cfg.node_hostname.clone(),
-            node_stage: cfg.node_stage.clone(),
-            node_cluster: cfg.node_cluster.clone(),
-            node_namespace: cfg.node_namespace.clone(),
-            node_rollout_group: cfg.node_rollout_group.clone(),
-            node_public_host: cfg.node_public_host.clone(),
-            node_public_port: cfg.node_public_port,
-            node_display_name: cfg.node_display_name.clone(),
-            trusttunnel_runtime_dir: path_to_string(&cfg.trusttunnel_runtime_dir)?.to_string(),
-            trusttunnel_credentials_file: path_to_string(&cfg.trusttunnel_credentials_file)?
-                .to_string(),
-            trusttunnel_config_file: path_to_string(&cfg.trusttunnel_config_file)?.to_string(),
-            trusttunnel_hosts_file: path_to_string(&cfg.trusttunnel_hosts_file)?.to_string(),
-        })
-    }
-}
-
-#[derive(Serialize)]
-struct RegisterPayload<'a> {
-    node_external_id: &'a str,
-    node_hostname: &'a str,
-    node_stage: &'a str,
-    node_cluster: &'a str,
-    node_namespace: &'a str,
-    node_rollout_group: &'a str,
-    node_public_host: Option<&'a str>,
-    node_public_port: Option<u16>,
-    node_display_name: Option<&'a str>,
-    trusttunnel_runtime_dir: &'a str,
-    trusttunnel_credentials_file: &'a str,
-    trusttunnel_config_file: &'a str,
-    trusttunnel_hosts_file: &'a str,
-    active_path: &'static str,
-    modified_enabled: bool,
-}
-
-impl<'a> RegisterPayload<'a> {
-    fn from_metadata(metadata: &'a NodeMetadata) -> Self {
-        Self {
-            node_external_id: &metadata.node_external_id,
-            node_hostname: &metadata.node_hostname,
-            node_stage: &metadata.node_stage,
-            node_cluster: &metadata.node_cluster,
-            node_namespace: &metadata.node_namespace,
-            node_rollout_group: &metadata.node_rollout_group,
-            node_public_host: metadata.node_public_host.as_deref(),
-            node_public_port: metadata.node_public_port,
-            node_display_name: metadata.node_display_name.as_deref(),
-            trusttunnel_runtime_dir: &metadata.trusttunnel_runtime_dir,
-            trusttunnel_credentials_file: &metadata.trusttunnel_credentials_file,
-            trusttunnel_config_file: &metadata.trusttunnel_config_file,
-            trusttunnel_hosts_file: &metadata.trusttunnel_hosts_file,
-            active_path: "classic",
-            modified_enabled: false,
-        }
-    }
-}
 
 enum RegisterAttemptOutcome {
     Registered,
@@ -818,7 +613,7 @@ mod tests {
     #[test]
     fn checksum_accepts_sha_of_raw_body() {
         let raw = br#"{"version":"1","checksum":"","accounts":[]}"#;
-        let snapshot = SnapshotResponse {
+        let snapshot = SyncPayload {
             version: "1".to_string(),
             checksum: sha256_hex(raw),
             accounts: vec![],
@@ -829,7 +624,7 @@ mod tests {
 
     #[test]
     fn checksum_rejects_unknown_hash() {
-        let snapshot = SnapshotResponse {
+        let snapshot = SyncPayload {
             version: "1".to_string(),
             checksum: "deadbeef".to_string(),
             accounts: vec![],
