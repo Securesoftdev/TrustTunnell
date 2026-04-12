@@ -2,6 +2,8 @@
 
 ## 1.0.28
 
+- [Fix] Docker image builds no longer fail on `docker-entrypoint.sh` copy step because the Dockerfile now uses a build-context-relative path.
+
 - [Fix] `classic_agent` now supports one-time bootstrap import from `TRUSTTUNNEL_BOOTSTRAP_CREDENTIALS_FILE` into `TRUSTTUNNEL_RUNTIME_DIR/<TRUSTTUNNEL_CREDENTIALS_FILE>`, then marks runtime credentials as primary after the first successful sync/apply and stops treating bootstrap storage as primary on restart.
 
 - [Fix] `classic_agent` now persists failed `sync-report` deliveries in `pending_sync_reports.jsonl` under `TRUSTTUNNEL_RUNTIME_DIR` and retries them with backoff until they are delivered.
