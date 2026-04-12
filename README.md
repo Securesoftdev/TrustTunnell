@@ -525,6 +525,7 @@ Classic agent optional environment variables:
 - `LK_SNAPSHOT_PATH` (default `/internal/vpn/classic/accounts`)
 - `LK_SYNC_REPORT_PATH` (default `/internal/vpn/classic/sync-report`)
 - `LK_HEARTBEAT_PATH` (default `/internal/vpn/classic/heartbeat`)
+- `AGENT_METRICS_ADDRESS` (default `127.0.0.1:9901`, Prometheus endpoint exposed as `GET /metrics`)
 
 Classic agent runtime credentials migration and restart recovery:
 
@@ -532,3 +533,19 @@ Classic agent runtime credentials migration and restart recovery:
 - After the first successful `sync` + apply cycle, the agent creates a marker file `.runtime_credentials_primary` in `TRUSTTUNNEL_RUNTIME_DIR` and treats runtime credentials as the source of truth.
 - After this marker exists, restarts do not re-import credentials from the bootstrap source (for example, from a read-only ConfigMap mount), so runtime no longer depends on that source as the primary store.
 - If runtime credentials are lost after migration, restart does not restore them from bootstrap; the next successful LK sync recreates runtime credentials and reapplies runtime configuration.
+
+Classic agent sidecar observability:
+
+- Structured logs are emitted in JSON with normalized fields: `revision`, `node`, `status`, and `error_class`.
+- Internal Prometheus endpoint is exposed on `AGENT_METRICS_ADDRESS` via `GET /metrics`.
+- Sidecar metrics include:
+  - `classic_agent_last_successful_sync_timestamp_seconds`
+  - `classic_agent_last_failed_sync_timestamp_seconds`
+  - `classic_agent_apply_duration_milliseconds`
+  - `classic_agent_credentials_count`
+  - `classic_agent_heartbeat_status`
+  - `classic_agent_endpoint_process_status`
+  - Operation counters with labels `revision/node/status/error_class`:
+    - `classic_agent_sync_total`
+    - `classic_agent_apply_total`
+    - `classic_agent_heartbeat_total`
