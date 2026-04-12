@@ -12,9 +12,12 @@ use std::collections::HashMap;
 use std::fs::read_dir;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::process::Command;
 use tokio::time::{interval, MissedTickBehavior};
+use toml_edit::value;
+use trusttunnel::settings::Settings;
 
 const REGISTER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const REGISTER_MAX_BACKOFF: Duration = Duration::from_secs(60);
@@ -312,19 +315,44 @@ impl Agent {
             snapshot.accounts.iter().filter(|a| a.enabled).count()
         );
 
-        atomic_write(&self.cfg.runtime_credentials_path, rendered.as_bytes()).await?;
+        let previous_runtime_credentials = fs::read(&self.cfg.runtime_credentials_path).await.ok();
+        let tmp_credentials_path = self
+            .write_runtime_credentials_tmp(rendered.as_bytes())
+            .await?;
+        if let Err(err) = self.validate_credentials_with_endpoint_parser(&tmp_credentials_path) {
+            let _ = fs::remove_file(&tmp_credentials_path).await;
+            return Err(err);
+        }
+        self.promote_runtime_credentials(&tmp_credentials_path).await?;
         println!(
             "credentials updated atomically at {}",
             self.cfg.runtime_credentials_path.display()
         );
 
         let apply_result = self.apply_runtime().await;
+        let apply_result = match apply_result {
+            Ok(()) => self.verify_runtime_post_apply(&rendered_sha).await,
+            Err(err) => Err(err),
+        };
         let apply_ok = apply_result.is_ok();
         let apply_details = match apply_result {
             Ok(_) => "runtime apply succeeded".to_string(),
-            Err(e) => format!("runtime apply failed: {e}"),
+            Err(e) => {
+                let rollback_result = self.rollback_runtime(previous_runtime_credentials).await;
+                match rollback_result {
+                    Ok(()) => format!("runtime apply failed and rollback completed: {e}"),
+                    Err(rollback_err) => format!(
+                        "runtime apply failed: {e}; rollback failed: {rollback_err}"
+                    ),
+                }
+            }
         };
         self.last_apply_status = apply_details.clone();
+
+        if !apply_ok {
+            self.send_sync_report(&snapshot, false, &apply_details).await?;
+            return Err(apply_details);
+        }
 
         self.state = AgentState {
             version: snapshot.version.clone(),
@@ -332,12 +360,7 @@ impl Agent {
             credentials_sha256: rendered_sha,
         };
         persist_state(&self.cfg.agent_state_path, &self.state).await?;
-
-        self.send_sync_report(&snapshot, apply_ok, &apply_details).await?;
-
-        if !apply_ok {
-            return Err(apply_details);
-        }
+        self.send_sync_report(&snapshot, true, &apply_details).await?;
 
         Ok(())
     }
@@ -481,6 +504,140 @@ impl Agent {
 
         println!("runtime apply finished successfully");
         Ok(())
+    }
+
+    async fn write_runtime_credentials_tmp(&self, data: &[u8]) -> Result<PathBuf, String> {
+        let parent = self
+            .cfg
+            .runtime_credentials_path
+            .parent()
+            .ok_or_else(|| {
+                format!(
+                    "runtime credentials path has no parent: {}",
+                    self.cfg.runtime_credentials_path.display()
+                )
+            })?;
+        fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("failed to create runtime directory {}: {e}", parent.display()))?;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|x| x.as_nanos())
+            .unwrap_or_default();
+        let tmp_path = parent.join(format!(
+            ".{}.candidate.{}.{nonce}.tmp",
+            self.cfg
+                .runtime_credentials_path
+                .file_name()
+                .and_then(|x| x.to_str())
+                .unwrap_or("credentials"),
+            std::process::id()
+        ));
+        fs::write(&tmp_path, data)
+            .await
+            .map_err(|e| format!("failed to write candidate credentials {}: {e}", tmp_path.display()))?;
+
+        Ok(tmp_path)
+    }
+
+    fn validate_credentials_with_endpoint_parser(&self, candidate_path: &Path) -> Result<(), String> {
+        let settings_path = self.resolve_runtime_path(&self.cfg.trusttunnel_config_file);
+        let settings_content = std::fs::read_to_string(&settings_path).map_err(|e| {
+            format!(
+                "failed to read endpoint settings {}: {e}",
+                settings_path.display()
+            )
+        })?;
+        let mut settings_doc = settings_content.parse::<toml_edit::Document>().map_err(|e| {
+            format!(
+                "failed to parse endpoint settings {}: {e}",
+                settings_path.display()
+            )
+        })?;
+        let candidate_path_str = path_to_string(candidate_path)?.to_string();
+        settings_doc["credentials_file"] = value(candidate_path_str);
+
+        toml::from_str::<Settings>(&settings_doc.to_string())
+            .map(|_| ())
+            .map_err(|e| format!("failed to validate candidate credentials via endpoint parser: {e}"))
+    }
+
+    async fn promote_runtime_credentials(&self, candidate_path: &Path) -> Result<(), String> {
+        fs::rename(candidate_path, &self.cfg.runtime_credentials_path)
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to atomically rename {} -> {}: {e}",
+                    candidate_path.display(),
+                    self.cfg.runtime_credentials_path.display()
+                )
+            })
+    }
+
+    async fn verify_runtime_post_apply(&self, expected_revision: &str) -> Result<(), String> {
+        let runtime_status = RuntimeStatus::collect(
+            &self.cfg.runtime_pid_path,
+            &self.cfg.runtime_process_name,
+            &self.cfg.runtime_credentials_path,
+        );
+        if runtime_status.health_status() == "dead" {
+            return Err("runtime health check failed: dead".to_string());
+        }
+
+        let actual_credentials = fs::read(&self.cfg.runtime_credentials_path)
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to read runtime credentials {}: {e}",
+                    self.cfg.runtime_credentials_path.display()
+                )
+            })?;
+        let actual_revision = sha256_hex(&actual_credentials);
+        if actual_revision != expected_revision {
+            return Err(format!(
+                "runtime revision mismatch: expected={expected_revision}, actual={actual_revision}"
+            ));
+        }
+
+        Ok(())
+    }
+
+    async fn rollback_runtime(&self, previous_runtime_credentials: Option<Vec<u8>>) -> Result<(), String> {
+        match previous_runtime_credentials {
+            Some(data) => {
+                atomic_write(&self.cfg.runtime_credentials_path, &data).await?;
+            }
+            None => {
+                if fs::try_exists(&self.cfg.runtime_credentials_path)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "failed to check runtime credentials presence {}: {e}",
+                            self.cfg.runtime_credentials_path.display()
+                        )
+                    })?
+                {
+                    fs::remove_file(&self.cfg.runtime_credentials_path)
+                        .await
+                        .map_err(|e| {
+                            format!(
+                                "failed to remove runtime credentials {} during rollback: {e}",
+                                self.cfg.runtime_credentials_path.display()
+                            )
+                        })?;
+                }
+            }
+        }
+
+        self.apply_runtime()
+            .await
+            .map_err(|e| format!("failed to re-apply runtime after rollback: {e}"))?;
+        Ok(())
+    }
+
+    fn resolve_runtime_path(&self, path: &Path) -> PathBuf {
+        resolve_runtime_path(&self.cfg.trusttunnel_runtime_dir, path)
     }
 }
 
@@ -820,6 +977,13 @@ fn path_to_string(path: &Path) -> Result<&str, String> {
         .ok_or_else(|| format!("path must be valid UTF-8: {}", path.display()))
 }
 
+fn resolve_runtime_path(runtime_dir: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    runtime_dir.join(path)
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
     hex::encode(digest.as_ref())
@@ -938,5 +1102,24 @@ mod tests {
         assert!(is_temporary_http_status(StatusCode::TOO_MANY_REQUESTS));
         assert!(is_temporary_http_status(StatusCode::BAD_GATEWAY));
         assert!(!is_temporary_http_status(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn resolve_runtime_path_keeps_absolute_paths() {
+        let runtime_dir = Path::new("/var/lib/trusttunnel");
+        let path = Path::new("/etc/trusttunnel/vpn.toml");
+
+        assert_eq!(resolve_runtime_path(runtime_dir, path), path);
+    }
+
+    #[test]
+    fn resolve_runtime_path_joins_relative_paths() {
+        let runtime_dir = Path::new("/var/lib/trusttunnel");
+        let path = Path::new("vpn.toml");
+
+        assert_eq!(
+            resolve_runtime_path(runtime_dir, path),
+            Path::new("/var/lib/trusttunnel/vpn.toml")
+        );
     }
 }
