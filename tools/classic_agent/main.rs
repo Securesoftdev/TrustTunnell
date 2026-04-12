@@ -1724,7 +1724,240 @@ fn is_temporary_http_status(status: StatusCode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::{BodyExt, Full};
+    use hyper::body::{Bytes, Incoming};
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper::{Method, Request, Response, StatusCode as HyperStatusCode};
+    use hyper_util::rt::TokioIo;
+    use std::collections::VecDeque;
+    use std::convert::Infallible;
+    use std::sync::Arc;
     use tempfile::TempDir;
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex;
+
+    #[derive(Clone)]
+    struct MockResponse {
+        status: HyperStatusCode,
+        body: String,
+    }
+
+    #[derive(Clone)]
+    struct CapturedRequest {
+        method: Method,
+        path: String,
+        body: String,
+    }
+
+    #[derive(Default)]
+    struct MockState {
+        routes: HashMap<(Method, String), VecDeque<MockResponse>>,
+        captured: Vec<CapturedRequest>,
+    }
+
+    struct MockHttpServer {
+        base_url: String,
+        state: Arc<Mutex<MockState>>,
+    }
+
+    impl MockHttpServer {
+        async fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let state = Arc::new(Mutex::new(MockState::default()));
+            let state_for_task = Arc::clone(&state);
+
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let io = TokioIo::new(stream);
+                    let state_for_conn = Arc::clone(&state_for_task);
+                    tokio::spawn(async move {
+                        let service = service_fn(move |req: Request<Incoming>| {
+                            let state_for_req = Arc::clone(&state_for_conn);
+                            async move {
+                                let method = req.method().clone();
+                                let path = req.uri().path().to_string();
+                                let body = req
+                                    .into_body()
+                                    .collect()
+                                    .await
+                                    .map(|x| x.to_bytes())
+                                    .unwrap_or_else(|_| Bytes::new());
+                                let body = String::from_utf8_lossy(&body).to_string();
+
+                                let mut guard = state_for_req.lock().await;
+                                guard.captured.push(CapturedRequest {
+                                    method: method.clone(),
+                                    path: path.clone(),
+                                    body,
+                                });
+                                let response = guard
+                                    .routes
+                                    .get_mut(&(method, path))
+                                    .and_then(|queue| queue.pop_front())
+                                    .unwrap_or(MockResponse {
+                                        status: HyperStatusCode::NOT_FOUND,
+                                        body: String::new(),
+                                    });
+
+                                Ok::<_, Infallible>(
+                                    Response::builder()
+                                        .status(response.status)
+                                        .body(Full::new(Bytes::from(response.body)))
+                                        .unwrap(),
+                                )
+                            }
+                        });
+
+                        let _ = http1::Builder::new().serve_connection(io, service).await;
+                    });
+                }
+            });
+
+            Self {
+                base_url: format!("http://{addr}"),
+                state,
+            }
+        }
+
+        async fn enqueue(
+            &self,
+            method: Method,
+            path: &str,
+            status: HyperStatusCode,
+            body: impl Into<String>,
+        ) {
+            let mut guard = self.state.lock().await;
+            guard
+                .routes
+                .entry((method, path.to_string()))
+                .or_default()
+                .push_back(MockResponse {
+                    status,
+                    body: body.into(),
+                });
+        }
+
+        async fn captured(&self) -> Vec<CapturedRequest> {
+            self.state.lock().await.captured.clone()
+        }
+    }
+
+    async fn make_agent(
+        temp_dir: &TempDir,
+        base_url: &str,
+        apply_cmd: Option<&str>,
+    ) -> Agent {
+        let runtime_dir = temp_dir.path().join("runtime");
+        fs::create_dir_all(&runtime_dir).await.unwrap();
+        let config_file = runtime_dir.join("vpn.toml");
+        let credentials_file_rel = PathBuf::from("credentials.toml");
+        let credentials_file_abs = runtime_dir.join(&credentials_file_rel);
+        let hosts_file = runtime_dir.join("hosts.toml");
+        let rules_file = runtime_dir.join("rules.toml");
+        fs::write(&credentials_file_abs, b"").await.unwrap();
+        fs::write(&hosts_file, b"").await.unwrap();
+        fs::write(&rules_file, b"").await.unwrap();
+
+        let settings = format!(
+            r#"
+listen_address = "127.0.0.1:443"
+credentials_file = "{}"
+rules_file = "{}"
+
+[listen_protocols]
+
+[listen_protocols.http1]
+upload_buffer_size = 32768
+
+[listen_protocols.http2]
+initial_connection_window_size = 8388608
+initial_stream_window_size = 131072
+max_concurrent_streams = 1000
+max_frame_size = 16384
+header_table_size = 65536
+
+[listen_protocols.quic]
+recv_udp_payload_size = 1350
+send_udp_payload_size = 1350
+initial_max_data = 104857600
+initial_max_stream_data_bidi_local = 1048576
+initial_max_stream_data_bidi_remote = 1048576
+initial_max_stream_data_uni = 1048576
+initial_max_streams_bidi = 4096
+initial_max_streams_uni = 4096
+max_connection_window = 25165824
+max_stream_window = 16777216
+disable_active_migration = true
+enable_early_data = true
+message_queue_capacity = 4096
+"#,
+            credentials_file_abs.display(),
+            rules_file.display()
+        );
+        fs::write(&config_file, settings).await.unwrap();
+
+        let cfg = Config {
+            lk_base_url: base_url.to_string(),
+            lk_service_token: "token".to_string(),
+            node_external_id: "node-1".to_string(),
+            node_hostname: "node-1.example".to_string(),
+            node_stage: "prod".to_string(),
+            node_cluster: "cluster-a".to_string(),
+            node_namespace: "default".to_string(),
+            node_rollout_group: "g1".to_string(),
+            node_public_host: None,
+            node_public_port: None,
+            node_display_name: None,
+            trusttunnel_runtime_dir: runtime_dir.clone(),
+            trusttunnel_credentials_file: credentials_file_rel,
+            trusttunnel_config_file: config_file.clone(),
+            trusttunnel_hosts_file: hosts_file,
+            bootstrap_credentials_source_path: None,
+            runtime_credentials_path: credentials_file_abs,
+            runtime_primary_marker_path: runtime_dir.join(RUNTIME_PRIMARY_MARKER_FILE),
+            agent_state_path: runtime_dir.join("agent_state.json"),
+            poll_interval: Duration::from_secs(60),
+            heartbeat_interval: Duration::from_secs(60),
+            sync_path_template: "/sync/{externalNodeId}".to_string(),
+            sync_report_path: "/sync-report".to_string(),
+            heartbeat_path: "/heartbeat".to_string(),
+            register_path: "/register".to_string(),
+            apply_cmd: apply_cmd.map(ToString::to_string),
+            runtime_pid_path: runtime_dir.join("trusttunnel.pid"),
+            runtime_process_name: "trusttunnel_endpoint".to_string(),
+            runtime_version: "test".to_string(),
+            pending_sync_reports_path: runtime_dir.join(SYNC_REPORT_OUTBOX_FILE),
+            metrics_address: "127.0.0.1:9901".parse().unwrap(),
+        };
+
+        Agent::new(cfg).await.unwrap()
+    }
+
+    fn snapshot_json(
+        version: &str,
+        onboarding_state: &str,
+        sync_required: bool,
+        accounts: Vec<Account>,
+    ) -> String {
+        let snapshot = SyncPayload {
+            version: version.to_string(),
+            checksum: "placeholder".to_string(),
+            onboarding_state: onboarding_state.to_string(),
+            sync_required,
+            accounts,
+        };
+        let checksum = checksum_candidates(&snapshot, b"{}")[1].clone();
+        serde_json::json!({
+            "version": snapshot.version,
+            "checksum": checksum,
+            "onboardingState": snapshot.onboarding_state,
+            "syncRequired": snapshot.sync_required,
+            "users": snapshot.accounts,
+        })
+        .to_string()
+    }
 
     #[test]
     fn credentials_include_only_enabled_accounts() {
@@ -1879,5 +2112,261 @@ mod tests {
         assert!(names.contains(&"classic_agent_credentials_count".to_string()));
         assert!(names.contains(&"classic_agent_heartbeat_status".to_string()));
         assert!(names.contains(&"classic_agent_endpoint_process_status".to_string()));
+    }
+
+    #[tokio::test]
+    async fn sync_once_valid_config_applies_and_reports_success() {
+        let server = MockHttpServer::start().await;
+        let tmp_dir = TempDir::new().unwrap();
+        let mut agent = make_agent(&tmp_dir, &server.base_url, Some("true")).await;
+        fs::write(&agent.cfg.runtime_credentials_path, b"[[client]]\nusername=\"old\"\npassword=\"old\"\n")
+            .await
+            .unwrap();
+        let body = snapshot_json(
+            "v1",
+            "active",
+            true,
+            vec![Account {
+                username: "alice".to_string(),
+                password: "secret".to_string(),
+                enabled: true,
+            }],
+        );
+        server
+            .enqueue(
+                Method::GET,
+                "/sync/node-1",
+                HyperStatusCode::OK,
+                body.clone(),
+            )
+            .await;
+        server
+            .enqueue(Method::POST, "/sync-report", HyperStatusCode::OK, "")
+            .await;
+
+        agent.sync_once().await.unwrap();
+        let creds = fs::read_to_string(&agent.cfg.runtime_credentials_path)
+            .await
+            .unwrap();
+        assert!(creds.contains("username = \"alice\""));
+        assert_eq!(agent.state.version, "v1");
+        assert!(!fs::try_exists(&agent.cfg.pending_sync_reports_path).await.unwrap());
+
+        let requests = server.captured().await;
+        let report = requests
+            .iter()
+            .find(|x| x.method == Method::POST && x.path == "/sync-report")
+            .unwrap();
+        assert!(report.body.contains("\"applied\":true"));
+    }
+
+    #[tokio::test]
+    async fn sync_once_onboarding_not_active_skips_apply() {
+        let server = MockHttpServer::start().await;
+        let tmp_dir = TempDir::new().unwrap();
+        let mut agent = make_agent(&tmp_dir, &server.base_url, Some("true")).await;
+        let body = snapshot_json("v1", "pending", true, vec![]);
+        server
+            .enqueue(Method::GET, "/sync/node-1", HyperStatusCode::OK, body)
+            .await;
+        server
+            .enqueue(Method::POST, "/sync-report", HyperStatusCode::OK, "")
+            .await;
+
+        agent.sync_once().await.unwrap();
+        assert!(agent.last_apply_status.contains("onboarding_state=pending"));
+        let requests = server.captured().await;
+        let report = requests
+            .iter()
+            .find(|x| x.method == Method::POST && x.path == "/sync-report")
+            .unwrap();
+        assert!(report.body.contains("\"applied\":false"));
+    }
+
+    #[tokio::test]
+    async fn sync_once_sync_required_false_skips_apply() {
+        let server = MockHttpServer::start().await;
+        let tmp_dir = TempDir::new().unwrap();
+        let mut agent = make_agent(&tmp_dir, &server.base_url, Some("true")).await;
+        let body = snapshot_json("v1", "active", false, vec![]);
+        server
+            .enqueue(Method::GET, "/sync/node-1", HyperStatusCode::OK, body)
+            .await;
+        server
+            .enqueue(Method::POST, "/sync-report", HyperStatusCode::OK, "")
+            .await;
+
+        agent.sync_once().await.unwrap();
+        assert_eq!(agent.last_apply_status, "sync apply skipped: sync_required=false");
+        let requests = server.captured().await;
+        let report = requests
+            .iter()
+            .find(|x| x.method == Method::POST && x.path == "/sync-report")
+            .unwrap();
+        assert!(report.body.contains("\"applied\":false"));
+    }
+
+    #[tokio::test]
+    async fn sync_once_apply_failure_rolls_back_runtime_credentials() {
+        let server = MockHttpServer::start().await;
+        let tmp_dir = TempDir::new().unwrap();
+        let mut agent = make_agent(&tmp_dir, &server.base_url, Some("false")).await;
+        let original = b"[[client]]\nusername=\"before\"\npassword=\"before\"\n";
+        fs::write(&agent.cfg.runtime_credentials_path, original)
+            .await
+            .unwrap();
+        let body = snapshot_json(
+            "v2",
+            "active",
+            true,
+            vec![Account {
+                username: "alice".to_string(),
+                password: "new".to_string(),
+                enabled: true,
+            }],
+        );
+        server
+            .enqueue(Method::GET, "/sync/node-1", HyperStatusCode::OK, body)
+            .await;
+        server
+            .enqueue(Method::POST, "/sync-report", HyperStatusCode::OK, "")
+            .await;
+
+        let err = agent.sync_once().await.unwrap_err();
+        assert!(err.contains("rollback completed"));
+        let creds = fs::read(&agent.cfg.runtime_credentials_path).await.unwrap();
+        assert_eq!(creds, original);
+    }
+
+    #[tokio::test]
+    async fn failed_apply_with_sync_report_error_is_queued_for_retry() {
+        let server = MockHttpServer::start().await;
+        let tmp_dir = TempDir::new().unwrap();
+        let mut agent = make_agent(&tmp_dir, &server.base_url, Some("false")).await;
+        fs::write(
+            &agent.cfg.runtime_credentials_path,
+            b"[[client]]\nusername=\"old\"\npassword=\"old\"\n",
+        )
+        .await
+        .unwrap();
+        let body = snapshot_json(
+            "v3",
+            "active",
+            true,
+            vec![Account {
+                username: "alice".to_string(),
+                password: "new".to_string(),
+                enabled: true,
+            }],
+        );
+        server
+            .enqueue(Method::GET, "/sync/node-1", HyperStatusCode::OK, body)
+            .await;
+        server
+            .enqueue(
+                Method::POST,
+                "/sync-report",
+                HyperStatusCode::INTERNAL_SERVER_ERROR,
+                "",
+            )
+            .await;
+
+        let _ = agent.sync_once().await.unwrap_err();
+        assert!(fs::try_exists(&agent.cfg.pending_sync_reports_path).await.unwrap());
+        let queued = load_pending_sync_reports(&agent.cfg.pending_sync_reports_path)
+            .await
+            .unwrap();
+        assert_eq!(queued.len(), 1);
+        assert!(!queued[0].applied);
+    }
+
+    #[tokio::test]
+    async fn register_retries_on_temporary_lk_unavailability() {
+        let server = MockHttpServer::start().await;
+        let tmp_dir = TempDir::new().unwrap();
+        let agent = make_agent(&tmp_dir, &server.base_url, None).await;
+        server
+            .enqueue(
+                Method::POST,
+                "/register",
+                HyperStatusCode::SERVICE_UNAVAILABLE,
+                "",
+            )
+            .await;
+        server
+            .enqueue(Method::POST, "/register", HyperStatusCode::OK, "")
+            .await;
+
+        let started = std::time::Instant::now();
+        agent.bootstrap_register().await;
+        assert!(started.elapsed() >= REGISTER_INITIAL_BACKOFF);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_loop_is_resilient_to_temporary_lk_errors() {
+        let server = MockHttpServer::start().await;
+        let tmp_dir = TempDir::new().unwrap();
+        let agent = make_agent(&tmp_dir, &server.base_url, None).await;
+        server
+            .enqueue(
+                Method::POST,
+                "/heartbeat",
+                HyperStatusCode::INTERNAL_SERVER_ERROR,
+                "",
+            )
+            .await;
+        server
+            .enqueue(
+                Method::POST,
+                "/heartbeat",
+                HyperStatusCode::BAD_GATEWAY,
+                "",
+            )
+            .await;
+        server
+            .enqueue(Method::POST, "/heartbeat", HyperStatusCode::OK, "")
+            .await;
+
+        agent.send_heartbeat_with_retry().await;
+        let requests = server.captured().await;
+        let heartbeat_count = requests
+            .iter()
+            .filter(|x| x.method == Method::POST && x.path == "/heartbeat")
+            .count();
+        assert_eq!(heartbeat_count, 3);
+    }
+
+    #[tokio::test]
+    async fn temporary_lk_sync_failure_does_not_break_subsequent_sync() {
+        let server = MockHttpServer::start().await;
+        let tmp_dir = TempDir::new().unwrap();
+        let mut agent = make_agent(&tmp_dir, &server.base_url, Some("true")).await;
+        let valid_body = snapshot_json(
+            "v4",
+            "active",
+            true,
+            vec![Account {
+                username: "ok".to_string(),
+                password: "ok".to_string(),
+                enabled: true,
+            }],
+        );
+        server
+            .enqueue(
+                Method::GET,
+                "/sync/node-1",
+                HyperStatusCode::SERVICE_UNAVAILABLE,
+                "",
+            )
+            .await;
+        server
+            .enqueue(Method::GET, "/sync/node-1", HyperStatusCode::OK, valid_body)
+            .await;
+        server
+            .enqueue(Method::POST, "/sync-report", HyperStatusCode::OK, "")
+            .await;
+
+        assert!(agent.sync_once().await.is_err());
+        assert!(agent.sync_once().await.is_ok());
     }
 }
