@@ -218,13 +218,15 @@ impl Agent {
             cfg.sync_path_template.clone(),
         );
 
+        let metrics = Arc::new(AgentMetrics::new(&node_metadata.node_external_id)?);
+
         Ok(Self {
             cfg,
             lk_api,
             state,
             node_metadata,
             last_apply_status: "unknown".to_string(),
-            metrics: Arc::new(AgentMetrics::new(&node_metadata.node_external_id)?),
+            metrics,
             sync_report_backoff: SYNC_REPORT_INITIAL_BACKOFF,
             sync_report_next_retry_at: Instant::now(),
         })
@@ -334,7 +336,7 @@ impl Agent {
 
     async fn sync_once(&mut self) -> Result<(), String> {
         let (snapshot, raw_body) = self.pull_snapshot().await?;
-        let node = self.cfg.node_external_id.as_str();
+        let node = self.cfg.node_external_id.clone();
 
         if snapshot.onboarding_state != "active" {
             let details = format!(
@@ -346,12 +348,12 @@ impl Agent {
             self.send_sync_report(&snapshot, false, &details).await?;
             self.metrics
                 .sync_total
-                .with_label_values(&[node, &snapshot.version, "skipped", "onboarding_state"])
+                .with_label_values(&[&node, &snapshot.version, "skipped", "onboarding_state"])
                 .inc();
             log_event(
                 "info",
                 &snapshot.version,
-                node,
+                &node,
                 "sync_skipped",
                 "onboarding_state",
             );
@@ -365,12 +367,12 @@ impl Agent {
             self.send_sync_report(&snapshot, false, &details).await?;
             self.metrics
                 .sync_total
-                .with_label_values(&[node, &snapshot.version, "skipped", "sync_not_required"])
+                .with_label_values(&[&node, &snapshot.version, "skipped", "sync_not_required"])
                 .inc();
             log_event(
                 "info",
                 &snapshot.version,
-                node,
+                &node,
                 "sync_skipped",
                 "sync_not_required",
             );
@@ -383,13 +385,19 @@ impl Agent {
             self.send_sync_report(&snapshot, false, detail).await?;
             self.metrics
                 .sync_total
-                .with_label_values(&[node, &snapshot.version, "failed", "invalid_checksum"])
+                .with_label_values(&[&node, &snapshot.version, "failed", "invalid_checksum"])
                 .inc();
             self.metrics
                 .last_failed_sync
-                .with_label_values(&[node])
+                .with_label_values(&[&node])
                 .set(chrono::Utc::now().timestamp());
-            log_event("error", &snapshot.version, node, "sync_failed", "invalid_checksum");
+            log_event(
+                "error",
+                &snapshot.version,
+                &node,
+                "sync_failed",
+                "invalid_checksum",
+            );
             return Err(detail.to_string());
         }
 
@@ -406,9 +414,9 @@ impl Agent {
             );
             self.metrics
                 .sync_total
-                .with_label_values(&[node, &snapshot.version, "unchanged", "none"])
+                .with_label_values(&[&node, &snapshot.version, "unchanged", "none"])
                 .inc();
-            log_event("info", &snapshot.version, node, "sync_unchanged", "none");
+            log_event("info", &snapshot.version, &node, "sync_unchanged", "none");
             return Ok(());
         }
 
@@ -421,7 +429,7 @@ impl Agent {
         );
         self.metrics
             .credentials_count
-            .with_label_values(&[node])
+            .with_label_values(&[&node])
             .set(snapshot.accounts.iter().filter(|a| a.enabled).count() as i64);
 
         let previous_runtime_credentials = fs::read(&self.cfg.runtime_credentials_path).await.ok();
@@ -446,7 +454,7 @@ impl Agent {
         };
         self.metrics
             .apply_duration_ms
-            .with_label_values(&[node])
+            .with_label_values(&[&node])
             .set(apply_started.elapsed().as_millis() as i64);
         let apply_ok = apply_result.is_ok();
         let apply_details = match apply_result {
@@ -463,7 +471,7 @@ impl Agent {
         };
         self.last_apply_status = apply_details.clone();
         self.metrics.apply_total.with_label_values(&[
-            node,
+            &node,
             &snapshot.version,
             if apply_ok { "success" } else { "failed" },
             if apply_ok { "none" } else { "apply_or_verify" },
@@ -471,7 +479,7 @@ impl Agent {
         log_event(
             if apply_ok { "info" } else { "error" },
             &snapshot.version,
-            node,
+            &node,
             if apply_ok { "apply_success" } else { "apply_failed" },
             if apply_ok { "none" } else { "apply_or_verify" },
         );
@@ -479,13 +487,13 @@ impl Agent {
         if !apply_ok {
             self.metrics
                 .sync_total
-                .with_label_values(&[node, &snapshot.version, "failed", "apply"])
+                .with_label_values(&[&node, &snapshot.version, "failed", "apply"])
                 .inc();
             self.metrics
                 .last_failed_sync
-                .with_label_values(&[node])
+                .with_label_values(&[&node])
                 .set(chrono::Utc::now().timestamp());
-            log_event("error", &snapshot.version, node, "sync_failed", "apply");
+            log_event("error", &snapshot.version, &node, "sync_failed", "apply");
             self.send_sync_report(&snapshot, false, &apply_details).await?;
             return Err(apply_details);
         }
@@ -500,13 +508,13 @@ impl Agent {
         self.send_sync_report(&snapshot, true, &apply_details).await?;
         self.metrics
             .sync_total
-            .with_label_values(&[node, &snapshot.version, "success", "none"])
+            .with_label_values(&[&node, &snapshot.version, "success", "none"])
             .inc();
         self.metrics
             .last_successful_sync
-            .with_label_values(&[node])
+            .with_label_values(&[&node])
             .set(chrono::Utc::now().timestamp());
-        log_event("info", &snapshot.version, node, "sync_success", "none");
+        log_event("info", &snapshot.version, &node, "sync_success", "none");
 
         Ok(())
     }
