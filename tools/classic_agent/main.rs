@@ -13,9 +13,10 @@ use std::fs::read_dir;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::fs;
+use tokio::fs::{self, OpenOptions};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{Instant, MissedTickBehavior, interval};
 use toml_edit::value;
 use trusttunnel::settings::Settings;
 
@@ -24,6 +25,9 @@ const REGISTER_MAX_BACKOFF: Duration = Duration::from_secs(60);
 const HEARTBEAT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const HEARTBEAT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const HEARTBEAT_MAX_ATTEMPTS: usize = 3;
+const SYNC_REPORT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const SYNC_REPORT_MAX_BACKOFF: Duration = Duration::from_secs(300);
+const SYNC_REPORT_OUTBOX_FILE: &str = "pending_sync_reports.jsonl";
 
 #[derive(Clone)]
 struct Config {
@@ -54,6 +58,7 @@ struct Config {
     runtime_pid_path: PathBuf,
     runtime_process_name: String,
     runtime_version: String,
+    pending_sync_reports_path: PathBuf,
 }
 
 impl Config {
@@ -107,6 +112,7 @@ impl Config {
             .unwrap_or_else(|_| "trusttunnel_endpoint".to_string());
         let runtime_version = std::env::var("TRUSTTUNNEL_RUNTIME_VERSION")
             .unwrap_or_else(|_| "unknown".to_string());
+        let pending_sync_reports_path = trusttunnel_runtime_dir.join(SYNC_REPORT_OUTBOX_FILE);
 
         Ok(Self {
             lk_base_url,
@@ -136,6 +142,7 @@ impl Config {
             runtime_pid_path,
             runtime_process_name,
             runtime_version,
+            pending_sync_reports_path,
         })
     }
 }
@@ -153,6 +160,8 @@ struct Agent {
     state: AgentState,
     node_metadata: NodeMetadata,
     last_apply_status: String,
+    sync_report_backoff: Duration,
+    sync_report_next_retry_at: Instant,
 }
 
 impl Agent {
@@ -195,6 +204,8 @@ impl Agent {
             state,
             node_metadata,
             last_apply_status: "unknown".to_string(),
+            sync_report_backoff: SYNC_REPORT_INITIAL_BACKOFF,
+            sync_report_next_retry_at: Instant::now(),
         })
     }
 
@@ -206,6 +217,8 @@ impl Agent {
 
         let mut heartbeat_tick = interval(self.cfg.heartbeat_interval);
         heartbeat_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut sync_report_tick = interval(Duration::from_secs(1));
+        sync_report_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         let mut backoff = Duration::from_secs(1);
 
@@ -223,6 +236,9 @@ impl Agent {
                 }
                 _ = heartbeat_tick.tick() => {
                     self.send_heartbeat_with_retry().await;
+                }
+                _ = sync_report_tick.tick() => {
+                    self.flush_pending_sync_reports().await;
                 }
             }
         }
@@ -370,28 +386,102 @@ impl Agent {
     }
 
     async fn send_sync_report(
-        &self,
+        &mut self,
         snapshot: &SyncPayload,
         applied: bool,
         details: &str,
     ) -> Result<(), String> {
-        let onboarding = OnboardingPayload::from_metadata(&self.node_metadata);
-        onboarding.validate_compatibility()?;
-        let payload = SyncReportPayload {
-            onboarding,
+        let report = PendingSyncReport {
             version: &snapshot.version,
             checksum: &snapshot.checksum,
             applied,
             details,
         };
+        if let Err(err) = self.send_sync_report_payload(&report).await {
+            eprintln!("sync-report failed: {err}; queued for retry");
+            append_pending_sync_report(
+                &self.cfg.pending_sync_reports_path,
+                &report.to_owned_payload(),
+            )
+            .await?;
+            self.increase_sync_report_backoff();
+            return Ok(());
+        }
+
+        Ok(())
+    }
+
+    async fn send_sync_report_payload(&self, report: &PendingSyncReport<'_>) -> Result<(), String> {
+        let onboarding = OnboardingPayload::from_metadata(&self.node_metadata);
+        onboarding.validate_compatibility()?;
+        let payload = SyncReportPayload {
+            onboarding,
+            version: report.version,
+            checksum: report.checksum,
+            applied: report.applied,
+            details: report.details,
+        };
         self.lk_api.sync_report(&payload).await?;
 
         println!(
             "sync-report sent: version={} checksum={} applied={} details={}",
-            snapshot.version, snapshot.checksum, applied, details
+            report.version, report.checksum, report.applied, report.details
         );
-
         Ok(())
+    }
+
+    async fn flush_pending_sync_reports(&mut self) {
+        if Instant::now() < self.sync_report_next_retry_at {
+            return;
+        }
+
+        let pending = match load_pending_sync_reports(&self.cfg.pending_sync_reports_path).await {
+            Ok(items) => items,
+            Err(err) => {
+                eprintln!("failed to load sync-report outbox: {err}");
+                self.increase_sync_report_backoff();
+                return;
+            }
+        };
+        if pending.is_empty() {
+            self.reset_sync_report_backoff();
+            return;
+        }
+
+        for (idx, item) in pending.iter().enumerate() {
+            let report = item.as_payload();
+            if let Err(err) = self.send_sync_report_payload(&report).await {
+                eprintln!("sync-report retry failed: {err}");
+                if let Err(persist_err) = persist_pending_sync_reports(
+                    &self.cfg.pending_sync_reports_path,
+                    &pending[idx..],
+                )
+                .await
+                {
+                    eprintln!("failed to persist sync-report outbox: {persist_err}");
+                }
+                self.increase_sync_report_backoff();
+                return;
+            }
+        }
+
+        if let Err(err) = persist_pending_sync_reports(&self.cfg.pending_sync_reports_path, &[]).await {
+            eprintln!("failed to clear sync-report outbox: {err}");
+            self.increase_sync_report_backoff();
+            return;
+        }
+        self.reset_sync_report_backoff();
+    }
+
+    fn increase_sync_report_backoff(&mut self) {
+        self.sync_report_next_retry_at = Instant::now() + self.sync_report_backoff;
+        self.sync_report_backoff =
+            std::cmp::min(self.sync_report_backoff.saturating_mul(2), SYNC_REPORT_MAX_BACKOFF);
+    }
+
+    fn reset_sync_report_backoff(&mut self) {
+        self.sync_report_backoff = SYNC_REPORT_INITIAL_BACKOFF;
+        self.sync_report_next_retry_at = Instant::now();
     }
 
     async fn send_heartbeat_with_retry(&self) {
@@ -673,6 +763,44 @@ struct RuntimeStatus {
     memory_percent: f64,
 }
 
+#[derive(Clone, Debug)]
+struct PendingSyncReport<'a> {
+    version: &'a str,
+    checksum: &'a str,
+    applied: bool,
+    details: &'a str,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingSyncReportOwned {
+    version: String,
+    checksum: String,
+    applied: bool,
+    details: String,
+}
+
+impl PendingSyncReport<'_> {
+    fn to_owned_payload(&self) -> PendingSyncReportOwned {
+        PendingSyncReportOwned {
+            version: self.version.to_string(),
+            checksum: self.checksum.to_string(),
+            applied: self.applied,
+            details: self.details.to_string(),
+        }
+    }
+}
+
+impl PendingSyncReportOwned {
+    fn as_payload(&self) -> PendingSyncReport<'_> {
+        PendingSyncReport {
+            version: &self.version,
+            checksum: &self.checksum,
+            applied: self.applied,
+            details: &self.details,
+        }
+    }
+}
+
 impl RuntimeStatus {
     fn collect(runtime_pid_path: &Path, process_name: &str, credentials_file: &Path) -> Self {
         let pid = read_pid(runtime_pid_path).or_else(|| find_pid_by_name(process_name));
@@ -828,6 +956,98 @@ async fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
         .map_err(|e| format!("failed to atomically rename {} -> {}: {e}", tmp_path.display(), path.display()))?;
 
     Ok(())
+}
+
+async fn append_pending_sync_report(
+    outbox_path: &Path,
+    report: &PendingSyncReportOwned,
+) -> Result<(), String> {
+    let parent = outbox_path
+        .parent()
+        .ok_or_else(|| format!("path has no parent: {}", outbox_path.display()))?;
+    fs::create_dir_all(parent)
+        .await
+        .map_err(|e| format!("failed to create directory {}: {e}", parent.display()))?;
+
+    let mut outbox = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(outbox_path)
+        .await
+        .map_err(|e| format!("failed to open sync-report outbox {}: {e}", outbox_path.display()))?;
+    let encoded = serde_json::to_vec(report)
+        .map_err(|e| format!("failed to serialize sync-report outbox row: {e}"))?;
+    outbox
+        .write_all(&encoded)
+        .await
+        .map_err(|e| format!("failed to append sync-report outbox row: {e}"))?;
+    outbox
+        .write_all(b"\n")
+        .await
+        .map_err(|e| format!("failed to append sync-report outbox newline: {e}"))?;
+    outbox
+        .flush()
+        .await
+        .map_err(|e| format!("failed to flush sync-report outbox: {e}"))?;
+    Ok(())
+}
+
+async fn load_pending_sync_reports(path: &Path) -> Result<Vec<PendingSyncReportOwned>, String> {
+    let raw = match fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(err) => {
+            return Err(format!(
+                "failed to read sync-report outbox {}: {err}",
+                path.display()
+            ));
+        }
+    };
+    let content = std::str::from_utf8(&raw)
+        .map_err(|e| format!("sync-report outbox is not valid UTF-8 {}: {e}", path.display()))?;
+
+    let mut reports = Vec::new();
+    for (idx, line) in content.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let report = serde_json::from_str::<PendingSyncReportOwned>(line).map_err(|e| {
+            format!(
+                "failed to parse sync-report outbox line {} in {}: {e}",
+                idx + 1,
+                path.display()
+            )
+        })?;
+        reports.push(report);
+    }
+    Ok(reports)
+}
+
+async fn persist_pending_sync_reports(
+    path: &Path,
+    reports: &[PendingSyncReportOwned],
+) -> Result<(), String> {
+    if reports.is_empty() {
+        match fs::remove_file(path).await {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(format!(
+                    "failed to remove empty sync-report outbox {}: {err}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    let mut encoded = Vec::new();
+    for report in reports {
+        let line = serde_json::to_vec(report)
+            .map_err(|e| format!("failed to serialize sync-report outbox row: {e}"))?;
+        encoded.extend_from_slice(&line);
+        encoded.push(b'\n');
+    }
+    atomic_write(path, &encoded).await
 }
 
 fn required_env(name: &str) -> Result<String, String> {
@@ -1036,6 +1256,7 @@ fn is_temporary_http_status(status: StatusCode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn credentials_include_only_enabled_accounts() {
@@ -1121,5 +1342,41 @@ mod tests {
             resolve_runtime_path(runtime_dir, path),
             Path::new("/var/lib/trusttunnel/vpn.toml")
         );
+    }
+
+    #[tokio::test]
+    async fn pending_sync_report_outbox_roundtrip() {
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.path().join("pending_sync_reports.jsonl");
+        let first = PendingSyncReportOwned {
+            version: "1".to_string(),
+            checksum: "a".to_string(),
+            applied: true,
+            details: "ok".to_string(),
+        };
+        let second = PendingSyncReportOwned {
+            version: "2".to_string(),
+            checksum: "b".to_string(),
+            applied: false,
+            details: "failed".to_string(),
+        };
+
+        append_pending_sync_report(&path, &first).await.unwrap();
+        append_pending_sync_report(&path, &second).await.unwrap();
+
+        let loaded = load_pending_sync_reports(&path).await.unwrap();
+        assert_eq!(loaded, vec![first, second]);
+    }
+
+    #[tokio::test]
+    async fn persist_pending_sync_report_outbox_clears_file_on_empty_batch() {
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.path().join("pending_sync_reports.jsonl");
+        fs::write(&path, b"{\"version\":\"1\",\"checksum\":\"x\",\"applied\":true,\"details\":\"ok\"}\n")
+            .await
+            .unwrap();
+
+        persist_pending_sync_reports(&path, &[]).await.unwrap();
+        assert!(!fs::try_exists(&path).await.unwrap());
     }
 }
