@@ -10,6 +10,9 @@ use tokio::time::{interval, MissedTickBehavior};
 const DEFAULT_SNAPSHOT_PATH: &str = "/internal/vpn/classic/accounts";
 const DEFAULT_SYNC_REPORT_PATH: &str = "/internal/vpn/classic/sync-report";
 const DEFAULT_HEARTBEAT_PATH: &str = "/internal/vpn/classic/heartbeat";
+const DEFAULT_REGISTER_PATH: &str = "/internal/vpn/classic/register";
+const REGISTER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const REGISTER_MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 struct Config {
@@ -35,6 +38,7 @@ struct Config {
     snapshot_path: String,
     sync_report_path: String,
     heartbeat_path: String,
+    register_path: String,
     apply_cmd: Option<String>,
 }
 
@@ -76,6 +80,8 @@ impl Config {
             .unwrap_or_else(|_| DEFAULT_SYNC_REPORT_PATH.to_string());
         let heartbeat_path = std::env::var("LK_HEARTBEAT_PATH")
             .unwrap_or_else(|_| DEFAULT_HEARTBEAT_PATH.to_string());
+        let register_path =
+            std::env::var("LK_REGISTER_PATH").unwrap_or_else(|_| DEFAULT_REGISTER_PATH.to_string());
 
         let apply_cmd = std::env::var("TRUSTTUNNEL_APPLY_CMD")
             .ok()
@@ -104,6 +110,7 @@ impl Config {
             snapshot_path,
             sync_report_path,
             heartbeat_path,
+            register_path,
             apply_cmd,
         })
     }
@@ -184,6 +191,7 @@ struct Agent {
     cfg: Config,
     client: reqwest::Client,
     state: AgentState,
+    node_metadata: NodeMetadata,
 }
 
 impl Agent {
@@ -194,11 +202,19 @@ impl Agent {
             .map_err(|e| format!("failed to build HTTP client: {e}"))?;
 
         let state = load_state(&cfg.agent_state_path).await.unwrap_or_default();
+        let node_metadata = NodeMetadata::from_config(&cfg)?;
 
-        Ok(Self { cfg, client, state })
+        Ok(Self {
+            cfg,
+            client,
+            state,
+            node_metadata,
+        })
     }
 
     async fn run(&mut self) {
+        self.bootstrap_register().await;
+
         let mut poll_tick = interval(self.cfg.poll_interval);
         poll_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -223,6 +239,42 @@ impl Agent {
                     if let Err(err) = self.send_heartbeat().await {
                         eprintln!("heartbeat push failed: {err}");
                     }
+                }
+            }
+        }
+    }
+
+    async fn bootstrap_register(&self) {
+        let mut backoff = REGISTER_INITIAL_BACKOFF;
+
+        loop {
+            match self.send_register_once().await {
+                Ok(RegisterAttemptOutcome::Registered) => {
+                    println!(
+                        "register succeeded for node_external_id={}",
+                        self.cfg.node_external_id
+                    );
+                    return;
+                }
+                Ok(RegisterAttemptOutcome::AlreadyRegistered) => {
+                    println!(
+                        "register skipped: node already registered, node_external_id={}",
+                        self.cfg.node_external_id
+                    );
+                    return;
+                }
+                Err(RegisterError::Temporary(detail)) => {
+                    eprintln!(
+                        "{}; retry in {}s",
+                        BootstrapError::RegisterFailed(detail),
+                        backoff.as_secs()
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff.saturating_mul(2), REGISTER_MAX_BACKOFF);
+                }
+                Err(RegisterError::Permanent(detail)) => {
+                    eprintln!("{}", BootstrapError::RegisterFailed(detail));
+                    std::process::exit(2);
                 }
             }
         }
@@ -413,6 +465,40 @@ impl Agent {
         Ok(())
     }
 
+    async fn send_register_once(&self) -> Result<RegisterAttemptOutcome, RegisterError> {
+        let endpoint = format_url(&self.cfg.lk_base_url, &self.cfg.register_path);
+        let payload = RegisterPayload::from_metadata(&self.node_metadata);
+
+        let response = self
+            .client
+            .post(endpoint)
+            .header("Authorization", format!("Bearer {}", self.cfg.lk_service_token))
+            .header("X-Internal-Agent-Token", &self.cfg.lk_service_token)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| RegisterError::Temporary(format!("register request failed: {e}")))?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(RegisterAttemptOutcome::Registered);
+        }
+
+        if is_idempotent_register_status(status) {
+            return Ok(RegisterAttemptOutcome::AlreadyRegistered);
+        }
+
+        if is_temporary_http_status(status) {
+            return Err(RegisterError::Temporary(format!(
+                "register request returned temporary HTTP {status}"
+            )));
+        }
+
+        Err(RegisterError::Permanent(format!(
+            "register request returned HTTP {status}"
+        )))
+    }
+
     async fn apply_runtime(&self) -> Result<(), String> {
         let Some(cmd) = &self.cfg.apply_cmd else {
             println!("runtime apply command is not set, skip runtime apply");
@@ -594,6 +680,117 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(digest.as_ref())
 }
 
+#[derive(Clone)]
+struct NodeMetadata {
+    node_external_id: String,
+    node_hostname: String,
+    node_stage: String,
+    node_cluster: String,
+    node_namespace: String,
+    node_rollout_group: String,
+    node_public_host: Option<String>,
+    node_public_port: Option<u16>,
+    node_display_name: Option<String>,
+    trusttunnel_runtime_dir: String,
+    trusttunnel_credentials_file: String,
+    trusttunnel_config_file: String,
+    trusttunnel_hosts_file: String,
+}
+
+impl NodeMetadata {
+    fn from_config(cfg: &Config) -> Result<Self, String> {
+        Ok(Self {
+            node_external_id: cfg.node_external_id.clone(),
+            node_hostname: cfg.node_hostname.clone(),
+            node_stage: cfg.node_stage.clone(),
+            node_cluster: cfg.node_cluster.clone(),
+            node_namespace: cfg.node_namespace.clone(),
+            node_rollout_group: cfg.node_rollout_group.clone(),
+            node_public_host: cfg.node_public_host.clone(),
+            node_public_port: cfg.node_public_port,
+            node_display_name: cfg.node_display_name.clone(),
+            trusttunnel_runtime_dir: path_to_string(&cfg.trusttunnel_runtime_dir)?.to_string(),
+            trusttunnel_credentials_file: path_to_string(&cfg.trusttunnel_credentials_file)?
+                .to_string(),
+            trusttunnel_config_file: path_to_string(&cfg.trusttunnel_config_file)?.to_string(),
+            trusttunnel_hosts_file: path_to_string(&cfg.trusttunnel_hosts_file)?.to_string(),
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct RegisterPayload<'a> {
+    node_external_id: &'a str,
+    node_hostname: &'a str,
+    node_stage: &'a str,
+    node_cluster: &'a str,
+    node_namespace: &'a str,
+    node_rollout_group: &'a str,
+    node_public_host: Option<&'a str>,
+    node_public_port: Option<u16>,
+    node_display_name: Option<&'a str>,
+    trusttunnel_runtime_dir: &'a str,
+    trusttunnel_credentials_file: &'a str,
+    trusttunnel_config_file: &'a str,
+    trusttunnel_hosts_file: &'a str,
+    active_path: &'static str,
+    modified_enabled: bool,
+}
+
+impl<'a> RegisterPayload<'a> {
+    fn from_metadata(metadata: &'a NodeMetadata) -> Self {
+        Self {
+            node_external_id: &metadata.node_external_id,
+            node_hostname: &metadata.node_hostname,
+            node_stage: &metadata.node_stage,
+            node_cluster: &metadata.node_cluster,
+            node_namespace: &metadata.node_namespace,
+            node_rollout_group: &metadata.node_rollout_group,
+            node_public_host: metadata.node_public_host.as_deref(),
+            node_public_port: metadata.node_public_port,
+            node_display_name: metadata.node_display_name.as_deref(),
+            trusttunnel_runtime_dir: &metadata.trusttunnel_runtime_dir,
+            trusttunnel_credentials_file: &metadata.trusttunnel_credentials_file,
+            trusttunnel_config_file: &metadata.trusttunnel_config_file,
+            trusttunnel_hosts_file: &metadata.trusttunnel_hosts_file,
+            active_path: "classic",
+            modified_enabled: false,
+        }
+    }
+}
+
+enum RegisterAttemptOutcome {
+    Registered,
+    AlreadyRegistered,
+}
+
+enum RegisterError {
+    Temporary(String),
+    Permanent(String),
+}
+
+enum BootstrapError {
+    RegisterFailed(String),
+}
+
+impl std::fmt::Display for BootstrapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RegisterFailed(detail) => write!(f, "register failed: {detail}"),
+        }
+    }
+}
+
+fn is_idempotent_register_status(status: StatusCode) -> bool {
+    status == StatusCode::CONFLICT
+}
+
+fn is_temporary_http_status(status: StatusCode) -> bool {
+    status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,5 +843,18 @@ mod tests {
         let err = non_empty_value("ANY_KEY", "   ".to_string()).unwrap_err();
 
         assert_eq!(err, "required env var ANY_KEY must not be empty");
+    }
+
+    #[test]
+    fn register_conflict_is_treated_as_idempotent_success() {
+        assert!(is_idempotent_register_status(StatusCode::CONFLICT));
+    }
+
+    #[test]
+    fn temporary_http_statuses_include_retryable_codes() {
+        assert!(is_temporary_http_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(is_temporary_http_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_temporary_http_status(StatusCode::BAD_GATEWAY));
+        assert!(!is_temporary_http_status(StatusCode::BAD_REQUEST));
     }
 }
