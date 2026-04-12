@@ -521,6 +521,14 @@ Classic agent optional environment variables:
 - `NODE_DISPLAY_NAME`
 - `AGENT_STATE_PATH` (default `agent_state.json`)
 - `TRUSTTUNNEL_APPLY_CMD` (command executed after runtime credentials update)
+- `TRUSTTUNNEL_BOOTSTRAP_CREDENTIALS_FILE` (read-only bootstrap credentials source to import once into `TRUSTTUNNEL_RUNTIME_DIR/<TRUSTTUNNEL_CREDENTIALS_FILE>`)
 - `LK_SNAPSHOT_PATH` (default `/internal/vpn/classic/accounts`)
 - `LK_SYNC_REPORT_PATH` (default `/internal/vpn/classic/sync-report`)
 - `LK_HEARTBEAT_PATH` (default `/internal/vpn/classic/heartbeat`)
+
+Classic agent runtime credentials migration and restart recovery:
+
+- On startup, if `TRUSTTUNNEL_BOOTSTRAP_CREDENTIALS_FILE` is set, runtime credentials file is absent, and runtime has not yet been marked as primary, the agent imports bootstrap credentials once into `TRUSTTUNNEL_RUNTIME_DIR`.
+- After the first successful `sync` + apply cycle, the agent creates a marker file `.runtime_credentials_primary` in `TRUSTTUNNEL_RUNTIME_DIR` and treats runtime credentials as the source of truth.
+- After this marker exists, restarts do not re-import credentials from the bootstrap source (for example, from a read-only ConfigMap mount), so runtime no longer depends on that source as the primary store.
+- If runtime credentials are lost after migration, restart does not restore them from bootstrap; the next successful LK sync recreates runtime credentials and reapplies runtime configuration.
