@@ -1,5 +1,6 @@
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 pub const DEFAULT_SYNC_PATH_TEMPLATE: &str = "/internal/trusttunnel/v1/nodes/{externalNodeId}/sync";
 pub const DEFAULT_SYNC_REPORT_PATH: &str = "/internal/trusttunnel/v1/nodes/sync-report";
@@ -52,7 +53,7 @@ impl LkApiClient {
             .map_err(|e| format!("register request failed: {e}"))
     }
 
-    pub async fn heartbeat(&self, payload: &OnboardingPayload<'_>) -> Result<(), String> {
+    pub async fn heartbeat(&self, payload: &HeartbeatPayload<'_>) -> Result<(), HeartbeatError> {
         let response = self
             .client
             .post(self.endpoint(&self.heartbeat_path))
@@ -61,13 +62,21 @@ impl LkApiClient {
             .json(payload)
             .send()
             .await
-            .map_err(|e| format!("heartbeat push failed: {e}"))?;
+            .map_err(|e| HeartbeatError::Network(format!("heartbeat push failed: {e}")))?;
 
         if response.status().is_success() {
             return Ok(());
         }
 
-        Err(format!("heartbeat push failed with HTTP {}", response.status()))
+        let status = response.status();
+        if status.is_server_error() {
+            return Err(HeartbeatError::ServerHttp(status));
+        }
+        if status.is_client_error() {
+            return Err(HeartbeatError::ClientHttp(status));
+        }
+
+        Err(HeartbeatError::UnexpectedStatus(status))
     }
 
     pub async fn sync(&self, external_node_id: &str) -> Result<(SyncPayload, Vec<u8>), String> {
@@ -222,6 +231,22 @@ pub struct OnboardingPayload<'a> {
     pub modified_enabled: bool,
 }
 
+#[derive(Serialize)]
+pub struct HeartbeatPayload<'a> {
+    #[serde(flatten)]
+    pub onboarding: OnboardingPayload<'a>,
+    pub external_node_id: &'a str,
+    pub current_revision: &'a str,
+    pub health_status: &'a str,
+    pub agent_version: &'a str,
+    pub runtime_version: &'a str,
+    pub active_clients: u64,
+    pub cpu_percent: f64,
+    pub memory_percent: f64,
+    pub last_apply_status: &'a str,
+    pub timestamp: String,
+}
+
 impl<'a> OnboardingPayload<'a> {
     pub fn from_metadata(metadata: &'a NodeMetadata) -> Self {
         Self {
@@ -262,6 +287,42 @@ impl<'a> OnboardingPayload<'a> {
             );
         }
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub enum HeartbeatError {
+    Network(String),
+    ClientHttp(StatusCode),
+    ServerHttp(StatusCode),
+    UnexpectedStatus(StatusCode),
+}
+
+impl HeartbeatError {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            HeartbeatError::Network(_) => "network",
+            HeartbeatError::ClientHttp(_) => "http_client",
+            HeartbeatError::ServerHttp(_) => "http_server",
+            HeartbeatError::UnexpectedStatus(_) => "http_unexpected",
+        }
+    }
+}
+
+impl fmt::Display for HeartbeatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HeartbeatError::Network(msg) => write!(f, "{msg}"),
+            HeartbeatError::ClientHttp(status) => {
+                write!(f, "heartbeat push failed with client HTTP {status}")
+            }
+            HeartbeatError::ServerHttp(status) => {
+                write!(f, "heartbeat push failed with server HTTP {status}")
+            }
+            HeartbeatError::UnexpectedStatus(status) => {
+                write!(f, "heartbeat push failed with unexpected HTTP {status}")
+            }
+        }
     }
 }
 
