@@ -2,6 +2,8 @@
 
 This document describes the metrics exposed by vpn-libs-endpoint for monitoring and observability.
 
+It also documents metrics exposed by the classic agent sidecar.
+
 ## Overview
 
 The endpoint exposes Prometheus-compatible metrics via an HTTP endpoint. Metrics are available when the `MetricsSettings` is configured in the endpoint settings.
@@ -202,6 +204,38 @@ Metrics are automatically managed through RAII (Resource Acquisition Is Initiali
 1. **Outbound sockets > client sessions:** Normal for HTTP/1.1 with multiple concurrent requests
 2. **Outbound sockets = 0 with active sessions:** May indicate all requests are cached or failing
 3. **Continuously growing sockets:** Check for connection leaks or slow destinations
+
+## Classic Agent Sidecar Metrics
+
+Classic agent exports internal Prometheus metrics on `GET /metrics` bound to
+`AGENT_METRICS_ADDRESS` (default `127.0.0.1:9901`).
+
+The sidecar logs are also emitted in structured JSON format with the fields:
+`revision`, `node`, `status`, `error_class`.
+
+### Counters
+
+- `classic_agent_sync_total{node,revision,status,error_class}`
+  - Sync cycle outcomes.
+- `classic_agent_apply_total{node,revision,status,error_class}`
+  - Runtime apply outcomes.
+- `classic_agent_heartbeat_total{node,revision,status,error_class}`
+  - Heartbeat push outcomes.
+
+### Gauges
+
+- `classic_agent_last_successful_sync_timestamp_seconds{node}`
+  - Unix timestamp of the latest successful sync.
+- `classic_agent_last_failed_sync_timestamp_seconds{node}`
+  - Unix timestamp of the latest failed sync.
+- `classic_agent_apply_duration_milliseconds{node}`
+  - Duration of the latest apply attempt.
+- `classic_agent_credentials_count{node}`
+  - Number of enabled credentials rendered by sidecar.
+- `classic_agent_heartbeat_status{node}`
+  - Heartbeat status (`1` success, `0` failure).
+- `classic_agent_endpoint_process_status{node}`
+  - Runtime endpoint process status (`1` alive, `0` dead).
 
 ## See Also
 
