@@ -28,6 +28,7 @@ const HEARTBEAT_MAX_ATTEMPTS: usize = 3;
 const SYNC_REPORT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const SYNC_REPORT_MAX_BACKOFF: Duration = Duration::from_secs(300);
 const SYNC_REPORT_OUTBOX_FILE: &str = "pending_sync_reports.jsonl";
+const RUNTIME_PRIMARY_MARKER_FILE: &str = ".runtime_credentials_primary";
 
 #[derive(Clone)]
 struct Config {
@@ -46,7 +47,9 @@ struct Config {
     trusttunnel_credentials_file: PathBuf,
     trusttunnel_config_file: PathBuf,
     trusttunnel_hosts_file: PathBuf,
+    bootstrap_credentials_source_path: Option<PathBuf>,
     runtime_credentials_path: PathBuf,
+    runtime_primary_marker_path: PathBuf,
     agent_state_path: PathBuf,
     poll_interval: Duration,
     heartbeat_interval: Duration,
@@ -76,6 +79,8 @@ impl Config {
             required_env("TRUSTTUNNEL_CREDENTIALS_FILE")?.into();
         let trusttunnel_config_file: PathBuf = required_env("TRUSTTUNNEL_CONFIG_FILE")?.into();
         let trusttunnel_hosts_file: PathBuf = required_env("TRUSTTUNNEL_HOSTS_FILE")?.into();
+        let bootstrap_credentials_source_path =
+            optional_env("TRUSTTUNNEL_BOOTSTRAP_CREDENTIALS_FILE").map(PathBuf::from);
         let node_public_host = optional_env("NODE_PUBLIC_HOST");
         let node_public_port = optional_env("NODE_PUBLIC_PORT")
             .map(|raw| {
@@ -86,6 +91,7 @@ impl Config {
         let node_display_name = optional_env("NODE_DISPLAY_NAME");
 
         let runtime_credentials_path = trusttunnel_runtime_dir.join(&trusttunnel_credentials_file);
+        let runtime_primary_marker_path = trusttunnel_runtime_dir.join(RUNTIME_PRIMARY_MARKER_FILE);
         let agent_state_path = std::env::var("AGENT_STATE_PATH")
             .unwrap_or_else(|_| "agent_state.json".to_string())
             .into();
@@ -130,7 +136,9 @@ impl Config {
             trusttunnel_credentials_file,
             trusttunnel_config_file,
             trusttunnel_hosts_file,
+            bootstrap_credentials_source_path,
             runtime_credentials_path,
+            runtime_primary_marker_path,
             agent_state_path,
             poll_interval,
             heartbeat_interval,
@@ -210,6 +218,11 @@ impl Agent {
     }
 
     async fn run(&mut self) {
+        if let Err(err) = self.bootstrap_runtime_credentials().await {
+            eprintln!("bootstrap import failed: {err}");
+            std::process::exit(2);
+        }
+
         self.bootstrap_register().await;
 
         let mut poll_tick = interval(self.cfg.poll_interval);
@@ -375,10 +388,87 @@ impl Agent {
             checksum: snapshot.checksum.clone(),
             credentials_sha256: rendered_sha,
         };
+        self.mark_runtime_as_primary().await?;
         persist_state(&self.cfg.agent_state_path, &self.state).await?;
         self.send_sync_report(&snapshot, true, &apply_details).await?;
 
         Ok(())
+    }
+
+    async fn bootstrap_runtime_credentials(&self) -> Result<(), String> {
+        let should_import = should_import_bootstrap_credentials(
+            self.cfg.bootstrap_credentials_source_path.is_some(),
+            fs::try_exists(&self.cfg.runtime_primary_marker_path)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "failed to check runtime marker {}: {e}",
+                        self.cfg.runtime_primary_marker_path.display()
+                    )
+                })?,
+            fs::try_exists(&self.cfg.runtime_credentials_path)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "failed to check runtime credentials {}: {e}",
+                        self.cfg.runtime_credentials_path.display()
+                    )
+                })?,
+        );
+        if !should_import {
+            if fs::try_exists(&self.cfg.runtime_primary_marker_path)
+                .await
+                .unwrap_or(false)
+            {
+                println!(
+                    "runtime credentials already marked as primary, bootstrap source ignored"
+                );
+            }
+            return Ok(());
+        }
+
+        let source_path = self
+            .cfg
+            .bootstrap_credentials_source_path
+            .as_ref()
+            .ok_or_else(|| "bootstrap source path is missing".to_string())?;
+        let bootstrap_credentials = fs::read(source_path).await.map_err(|e| {
+            format!(
+                "failed to read bootstrap credentials {}: {e}",
+                source_path.display()
+            )
+        })?;
+        let tmp_credentials_path = self
+            .write_runtime_credentials_tmp(&bootstrap_credentials)
+            .await?;
+        if let Err(err) = self.validate_credentials_with_endpoint_parser(&tmp_credentials_path) {
+            let _ = fs::remove_file(&tmp_credentials_path).await;
+            return Err(err);
+        }
+        self.promote_runtime_credentials(&tmp_credentials_path).await?;
+        self.apply_runtime().await?;
+        println!(
+            "bootstrap credentials imported: {} -> {}",
+            source_path.display(),
+            self.cfg.runtime_credentials_path.display()
+        );
+        Ok(())
+    }
+
+    async fn mark_runtime_as_primary(&self) -> Result<(), String> {
+        if fs::try_exists(&self.cfg.runtime_primary_marker_path)
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to check runtime marker {}: {e}",
+                    self.cfg.runtime_primary_marker_path.display()
+                )
+            })?
+        {
+            return Ok(());
+        }
+
+        atomic_write(&self.cfg.runtime_primary_marker_path, b"runtime_credentials_primary\n").await
     }
 
     async fn pull_snapshot(&self) -> Result<(SyncPayload, Vec<u8>), String> {
@@ -1204,6 +1294,14 @@ fn resolve_runtime_path(runtime_dir: &Path, path: &Path) -> PathBuf {
     runtime_dir.join(path)
 }
 
+fn should_import_bootstrap_credentials(
+    has_bootstrap_source: bool,
+    runtime_primary_marker_exists: bool,
+    runtime_credentials_exists: bool,
+) -> bool {
+    has_bootstrap_source && !runtime_primary_marker_exists && !runtime_credentials_exists
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
     hex::encode(digest.as_ref())
@@ -1342,6 +1440,14 @@ mod tests {
             resolve_runtime_path(runtime_dir, path),
             Path::new("/var/lib/trusttunnel/vpn.toml")
         );
+    }
+
+    #[test]
+    fn import_bootstrap_credentials_only_before_runtime_becomes_primary() {
+        assert!(should_import_bootstrap_credentials(true, false, false));
+        assert!(!should_import_bootstrap_credentials(true, true, false));
+        assert!(!should_import_bootstrap_credentials(true, false, true));
+        assert!(!should_import_bootstrap_credentials(false, false, false));
     }
 
     #[tokio::test]
