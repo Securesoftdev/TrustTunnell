@@ -1,13 +1,15 @@
 mod lk_api;
 
 use lk_api::{
-    Account, LkApiClient, NodeMetadata, OnboardingPayload, SyncPayload, SyncReportPayload,
+    Account, HeartbeatPayload, LkApiClient, NodeMetadata, OnboardingPayload, SyncPayload,
+    SyncReportPayload,
     DEFAULT_HEARTBEAT_PATH, DEFAULT_REGISTER_PATH, DEFAULT_SYNC_PATH_TEMPLATE,
     DEFAULT_SYNC_REPORT_PATH,
 };
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs::read_dir;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::fs;
@@ -16,6 +18,9 @@ use tokio::time::{interval, MissedTickBehavior};
 
 const REGISTER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const REGISTER_MAX_BACKOFF: Duration = Duration::from_secs(60);
+const HEARTBEAT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const HEARTBEAT_MAX_BACKOFF: Duration = Duration::from_secs(30);
+const HEARTBEAT_MAX_ATTEMPTS: usize = 3;
 
 #[derive(Clone)]
 struct Config {
@@ -43,6 +48,9 @@ struct Config {
     heartbeat_path: String,
     register_path: String,
     apply_cmd: Option<String>,
+    runtime_pid_path: PathBuf,
+    runtime_process_name: String,
+    runtime_version: String,
 }
 
 impl Config {
@@ -89,6 +97,13 @@ impl Config {
         let apply_cmd = std::env::var("TRUSTTUNNEL_APPLY_CMD")
             .ok()
             .and_then(|x| if x.trim().is_empty() { None } else { Some(x) });
+        let runtime_pid_path = std::env::var("TRUSTTUNNEL_RUNTIME_PID_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| trusttunnel_runtime_dir.join("trusttunnel.pid"));
+        let runtime_process_name = std::env::var("TRUSTTUNNEL_RUNTIME_PROCESS_NAME")
+            .unwrap_or_else(|_| "trusttunnel_endpoint".to_string());
+        let runtime_version = std::env::var("TRUSTTUNNEL_RUNTIME_VERSION")
+            .unwrap_or_else(|_| "unknown".to_string());
 
         Ok(Self {
             lk_base_url,
@@ -115,6 +130,9 @@ impl Config {
             heartbeat_path,
             register_path,
             apply_cmd,
+            runtime_pid_path,
+            runtime_process_name,
+            runtime_version,
         })
     }
 }
@@ -131,6 +149,7 @@ struct Agent {
     lk_api: LkApiClient,
     state: AgentState,
     node_metadata: NodeMetadata,
+    last_apply_status: String,
 }
 
 impl Agent {
@@ -172,6 +191,7 @@ impl Agent {
             lk_api,
             state,
             node_metadata,
+            last_apply_status: "unknown".to_string(),
         })
     }
 
@@ -199,9 +219,7 @@ impl Agent {
                     }
                 }
                 _ = heartbeat_tick.tick() => {
-                    if let Err(err) = self.send_heartbeat().await {
-                        eprintln!("heartbeat push failed: {err}");
-                    }
+                    self.send_heartbeat_with_retry().await;
                 }
             }
         }
@@ -287,6 +305,7 @@ impl Agent {
             Ok(_) => "runtime apply succeeded".to_string(),
             Err(e) => format!("runtime apply failed: {e}"),
         };
+        self.last_apply_status = apply_details.clone();
 
         self.state = AgentState {
             version: snapshot.version.clone(),
@@ -333,10 +352,58 @@ impl Agent {
         Ok(())
     }
 
-    async fn send_heartbeat(&self) -> Result<(), String> {
-        let payload = OnboardingPayload::from_metadata(&self.node_metadata);
-        payload.validate_compatibility()?;
-        self.lk_api.heartbeat(&payload).await?;
+    async fn send_heartbeat_with_retry(&self) {
+        let mut backoff = HEARTBEAT_INITIAL_BACKOFF;
+        for attempt in 1..=HEARTBEAT_MAX_ATTEMPTS {
+            match self.send_heartbeat().await {
+                Ok(()) => return,
+                Err(err) => {
+                    let is_last = attempt == HEARTBEAT_MAX_ATTEMPTS;
+                    eprintln!(
+                        "heartbeat failed: kind={} attempt={}/{} detail={}",
+                        err.kind(),
+                        attempt,
+                        HEARTBEAT_MAX_ATTEMPTS,
+                        err
+                    );
+                    if is_last {
+                        return;
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff.saturating_mul(2), HEARTBEAT_MAX_BACKOFF);
+                }
+            }
+        }
+    }
+
+    async fn send_heartbeat(&self) -> Result<(), HeartbeatFailure> {
+        let onboarding = OnboardingPayload::from_metadata(&self.node_metadata);
+        onboarding
+            .validate_compatibility()
+            .map_err(HeartbeatFailure::PayloadValidation)?;
+        let runtime_status = RuntimeStatus::collect(
+            &self.cfg.runtime_pid_path,
+            &self.cfg.runtime_process_name,
+            &self.cfg.runtime_credentials_path,
+        );
+        let health_status = runtime_status.health_status();
+        let payload = HeartbeatPayload {
+            onboarding,
+            external_node_id: &self.cfg.node_external_id,
+            current_revision: &self.state.version,
+            health_status,
+            agent_version: env!("CARGO_PKG_VERSION"),
+            runtime_version: &self.cfg.runtime_version,
+            active_clients: runtime_status.active_clients,
+            cpu_percent: runtime_status.cpu_percent,
+            memory_percent: runtime_status.memory_percent,
+            last_apply_status: &self.last_apply_status,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        self.lk_api
+            .heartbeat(&payload)
+            .await
+            .map_err(HeartbeatFailure::Api)?;
 
         println!(
             "heartbeat sent for node_external_id={}",
@@ -395,6 +462,78 @@ impl Agent {
 
         println!("runtime apply finished successfully");
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+enum HeartbeatFailure {
+    PayloadValidation(String),
+    Api(lk_api::HeartbeatError),
+}
+
+impl HeartbeatFailure {
+    fn kind(&self) -> &'static str {
+        match self {
+            HeartbeatFailure::PayloadValidation(_) => "payload_validation",
+            HeartbeatFailure::Api(err) => err.kind(),
+        }
+    }
+}
+
+impl std::fmt::Display for HeartbeatFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HeartbeatFailure::PayloadValidation(msg) => write!(f, "{msg}"),
+            HeartbeatFailure::Api(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+struct RuntimeStatus {
+    alive: bool,
+    metrics_available: bool,
+    active_clients: u64,
+    cpu_percent: f64,
+    memory_percent: f64,
+}
+
+impl RuntimeStatus {
+    fn collect(runtime_pid_path: &Path, process_name: &str, credentials_file: &Path) -> Self {
+        let pid = read_pid(runtime_pid_path).or_else(|| find_pid_by_name(process_name));
+        let alive = pid.is_some_and(is_pid_alive);
+        let active_clients = count_active_clients(credentials_file).unwrap_or(0);
+
+        if let Some(pid) = pid {
+            if let (Some(cpu_percent), Some(memory_percent)) =
+                (read_cpu_percent(pid), read_memory_percent(pid))
+            {
+                return Self {
+                    alive,
+                    metrics_available: true,
+                    active_clients,
+                    cpu_percent,
+                    memory_percent,
+                };
+            }
+        }
+
+        Self {
+            alive,
+            metrics_available: false,
+            active_clients,
+            cpu_percent: 0.0,
+            memory_percent: 0.0,
+        }
+    }
+
+    fn health_status(&self) -> &'static str {
+        if !self.alive {
+            return "dead";
+        }
+        if self.metrics_available {
+            return "healthy";
+        }
+        "degraded"
     }
 }
 
@@ -518,6 +657,120 @@ async fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
 fn required_env(name: &str) -> Result<String, String> {
     let raw = std::env::var(name).map_err(|_| format!("required env var {name} is missing"))?;
     non_empty_value(name, raw)
+}
+
+fn read_pid(pid_path: &Path) -> Option<u32> {
+    let raw = std::fs::read_to_string(pid_path).ok()?;
+    raw.trim().parse::<u32>().ok()
+}
+
+fn find_pid_by_name(process_name: &str) -> Option<u32> {
+    let entries = read_dir("/proc").ok()?;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let pid = file_name.to_str()?.parse::<u32>().ok()?;
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+        if comm.trim() == process_name {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+fn is_pid_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+fn read_cpu_percent(pid: u32) -> Option<f64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let parts = stat.split_whitespace().collect::<Vec<_>>();
+    if parts.len() <= 21 {
+        return None;
+    }
+    let utime = parts[13].parse::<f64>().ok()?;
+    let stime = parts[14].parse::<f64>().ok()?;
+    let start_time = parts[21].parse::<f64>().ok()?;
+    let uptime = std::fs::read_to_string("/proc/uptime").ok()?;
+    let uptime_secs = uptime.split_whitespace().next()?.parse::<f64>().ok()?;
+    let ticks_per_sec = 100.0;
+    let total_time_secs = (utime + stime) / ticks_per_sec;
+    let running_secs = uptime_secs - (start_time / ticks_per_sec);
+    if running_secs <= 0.0 {
+        return None;
+    }
+    Some((total_time_secs / running_secs * 100.0 * 100.0).round() / 100.0)
+}
+
+fn read_memory_percent(pid: u32) -> Option<f64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let rss_kb = status
+        .lines()
+        .find(|line| line.starts_with("VmRSS:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse::<f64>()
+        .ok()?;
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let total_kb = meminfo
+        .lines()
+        .find(|line| line.starts_with("MemTotal:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse::<f64>()
+        .ok()?;
+    if total_kb <= 0.0 {
+        return None;
+    }
+    Some((rss_kb / total_kb * 100.0 * 100.0).round() / 100.0)
+}
+
+fn count_active_clients(credentials_file: &Path) -> Option<u64> {
+    let raw = std::fs::read_to_string(credentials_file).ok()?;
+    Some(raw.matches("[[client]]").count() as u64)
+}
+
+#[cfg(test)]
+mod runtime_status_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_health_status_dead_when_process_unavailable() {
+        let status = RuntimeStatus {
+            alive: false,
+            metrics_available: false,
+            active_clients: 0,
+            cpu_percent: 0.0,
+            memory_percent: 0.0,
+        };
+
+        assert_eq!(status.health_status(), "dead");
+    }
+
+    #[test]
+    fn runtime_health_status_degraded_on_metrics_fallback() {
+        let status = RuntimeStatus {
+            alive: true,
+            metrics_available: false,
+            active_clients: 0,
+            cpu_percent: 0.0,
+            memory_percent: 0.0,
+        };
+
+        assert_eq!(status.health_status(), "degraded");
+    }
+
+    #[test]
+    fn runtime_health_status_healthy_when_metrics_ready() {
+        let status = RuntimeStatus {
+            alive: true,
+            metrics_available: true,
+            active_clients: 3,
+            cpu_percent: 2.4,
+            memory_percent: 1.7,
+        };
+
+        assert_eq!(status.health_status(), "healthy");
+    }
 }
 
 fn optional_env(name: &str) -> Option<String> {
