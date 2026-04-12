@@ -34,7 +34,7 @@ COPY --from=build /home/TrustTunnel/target/release/trusttunnel_endpoint /usr/loc
 RUN ln -s /usr/local/bin/trusttunnel_endpoint /usr/local/bin/trusttunnel-endpoint \
     && ln -s /usr/local/bin/setup_wizard /bin/setup_wizard \
     && ln -s /usr/local/bin/trusttunnel_endpoint /bin/trusttunnel_endpoint
-COPY --chmod=755 /docker-entrypoint.sh /scripts/
+COPY --chmod=755 docker-entrypoint.sh /scripts/
 
 WORKDIR /trusttunnel_endpoint
 VOLUME /trusttunnel_endpoint/
