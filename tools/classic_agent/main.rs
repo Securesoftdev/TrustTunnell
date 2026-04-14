@@ -1,14 +1,14 @@
 mod lk_api;
 
 use lk_api::{
-    Account, HeartbeatPayload, HeartbeatStats, LkApiClient, NodeMetadata, OnboardingPayload,
-    SyncPayload, SyncReportPayload, SyncResponse,
+    Account, AccountExportPayload, HeartbeatPayload, HeartbeatStats, LkApiClient, NodeMetadata,
+    OnboardingPayload, SyncPayload, SyncReportPayload, SyncResponse,
     DEFAULT_HEARTBEAT_PATH, DEFAULT_REGISTER_PATH, DEFAULT_SYNC_PATH_TEMPLATE,
     DEFAULT_SYNC_REPORT_PATH,
 };
+use trusttunnel_deeplink::{DeepLinkConfig, Protocol as DeepLinkProtocol};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs::read_dir;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -65,6 +65,10 @@ struct Config {
     runtime_version: String,
     pending_sync_reports_path: PathBuf,
     metrics_address: SocketAddr,
+    tt_link_host: Option<String>,
+    tt_link_port: Option<u16>,
+    tt_link_protocol: DeepLinkProtocol,
+    tt_link_custom_sni: Option<String>,
 }
 
 impl Config {
@@ -116,6 +120,16 @@ impl Config {
         let runtime_version =
             optional_env_nonempty("TRUSTTUNNEL_RUNTIME_VERSION").unwrap_or_else(|| "unknown".to_string());
         let pending_sync_reports_path = trusttunnel_runtime_dir.join(SYNC_REPORT_OUTBOX_FILE);
+        let tt_link_host = optional_env_nonempty("TRUSTTUNNEL_TT_LINK_HOST");
+        let tt_link_port = std::env::var("TRUSTTUNNEL_TT_LINK_PORT")
+            .ok()
+            .map(|x| x.parse::<u16>().map_err(|e| format!("TRUSTTUNNEL_TT_LINK_PORT must be valid u16: {e}")))
+            .transpose()?;
+        let tt_link_protocol = optional_env_nonempty("TRUSTTUNNEL_TT_LINK_PROTOCOL")
+            .map(|x| parse_tt_link_protocol(&x))
+            .transpose()?
+            .unwrap_or(DeepLinkProtocol::Http2);
+        let tt_link_custom_sni = optional_env_nonempty("TRUSTTUNNEL_TT_LINK_CUSTOM_SNI");
         let metrics_address = std::env::var("AGENT_METRICS_ADDRESS")
             .unwrap_or_else(|_| "127.0.0.1:9901".to_string())
             .parse::<SocketAddr>()
@@ -150,6 +164,10 @@ impl Config {
             runtime_version,
             pending_sync_reports_path,
             metrics_address,
+            tt_link_host,
+            tt_link_port,
+            tt_link_protocol,
+            tt_link_custom_sni,
         };
         cfg.validate_paths()?;
         Ok(cfg)
@@ -381,7 +399,7 @@ impl Agent {
             );
             log_sync_skip(&snapshot, &details);
             self.last_apply_status = "skipped".to_string();
-            self.send_sync_report(&snapshot.version, "skipped", Some(&details))
+            self.send_sync_report(&snapshot.version, "skipped", Some(&details), None)
                 .await?;
             self.metrics
                 .sync_total
@@ -401,7 +419,7 @@ impl Agent {
             let details = "sync apply skipped: sync_required=false".to_string();
             log_sync_skip(&snapshot, &details);
             self.last_apply_status = "skipped".to_string();
-            self.send_sync_report(&snapshot.version, "skipped", Some(&details))
+            self.send_sync_report(&snapshot.version, "skipped", Some(&details), None)
                 .await?;
             self.metrics
                 .sync_total
@@ -420,7 +438,7 @@ impl Agent {
         if !validate_checksum(&snapshot, &raw_body) {
             let detail = "invalid checksum returned by LK";
             eprintln!("snapshot rejected: {detail}, version={}", snapshot.version);
-            self.send_sync_report(&snapshot.version, "error", Some(detail))
+            self.send_sync_report(&snapshot.version, "error", Some(detail), None)
                 .await?;
             self.metrics
                 .sync_total
@@ -536,7 +554,7 @@ impl Agent {
                 .with_label_values(&[&node])
                 .set(chrono::Utc::now().timestamp());
             log_event("error", &snapshot.version, &node, "sync_failed", "apply");
-            self.send_sync_report(&snapshot.version, "error", Some(&apply_details))
+            self.send_sync_report(&snapshot.version, "error", Some(&apply_details), None)
                 .await?;
             return Err(apply_details);
         }
@@ -548,7 +566,22 @@ impl Agent {
         };
         self.mark_runtime_as_primary().await?;
         persist_state(&self.cfg.agent_state_path, &self.state).await?;
-        self.send_sync_report(&snapshot.version, "ok", None).await?;
+        let account_exports = build_account_exports(&self.cfg, &snapshot)?;
+        for export in &account_exports {
+            log_event(
+                "info",
+                &snapshot.version,
+                &node,
+                "tt_link_generated",
+                if export.access_bundle_id.is_some() {
+                    "bundle_id_present"
+                } else {
+                    "bundle_id_missing"
+                },
+            );
+        }
+        self.send_sync_report(&snapshot.version, "ok", None, Some(&account_exports))
+            .await?;
         self.metrics
             .sync_total
             .with_label_values(&[&node, &snapshot.version, "success", "none"])
@@ -665,11 +698,13 @@ impl Agent {
         applied_revision: &str,
         status: &'static str,
         error: Option<&str>,
+        account_exports: Option<&[AccountExportOwned]>,
     ) -> Result<(), String> {
         let report = PendingSyncReport {
             applied_revision,
             status,
             error,
+            account_exports,
         };
         if let Err(err) = self.send_sync_report_payload(&report).await {
             eprintln!("sync-report failed: {err}; queued for retry");
@@ -686,20 +721,39 @@ impl Agent {
     }
 
     async fn send_sync_report_payload(&self, report: &PendingSyncReport<'_>) -> Result<(), String> {
+        let account_exports = report.account_exports.map(|items| {
+            items
+                .iter()
+                .map(|item| AccountExportPayload {
+                    external_node_id: &self.cfg.node_external_id,
+                    username: &item.username,
+                    external_account_id: item.external_account_id.as_deref(),
+                    access_bundle_id: item.access_bundle_id.as_deref(),
+                    active: item.active,
+                    tt_link: &item.tt_link,
+                    endpoint_host: &item.endpoint_host,
+                    endpoint_port: item.endpoint_port,
+                    protocol: &item.protocol,
+                    applied_revision: &item.applied_revision,
+                })
+                .collect::<Vec<_>>()
+        });
         let payload = SyncReportPayload {
             contract_version: "v1",
             external_node_id: &self.cfg.node_external_id,
             applied_revision: report.applied_revision,
             last_sync_status: report.status,
             last_sync_error: report.error,
+            account_exports: account_exports.as_deref(),
         };
         self.lk_api.sync_report(&payload).await?;
 
         println!(
-            "sync-report sent: applied_revision={} status={} error={}",
+            "sync-report sent: applied_revision={} status={} error={} account_exports={}",
             report.applied_revision,
             report.status,
-            report.error.unwrap_or("<none>")
+            report.error.unwrap_or("<none>"),
+            report.account_exports.map_or(0, |x| x.len())
         );
         Ok(())
     }
@@ -1234,6 +1288,7 @@ struct PendingSyncReport<'a> {
     applied_revision: &'a str,
     status: &'a str,
     error: Option<&'a str>,
+    account_exports: Option<&'a [AccountExportOwned]>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1241,6 +1296,21 @@ struct PendingSyncReportOwned {
     applied_revision: String,
     status: String,
     error: Option<String>,
+    #[serde(default)]
+    account_exports: Vec<AccountExportOwned>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct AccountExportOwned {
+    username: String,
+    external_account_id: Option<String>,
+    access_bundle_id: Option<String>,
+    active: bool,
+    tt_link: String,
+    endpoint_host: String,
+    endpoint_port: u16,
+    protocol: String,
+    applied_revision: String,
 }
 
 impl PendingSyncReport<'_> {
@@ -1249,6 +1319,7 @@ impl PendingSyncReport<'_> {
             applied_revision: self.applied_revision.to_string(),
             status: self.status.to_string(),
             error: self.error.map(ToString::to_string),
+            account_exports: self.account_exports.unwrap_or_default().to_vec(),
         }
     }
 }
@@ -1259,6 +1330,7 @@ impl PendingSyncReportOwned {
             applied_revision: &self.applied_revision,
             status: &self.status,
             error: self.error.as_deref(),
+            account_exports: (!self.account_exports.is_empty()).then_some(&self.account_exports),
         }
     }
 }
@@ -1485,25 +1557,20 @@ fn validate_checksum(snapshot: &SyncPayload, raw_body: &[u8]) -> bool {
     }
 
     let candidates = checksum_candidates(snapshot, raw_body);
-    candidates.iter().any(|x| x == &expected) || expected.len() == 64
+    candidates.iter().any(|x| x == &expected)
 }
 
 fn checksum_candidates(snapshot: &SyncPayload, raw_body: &[u8]) -> Vec<String> {
     let mut stable_accounts = snapshot
         .accounts
         .iter()
-        .map(|x| {
-            let mut m = HashMap::new();
-            m.insert("username", x.username.clone());
-            m.insert("password", x.password.clone());
-            m.insert(
-                "enabled",
-                if x.enabled { "true" } else { "false" }.to_string(),
-            );
-            m
-        })
+        .map(|x| serde_json::json!({
+            "enabled": x.enabled,
+            "password": x.password,
+            "username": x.username,
+        }))
         .collect::<Vec<_>>();
-    stable_accounts.sort_by(|a, b| a["username"].cmp(&b["username"]));
+    stable_accounts.sort_by(|a, b| a["username"].as_str().cmp(&b["username"].as_str()));
 
     let canonical_accounts = serde_json::to_vec(&stable_accounts).unwrap_or_default();
     let mut with_version = snapshot.version.as_bytes().to_vec();
@@ -1643,6 +1710,68 @@ async fn persist_pending_sync_reports(
         encoded.push(b'\n');
     }
     atomic_write(path, &encoded).await
+}
+
+fn build_account_exports(cfg: &Config, snapshot: &SyncPayload) -> Result<Vec<AccountExportOwned>, String> {
+    let endpoint_host = cfg
+        .tt_link_host
+        .clone()
+        .unwrap_or_else(|| cfg.node_hostname.clone());
+    let endpoint_port = match cfg.tt_link_port {
+        Some(port) => port,
+        None => resolve_runtime_port(&cfg.trusttunnel_config_file).unwrap_or(443),
+    };
+    let protocol = cfg.tt_link_protocol.to_string();
+
+    snapshot
+        .accounts
+        .iter()
+        .filter(|x| x.enabled)
+        .map(|account| {
+            let deep_link = DeepLinkConfig::builder()
+                .hostname(endpoint_host.clone())
+                .addresses(vec![format!("{endpoint_host}:{endpoint_port}")])
+                .username(account.username.clone())
+                .password(account.password.clone())
+                .custom_sni(cfg.tt_link_custom_sni.clone())
+                .upstream_protocol(cfg.tt_link_protocol)
+                .build()
+                .map_err(|e| format!("failed to build TT deep-link config for {}: {e}", account.username))?;
+            let tt_link = trusttunnel_deeplink::encode(&deep_link)
+                .map_err(|e| format!("failed to encode TT deep-link for {}: {e}", account.username))?;
+
+            Ok(AccountExportOwned {
+                username: account.username.clone(),
+                external_account_id: account.external_account_id.clone(),
+                access_bundle_id: account.access_bundle_id.clone(),
+                active: true,
+                tt_link,
+                endpoint_host: endpoint_host.clone(),
+                endpoint_port,
+                protocol: protocol.clone(),
+                applied_revision: snapshot.version.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn resolve_runtime_port(path: &Path) -> Option<u16> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let value = raw.parse::<toml::Value>().ok()?;
+    let listen_address = value.get("listen_address")?.as_str()?;
+    listen_address
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+}
+
+fn parse_tt_link_protocol(raw: &str) -> Result<DeepLinkProtocol, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "http2" => Ok(DeepLinkProtocol::Http2),
+        "http3" => Ok(DeepLinkProtocol::Http3),
+        other => Err(format!(
+            "TRUSTTUNNEL_TT_LINK_PROTOCOL must be either http2 or http3, got: {other}"
+        )),
+    }
 }
 
 fn required_env(name: &str) -> Result<String, String> {
@@ -1934,7 +2063,7 @@ mod tests {
     use hyper::service::service_fn;
     use hyper::{Method, Request, Response, StatusCode as HyperStatusCode};
     use hyper_util::rt::TokioIo;
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::convert::Infallible;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -2131,6 +2260,10 @@ message_queue_capacity = 4096
             runtime_version: "test".to_string(),
             pending_sync_reports_path: runtime_dir.join(SYNC_REPORT_OUTBOX_FILE),
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
+            tt_link_host: Some("node-1.example".to_string()),
+            tt_link_port: Some(8443),
+            tt_link_protocol: DeepLinkProtocol::Http2,
+            tt_link_custom_sni: None,
         };
 
         Agent::new(cfg).await.unwrap()
@@ -2167,17 +2300,81 @@ message_queue_capacity = 4096
                 username: "b".to_string(),
                 password: "p2".to_string(),
                 enabled: false,
+                external_account_id: None,
+                access_bundle_id: None,
             },
             Account {
                 username: "a".to_string(),
                 password: "p1".to_string(),
                 enabled: true,
+                external_account_id: None,
+                access_bundle_id: None,
             },
         ];
 
         let rendered = render_credentials(&accounts);
         assert!(rendered.contains("username = \"a\""));
         assert!(!rendered.contains("username = \"b\""));
+    }
+
+    #[test]
+    fn account_exports_generate_valid_tt_links() {
+        let snapshot = SyncPayload {
+            version: "rev-1".to_string(),
+            checksum: "0".repeat(64),
+            onboarding_state: "active".to_string(),
+            sync_required: true,
+            accounts: vec![Account {
+                username: "alice".to_string(),
+                password: "secret".to_string(),
+                enabled: true,
+                external_account_id: Some("acc-1".to_string()),
+                access_bundle_id: Some("bundle-1".to_string()),
+            }],
+        };
+        let cfg = Config {
+            lk_base_url: "http://localhost".to_string(),
+            lk_service_token: "token".to_string(),
+            node_external_id: "node-1".to_string(),
+            node_hostname: "node-1.example".to_string(),
+            node_stage: None,
+            node_cluster: None,
+            node_namespace: None,
+            node_rollout_group: None,
+            trusttunnel_runtime_dir: PathBuf::from("."),
+            trusttunnel_config_file: PathBuf::from("vpn.toml"),
+            trusttunnel_hosts_file: PathBuf::from("hosts.toml"),
+            bootstrap_credentials_source_path: None,
+            runtime_credentials_path: PathBuf::from("credentials.toml"),
+            runtime_primary_marker_path: PathBuf::from(".runtime_primary_marker"),
+            agent_state_path: PathBuf::from("agent_state.json"),
+            poll_interval: Duration::from_secs(10),
+            heartbeat_interval: Duration::from_secs(10),
+            sync_path_template: "/sync/{externalNodeId}".to_string(),
+            sync_report_path: "/sync-report".to_string(),
+            heartbeat_path: "/heartbeat".to_string(),
+            register_path: "/register".to_string(),
+            apply_cmd: None,
+            runtime_pid_path: PathBuf::from("trusttunnel.pid"),
+            runtime_process_name: "trusttunnel_endpoint".to_string(),
+            agent_version: "test".to_string(),
+            runtime_version: "test".to_string(),
+            pending_sync_reports_path: PathBuf::from("pending_sync_reports.jsonl"),
+            metrics_address: "127.0.0.1:9901".parse().unwrap(),
+            tt_link_host: Some("gw.example.com".to_string()),
+            tt_link_port: Some(443),
+            tt_link_protocol: DeepLinkProtocol::Http2,
+            tt_link_custom_sni: Some("sni.example.com".to_string()),
+        };
+
+        let exports = build_account_exports(&cfg, &snapshot).unwrap();
+        assert_eq!(exports.len(), 1);
+        assert!(exports[0].tt_link.starts_with("tt://"));
+        let decoded = trusttunnel_deeplink::decode(&exports[0].tt_link).unwrap();
+        assert_eq!(decoded.hostname, "gw.example.com");
+        assert_eq!(decoded.addresses, vec!["gw.example.com:443".to_string()]);
+        assert_eq!(decoded.username, "alice");
+        assert_eq!(decoded.password, "secret");
     }
 
     #[test]
@@ -2262,11 +2459,13 @@ message_queue_capacity = 4096
             applied_revision: "1".to_string(),
             status: "ok".to_string(),
             error: None,
+            account_exports: vec![],
         };
         let second = PendingSyncReportOwned {
             applied_revision: "2".to_string(),
             status: "error".to_string(),
             error: Some("failed".to_string()),
+            account_exports: vec![],
         };
 
         append_pending_sync_report(&path, &first).await.unwrap();
@@ -2327,6 +2526,8 @@ message_queue_capacity = 4096
                 username: "alice".to_string(),
                 password: "secret".to_string(),
                 enabled: true,
+                external_account_id: Some("acc-1".to_string()),
+                access_bundle_id: Some("bundle-1".to_string()),
             }],
         );
         server
@@ -2421,6 +2622,8 @@ message_queue_capacity = 4096
                 username: "alice".to_string(),
                 password: "new".to_string(),
                 enabled: true,
+                external_account_id: None,
+                access_bundle_id: None,
             }],
         );
         server
@@ -2455,6 +2658,8 @@ message_queue_capacity = 4096
                 username: "alice".to_string(),
                 password: "new".to_string(),
                 enabled: true,
+                external_account_id: None,
+                access_bundle_id: None,
             }],
         );
         server
@@ -2637,6 +2842,8 @@ message_queue_capacity = 4096
                 username: "ok".to_string(),
                 password: "ok".to_string(),
                 enabled: true,
+                external_account_id: None,
+                access_bundle_id: None,
             }],
         );
         server

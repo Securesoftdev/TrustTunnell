@@ -217,6 +217,10 @@ pub struct Account {
     pub password: String,
     #[serde(default = "default_enabled", alias = "isEnabled")]
     pub enabled: bool,
+    #[serde(default, alias = "accountId", alias = "credentialId")]
+    pub external_account_id: Option<String>,
+    #[serde(default, alias = "accessBundleId", alias = "bundleId")]
+    pub access_bundle_id: Option<String>,
 }
 
 fn default_enabled() -> bool {
@@ -376,6 +380,24 @@ pub struct SyncReportPayload<'a> {
     pub last_sync_status: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_sync_error: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_exports: Option<&'a [AccountExportPayload<'a>]>,
+}
+
+#[derive(Serialize)]
+pub struct AccountExportPayload<'a> {
+    pub external_node_id: &'a str,
+    pub username: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_account_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_bundle_id: Option<&'a str>,
+    pub active: bool,
+    pub tt_link: &'a str,
+    pub endpoint_host: &'a str,
+    pub endpoint_port: u16,
+    pub protocol: &'a str,
+    pub applied_revision: &'a str,
 }
 
 pub fn payload_top_level_keys(payload: &Value) -> String {
@@ -501,6 +523,7 @@ mod tests {
             applied_revision: "rev-1",
             last_sync_status: "ok",
             last_sync_error: None,
+            account_exports: None,
         };
 
         let value = serde_json::to_value(payload).unwrap();
