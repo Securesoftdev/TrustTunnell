@@ -37,8 +37,9 @@ const RUNTIME_PRIMARY_MARKER_FILE: &str = ".runtime_credentials_primary";
 #[derive(Clone)]
 struct Config {
     runtime_mode: RuntimeMode,
-    lk_base_url: String,
-    lk_service_token: String,
+    lk_db_dsn: String,
+    lk_base_url: Option<String>,
+    lk_service_token: Option<String>,
     node_external_id: String,
     node_hostname: String,
     node_stage: Option<String>,
@@ -49,10 +50,13 @@ struct Config {
     trusttunnel_config_file: PathBuf,
     trusttunnel_hosts_file: PathBuf,
     bootstrap_credentials_source_path: Option<PathBuf>,
+    trusttunnel_link_config_file: PathBuf,
     runtime_credentials_path: PathBuf,
     runtime_primary_marker_path: PathBuf,
     agent_state_path: PathBuf,
-    poll_interval: Duration,
+    reconcile_interval: Duration,
+    apply_interval: Duration,
+    heartbeat_interval: Duration,
     sync_path_template: String,
     sync_report_path: String,
     apply_cmd: Option<String>,
@@ -76,7 +80,7 @@ enum RuntimeMode {
 
 impl RuntimeMode {
     fn from_env() -> Result<Self, String> {
-        match optional_env_nonempty("CLASSIC_AGENT_RUNTIME_MODE")
+        match optional_env_nonempty("CLASSIC_AGENT_MODE")
             .unwrap_or_else(|| "db_worker".to_string())
             .to_ascii_lowercase()
             .as_str()
@@ -84,7 +88,7 @@ impl RuntimeMode {
             "db_worker" => Ok(Self::DbWorker),
             "legacy_http" => Ok(Self::LegacyHttp),
             other => Err(format!(
-                "CLASSIC_AGENT_RUNTIME_MODE must be one of: db_worker, legacy_http; got {other}"
+                "CLASSIC_AGENT_MODE must be one of: db_worker, legacy_http; got {other}"
             )),
         }
     }
@@ -93,34 +97,56 @@ impl RuntimeMode {
 impl Config {
     fn from_env() -> Result<Self, String> {
         let runtime_mode = RuntimeMode::from_env()?;
-        let lk_base_url = required_env("LK_BASE_URL")?;
-        let lk_service_token = required_env("LK_SERVICE_TOKEN")?;
+        let lk_db_dsn = required_env("LK_DB_DSN")?;
         let node_external_id = required_env("NODE_EXTERNAL_ID")?;
         let node_hostname = required_env("NODE_HOSTNAME")?;
-        let node_stage = optional_env_nonempty("NODE_STAGE");
-        let node_cluster = optional_env_nonempty("NODE_CLUSTER");
-        let node_namespace = optional_env_nonempty("NODE_NAMESPACE");
-        let node_rollout_group = optional_env_nonempty("NODE_ROLLOUT_GROUP");
         let trusttunnel_runtime_dir: PathBuf = required_env("TRUSTTUNNEL_RUNTIME_DIR")?.into();
-        let trusttunnel_credentials_file: PathBuf =
-            required_env("TRUSTTUNNEL_CREDENTIALS_FILE")?.into();
+        let trusttunnel_runtime_credentials_file: PathBuf =
+            required_env("TRUSTTUNNEL_RUNTIME_CREDENTIALS_FILE")?.into();
+        let trusttunnel_link_config_file: PathBuf =
+            required_env("TRUSTTUNNEL_LINK_CONFIG_FILE")?.into();
         let trusttunnel_config_file: PathBuf = required_env("TRUSTTUNNEL_CONFIG_FILE")?.into();
         let trusttunnel_hosts_file: PathBuf = required_env("TRUSTTUNNEL_HOSTS_FILE")?.into();
         let bootstrap_credentials_source_path =
             optional_env("TRUSTTUNNEL_BOOTSTRAP_CREDENTIALS_FILE").map(PathBuf::from);
         let runtime_credentials_path =
-            resolve_runtime_path(&trusttunnel_runtime_dir, &trusttunnel_credentials_file);
+            resolve_runtime_path(&trusttunnel_runtime_dir, &trusttunnel_runtime_credentials_file);
         let runtime_primary_marker_path = trusttunnel_runtime_dir.join(RUNTIME_PRIMARY_MARKER_FILE);
         let agent_state_path = std::env::var("AGENT_STATE_PATH")
             .unwrap_or_else(|_| "agent_state.json".to_string())
             .into();
 
-        let poll_interval = duration_required_from_env("AGENT_POLL_INTERVAL_SEC")?;
+        let reconcile_interval = duration_required_from_env("AGENT_RECONCILE_INTERVAL_SEC")?;
+        let apply_interval = duration_required_from_env("AGENT_APPLY_INTERVAL_SEC")?;
 
-        let sync_path_template = std::env::var("LK_SYNC_PATH_TEMPLATE")
-            .unwrap_or_else(|_| DEFAULT_SYNC_PATH_TEMPLATE.to_string());
-        let sync_report_path = std::env::var("LK_SYNC_REPORT_PATH")
-            .unwrap_or_else(|_| DEFAULT_SYNC_REPORT_PATH.to_string());
+        let (lk_base_url, lk_service_token, node_stage, node_cluster, node_namespace, node_rollout_group, heartbeat_interval, sync_path_template, sync_report_path) =
+            if runtime_mode == RuntimeMode::LegacyHttp {
+                (
+                    Some(required_env("LK_BASE_URL")?),
+                    Some(required_env("LK_SERVICE_TOKEN")?),
+                    optional_env_nonempty("NODE_STAGE"),
+                    optional_env_nonempty("NODE_CLUSTER"),
+                    optional_env_nonempty("NODE_NAMESPACE"),
+                    optional_env_nonempty("NODE_ROLLOUT_GROUP"),
+                    duration_required_from_env("AGENT_HEARTBEAT_INTERVAL_SEC")?,
+                    std::env::var("LK_SYNC_PATH_TEMPLATE")
+                        .unwrap_or_else(|_| DEFAULT_SYNC_PATH_TEMPLATE.to_string()),
+                    std::env::var("LK_SYNC_REPORT_PATH")
+                        .unwrap_or_else(|_| DEFAULT_SYNC_REPORT_PATH.to_string()),
+                )
+            } else {
+                (
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Duration::from_secs(30),
+                    DEFAULT_SYNC_PATH_TEMPLATE.to_string(),
+                    DEFAULT_SYNC_REPORT_PATH.to_string(),
+                )
+            };
 
         let apply_cmd = std::env::var("TRUSTTUNNEL_APPLY_CMD")
             .ok()
@@ -153,6 +179,7 @@ impl Config {
         let cfg = Self {
             lk_base_url,
             runtime_mode,
+            lk_db_dsn,
             lk_service_token,
             node_external_id,
             node_hostname,
@@ -164,10 +191,13 @@ impl Config {
             trusttunnel_config_file,
             trusttunnel_hosts_file,
             bootstrap_credentials_source_path,
+            trusttunnel_link_config_file,
             runtime_credentials_path,
             runtime_primary_marker_path,
             agent_state_path,
-            poll_interval,
+            reconcile_interval,
+            apply_interval,
+            heartbeat_interval,
             sync_path_template,
             sync_report_path,
             apply_cmd,
@@ -221,14 +251,29 @@ impl Config {
             .parent()
             .ok_or_else(|| {
                 format!(
-                    "TRUSTTUNNEL_CREDENTIALS_FILE has no parent directory: {}",
+                    "TRUSTTUNNEL_RUNTIME_CREDENTIALS_FILE has no parent directory: {}",
                     self.runtime_credentials_path.display()
                 )
             })?;
         if !credentials_parent.exists() {
             return Err(format!(
-                "TRUSTTUNNEL_CREDENTIALS_FILE parent path not found: {}",
+                "TRUSTTUNNEL_RUNTIME_CREDENTIALS_FILE parent path not found: {}",
                 credentials_parent.display()
+            ));
+        }
+
+        let link_config_path =
+            resolve_runtime_path(&self.trusttunnel_runtime_dir, &self.trusttunnel_link_config_file);
+        let link_config_parent = link_config_path.parent().ok_or_else(|| {
+            format!(
+                "TRUSTTUNNEL_LINK_CONFIG_FILE has no parent directory: {}",
+                link_config_path.display()
+            )
+        })?;
+        if !link_config_parent.exists() {
+            return Err(format!(
+                "TRUSTTUNNEL_LINK_CONFIG_FILE parent path not found: {}",
+                link_config_parent.display()
             ));
         }
         Ok(())
@@ -274,8 +319,8 @@ impl Agent {
         };
         let lk_api = LkApiClient::new(
             client,
-            cfg.lk_base_url.clone(),
-            cfg.lk_service_token.clone(),
+            cfg.lk_base_url.clone().unwrap_or_default(),
+            cfg.lk_service_token.clone().unwrap_or_default(),
             DEFAULT_REGISTER_PATH.to_string(),
             DEFAULT_HEARTBEAT_PATH.to_string(),
             cfg.sync_report_path.clone(),
@@ -329,7 +374,13 @@ impl Agent {
     }
 
     async fn run_db_worker_loop(&mut self) {
-        let mut poll_tick = interval(self.cfg.poll_interval);
+        println!(
+            "db_worker mode enabled for node_external_id={} (dsn_len={}, apply_interval_sec={})",
+            self.cfg.node_external_id,
+            self.cfg.lk_db_dsn.len(),
+            self.cfg.apply_interval.as_secs()
+        );
+        let mut poll_tick = interval(self.cfg.reconcile_interval);
         poll_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut backoff = Duration::from_secs(1);
 
@@ -355,9 +406,9 @@ impl Agent {
     async fn run_legacy_http_loop(&mut self) {
         self.bootstrap_register().await;
 
-        let mut poll_tick = interval(self.cfg.poll_interval);
+        let mut poll_tick = interval(self.cfg.reconcile_interval);
         poll_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut heartbeat_tick = interval(Duration::from_secs(30));
+        let mut heartbeat_tick = interval(self.cfg.heartbeat_interval);
         heartbeat_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut sync_report_tick = interval(Duration::from_secs(1));
         sync_report_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -1008,8 +1059,12 @@ impl Agent {
             .unwrap_or_else(|err| format!("failed to read response body: {err}"));
         let endpoint = format!(
             "{}{}",
-            self.cfg.lk_base_url.trim_end_matches('/'),
-            "/register"
+            self.cfg
+                .lk_base_url
+                .as_deref()
+                .unwrap_or_default()
+                .trim_end_matches('/'),
+            DEFAULT_REGISTER_PATH
         );
         let payload_keys = payload_key_list(&payload);
         let reason_summary = summarize_register_reason(status, &response_body);
@@ -2300,9 +2355,10 @@ message_queue_capacity = 4096
         fs::write(&config_file, settings).await.unwrap();
 
         let cfg = Config {
-            lk_base_url: base_url.to_string(),
+            lk_base_url: Some(base_url.to_string()),
             runtime_mode: RuntimeMode::DbWorker,
-            lk_service_token: "token".to_string(),
+            lk_db_dsn: "postgres://localhost/lk".to_string(),
+            lk_service_token: Some("token".to_string()),
             node_external_id: "node-1".to_string(),
             node_hostname: "node-1.example".to_string(),
             node_stage: Some("prod".to_string()),
@@ -2313,10 +2369,13 @@ message_queue_capacity = 4096
             trusttunnel_config_file: config_file.clone(),
             trusttunnel_hosts_file: hosts_file,
             bootstrap_credentials_source_path: None,
+            trusttunnel_link_config_file: runtime_dir.join("tt-link.toml"),
             runtime_credentials_path: credentials_file_abs,
             runtime_primary_marker_path: runtime_dir.join(RUNTIME_PRIMARY_MARKER_FILE),
             agent_state_path: runtime_dir.join("agent_state.json"),
-            poll_interval: Duration::from_secs(60),
+            reconcile_interval: Duration::from_secs(60),
+            apply_interval: Duration::from_secs(60),
+            heartbeat_interval: Duration::from_secs(30),
             sync_path_template: "/sync/{externalNodeId}".to_string(),
             sync_report_path: "/sync-report".to_string(),
             apply_cmd: apply_cmd.map(ToString::to_string),
@@ -2399,9 +2458,10 @@ message_queue_capacity = 4096
             }],
         };
         let cfg = Config {
-            lk_base_url: "http://localhost".to_string(),
+            lk_base_url: Some("http://localhost".to_string()),
             runtime_mode: RuntimeMode::DbWorker,
-            lk_service_token: "token".to_string(),
+            lk_db_dsn: "postgres://localhost/lk".to_string(),
+            lk_service_token: Some("token".to_string()),
             node_external_id: "node-1".to_string(),
             node_hostname: "node-1.example".to_string(),
             node_stage: None,
@@ -2412,10 +2472,13 @@ message_queue_capacity = 4096
             trusttunnel_config_file: PathBuf::from("vpn.toml"),
             trusttunnel_hosts_file: PathBuf::from("hosts.toml"),
             bootstrap_credentials_source_path: None,
+            trusttunnel_link_config_file: PathBuf::from("tt-link.toml"),
             runtime_credentials_path: PathBuf::from("credentials.toml"),
             runtime_primary_marker_path: PathBuf::from(".runtime_primary_marker"),
             agent_state_path: PathBuf::from("agent_state.json"),
-            poll_interval: Duration::from_secs(10),
+            reconcile_interval: Duration::from_secs(10),
+            apply_interval: Duration::from_secs(10),
+            heartbeat_interval: Duration::from_secs(30),
             sync_path_template: "/sync/{externalNodeId}".to_string(),
             sync_report_path: "/sync-report".to_string(),
             apply_cmd: None,
@@ -2755,13 +2818,13 @@ message_queue_capacity = 4096
         server
             .enqueue(
                 Method::POST,
-                "/register",
+                DEFAULT_REGISTER_PATH,
                 HyperStatusCode::SERVICE_UNAVAILABLE,
                 "",
             )
             .await;
         server
-            .enqueue(Method::POST, "/register", HyperStatusCode::OK, "")
+            .enqueue(Method::POST, DEFAULT_REGISTER_PATH, HyperStatusCode::OK, "")
             .await;
 
         let started = std::time::Instant::now();
@@ -2775,7 +2838,7 @@ message_queue_capacity = 4096
         let tmp_dir = TempDir::new().unwrap();
         let agent = make_agent(&tmp_dir, &server.base_url, None).await;
         server
-            .enqueue(Method::POST, "/register", HyperStatusCode::OK, "")
+            .enqueue(Method::POST, DEFAULT_REGISTER_PATH, HyperStatusCode::OK, "")
             .await;
 
         let outcome = agent.send_register_once().await.unwrap();
@@ -2784,7 +2847,7 @@ message_queue_capacity = 4096
         let requests = server.captured().await;
         let register = requests
             .iter()
-            .find(|x| x.method == Method::POST && x.path == "/register")
+            .find(|x| x.method == Method::POST && x.path == DEFAULT_REGISTER_PATH)
             .unwrap();
         let body: serde_json::Value = serde_json::from_str(&register.body).unwrap();
         assert_eq!(body["contract_version"], "v1");
@@ -2806,7 +2869,7 @@ message_queue_capacity = 4096
         server
             .enqueue(
                 Method::POST,
-                "/register",
+                DEFAULT_REGISTER_PATH,
                 HyperStatusCode::BAD_REQUEST,
                 r#"{"error":"missing field: contract_version"}"#,
             )
@@ -2840,7 +2903,7 @@ message_queue_capacity = 4096
         server
             .enqueue(
                 Method::POST,
-                "/heartbeat",
+                DEFAULT_HEARTBEAT_PATH,
                 HyperStatusCode::INTERNAL_SERVER_ERROR,
                 "",
             )
@@ -2848,20 +2911,20 @@ message_queue_capacity = 4096
         server
             .enqueue(
                 Method::POST,
-                "/heartbeat",
+                DEFAULT_HEARTBEAT_PATH,
                 HyperStatusCode::BAD_GATEWAY,
                 "",
             )
             .await;
         server
-            .enqueue(Method::POST, "/heartbeat", HyperStatusCode::OK, "")
+            .enqueue(Method::POST, DEFAULT_HEARTBEAT_PATH, HyperStatusCode::OK, "")
             .await;
 
         agent.send_heartbeat_with_retry().await;
         let requests = server.captured().await;
         let heartbeat_count = requests
             .iter()
-            .filter(|x| x.method == Method::POST && x.path == "/heartbeat")
+            .filter(|x| x.method == Method::POST && x.path == DEFAULT_HEARTBEAT_PATH)
             .count();
         assert_eq!(heartbeat_count, 3);
     }
@@ -2874,7 +2937,7 @@ message_queue_capacity = 4096
         agent.state.applied_revision = None;
         agent.last_apply_status = "".to_string();
         server
-            .enqueue(Method::POST, "/heartbeat", HyperStatusCode::OK, "")
+            .enqueue(Method::POST, DEFAULT_HEARTBEAT_PATH, HyperStatusCode::OK, "")
             .await;
 
         agent.send_heartbeat().await.unwrap();
@@ -2882,7 +2945,7 @@ message_queue_capacity = 4096
         let requests = server.captured().await;
         let heartbeat = requests
             .iter()
-            .find(|x| x.method == Method::POST && x.path == "/heartbeat")
+            .find(|x| x.method == Method::POST && x.path == DEFAULT_HEARTBEAT_PATH)
             .unwrap();
         let body: serde_json::Value = serde_json::from_str(&heartbeat.body).unwrap();
         assert_eq!(body["contract_version"], "v1");
