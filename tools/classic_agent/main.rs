@@ -2209,25 +2209,38 @@ fn summarize_register_reason(status: StatusCode, body: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "legacy-lk-http")]
     use http_body_util::{BodyExt, Full};
+    #[cfg(feature = "legacy-lk-http")]
     use hyper::body::{Bytes, Incoming};
+    #[cfg(feature = "legacy-lk-http")]
     use hyper::server::conn::http1;
+    #[cfg(feature = "legacy-lk-http")]
     use hyper::service::service_fn;
+    #[cfg(feature = "legacy-lk-http")]
     use hyper::{Method, Request, Response, StatusCode as HyperStatusCode};
+    #[cfg(feature = "legacy-lk-http")]
     use hyper_util::rt::TokioIo;
+    #[cfg(feature = "legacy-lk-http")]
     use std::collections::{HashMap, VecDeque};
+    #[cfg(feature = "legacy-lk-http")]
     use std::convert::Infallible;
+    #[cfg(feature = "legacy-lk-http")]
     use std::sync::Arc;
     use tempfile::TempDir;
+    #[cfg(feature = "legacy-lk-http")]
     use tokio::net::TcpListener;
+    #[cfg(feature = "legacy-lk-http")]
     use tokio::sync::Mutex;
 
+    #[cfg(feature = "legacy-lk-http")]
     #[derive(Clone)]
     struct MockResponse {
         status: HyperStatusCode,
         body: String,
     }
 
+    #[cfg(feature = "legacy-lk-http")]
     #[derive(Clone)]
     struct CapturedRequest {
         method: Method,
@@ -2235,17 +2248,20 @@ mod tests {
         body: String,
     }
 
+    #[cfg(feature = "legacy-lk-http")]
     #[derive(Default)]
     struct MockState {
         routes: HashMap<(Method, String), VecDeque<MockResponse>>,
         captured: Vec<CapturedRequest>,
     }
 
+    #[cfg(feature = "legacy-lk-http")]
     struct MockHttpServer {
         base_url: String,
         state: Arc<Mutex<MockState>>,
     }
 
+    #[cfg(feature = "legacy-lk-http")]
     impl MockHttpServer {
         async fn start() -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2329,6 +2345,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "legacy-lk-http")]
     async fn make_agent(
         temp_dir: &TempDir,
         base_url: &str,
@@ -2425,6 +2442,7 @@ message_queue_capacity = 4096
         Agent::new(cfg).await.unwrap()
     }
 
+    #[cfg(feature = "legacy-lk-http")]
     fn snapshot_json(
         version: &str,
         onboarding_state: &str,
@@ -2543,6 +2561,58 @@ message_queue_capacity = 4096
         assert!(rendered.contains("username = \"active\""));
         assert!(!rendered.contains("username = \"frozen\""));
         assert!(!rendered.contains("username = \"revoked\""));
+    }
+
+    #[test]
+    fn runtime_filters_keep_only_active_accounts() {
+        let accounts = vec![
+            Account {
+                username: "active".to_string(),
+                password: "p1".to_string(),
+                enabled: true,
+                assigned: true,
+                free: false,
+                revoked: false,
+                frozen: false,
+                external_account_id: None,
+                access_bundle_id: None,
+                tt_link: "tt://active".to_string(),
+                tt_link_config_hash: "hash".to_string(),
+                tt_link_stale: false,
+            },
+            Account {
+                username: "unassigned".to_string(),
+                password: "p2".to_string(),
+                enabled: true,
+                assigned: false,
+                free: false,
+                revoked: false,
+                frozen: false,
+                external_account_id: None,
+                access_bundle_id: None,
+                tt_link: "tt://u".to_string(),
+                tt_link_config_hash: "hash".to_string(),
+                tt_link_stale: false,
+            },
+            Account {
+                username: "free".to_string(),
+                password: "p3".to_string(),
+                enabled: true,
+                assigned: true,
+                free: true,
+                revoked: false,
+                frozen: false,
+                external_account_id: None,
+                access_bundle_id: None,
+                tt_link: "tt://f".to_string(),
+                tt_link_config_hash: "hash".to_string(),
+                tt_link_stale: false,
+            },
+        ];
+
+        let runtime_accounts = fetch_active_accounts_for_runtime(&accounts);
+        assert_eq!(runtime_accounts.len(), 1);
+        assert_eq!(runtime_accounts[0].username, "active");
     }
 
     #[test]
@@ -2730,6 +2800,160 @@ message_queue_capacity = 4096
     }
 
     #[test]
+    fn account_exports_regenerate_tt_link_when_config_hash_changes() {
+        let temp_dir = TempDir::new().unwrap();
+        let runtime_dir = temp_dir.path();
+        std::fs::write(
+            runtime_dir.join("tt-link.toml"),
+            "host = \"gw.example.com\"\nport = 443\nprotocol = \"http2\"\n",
+        )
+        .unwrap();
+        let cfg = Config {
+            lk_base_url: None,
+            runtime_mode: RuntimeMode::DbWorker,
+            lk_db_dsn: "postgres://localhost/lk".to_string(),
+            lk_service_token: None,
+            node_external_id: "node-1".to_string(),
+            node_hostname: "node-1.example".to_string(),
+            node_stage: None,
+            node_cluster: None,
+            node_namespace: None,
+            node_rollout_group: None,
+            trusttunnel_runtime_dir: runtime_dir.to_path_buf(),
+            trusttunnel_config_file: PathBuf::from("vpn.toml"),
+            trusttunnel_hosts_file: PathBuf::from("hosts.toml"),
+            bootstrap_credentials_source_path: None,
+            trusttunnel_link_config_file: PathBuf::from("tt-link.toml"),
+            runtime_credentials_path: PathBuf::from("credentials.toml"),
+            runtime_primary_marker_path: PathBuf::from(".runtime_primary_marker"),
+            agent_state_path: PathBuf::from("agent_state.json"),
+            reconcile_interval: Duration::from_secs(10),
+            apply_interval: Duration::from_secs(10),
+            heartbeat_interval: None,
+            sync_path_template: None,
+            sync_report_path: None,
+            apply_cmd: None,
+            runtime_pid_path: None,
+            runtime_process_name: None,
+            agent_version: "test".to_string(),
+            runtime_version: "test".to_string(),
+            pending_sync_reports_path: None,
+            metrics_address: "127.0.0.1:9901".parse().unwrap(),
+        };
+        let snapshot = SyncPayload {
+            version: "rev-1".to_string(),
+            checksum: "0".repeat(64),
+            onboarding_state: "active".to_string(),
+            sync_required: true,
+            accounts: vec![Account {
+                username: "alice".to_string(),
+                password: "secret".to_string(),
+                enabled: true,
+                assigned: true,
+                free: false,
+                revoked: false,
+                frozen: false,
+                external_account_id: Some("acc-1".to_string()),
+                access_bundle_id: Some("bundle-1".to_string()),
+                tt_link: "tt://existing".to_string(),
+                tt_link_config_hash: "old-config-hash".to_string(),
+                tt_link_stale: false,
+            }],
+        };
+
+        let (exports, stats) = build_account_exports(&cfg, &snapshot).unwrap();
+        assert_eq!(exports.len(), 1);
+        assert_ne!(exports[0].tt_link, "tt://existing");
+        assert_eq!(stats.updated_total, 1);
+        assert_eq!(stats.updated_hash_mismatch, 1);
+    }
+
+    #[test]
+    fn account_exports_generate_batch_for_snapshot_accounts() {
+        let temp_dir = TempDir::new().unwrap();
+        let runtime_dir = temp_dir.path();
+        std::fs::write(
+            runtime_dir.join("tt-link.toml"),
+            "host = \"gw.example.com\"\nport = 443\nprotocol = \"http2\"\n",
+        )
+        .unwrap();
+        let cfg = Config {
+            lk_base_url: None,
+            runtime_mode: RuntimeMode::DbWorker,
+            lk_db_dsn: "postgres://localhost/lk".to_string(),
+            lk_service_token: None,
+            node_external_id: "node-1".to_string(),
+            node_hostname: "node-1.example".to_string(),
+            node_stage: None,
+            node_cluster: None,
+            node_namespace: None,
+            node_rollout_group: None,
+            trusttunnel_runtime_dir: runtime_dir.to_path_buf(),
+            trusttunnel_config_file: PathBuf::from("vpn.toml"),
+            trusttunnel_hosts_file: PathBuf::from("hosts.toml"),
+            bootstrap_credentials_source_path: None,
+            trusttunnel_link_config_file: PathBuf::from("tt-link.toml"),
+            runtime_credentials_path: PathBuf::from("credentials.toml"),
+            runtime_primary_marker_path: PathBuf::from(".runtime_primary_marker"),
+            agent_state_path: PathBuf::from("agent_state.json"),
+            reconcile_interval: Duration::from_secs(10),
+            apply_interval: Duration::from_secs(10),
+            heartbeat_interval: None,
+            sync_path_template: None,
+            sync_report_path: None,
+            apply_cmd: None,
+            runtime_pid_path: None,
+            runtime_process_name: None,
+            agent_version: "test".to_string(),
+            runtime_version: "test".to_string(),
+            pending_sync_reports_path: None,
+            metrics_address: "127.0.0.1:9901".parse().unwrap(),
+        };
+        let snapshot = SyncPayload {
+            version: "rev-1".to_string(),
+            checksum: "0".repeat(64),
+            onboarding_state: "active".to_string(),
+            sync_required: true,
+            accounts: vec![
+                Account {
+                    username: "alice".to_string(),
+                    password: "secret-a".to_string(),
+                    enabled: true,
+                    assigned: true,
+                    free: false,
+                    revoked: false,
+                    frozen: false,
+                    external_account_id: Some("acc-1".to_string()),
+                    access_bundle_id: Some("bundle-1".to_string()),
+                    tt_link: String::new(),
+                    tt_link_config_hash: String::new(),
+                    tt_link_stale: false,
+                },
+                Account {
+                    username: "bob".to_string(),
+                    password: "secret-b".to_string(),
+                    enabled: true,
+                    assigned: true,
+                    free: false,
+                    revoked: false,
+                    frozen: false,
+                    external_account_id: Some("acc-2".to_string()),
+                    access_bundle_id: Some("bundle-2".to_string()),
+                    tt_link: String::new(),
+                    tt_link_config_hash: String::new(),
+                    tt_link_stale: false,
+                },
+            ],
+        };
+
+        let (exports, stats) = build_account_exports(&cfg, &snapshot).unwrap();
+        assert_eq!(exports.len(), 2);
+        assert!(exports.iter().all(|x| x.tt_link.starts_with("tt://")));
+        assert_eq!(stats.updated_total, 2);
+        assert_eq!(stats.updated_empty_link, 2);
+    }
+
+    #[test]
     fn checksum_accepts_sha_of_raw_body() {
         let raw = br#"{"version":"1","checksum":"","accounts":[]}"#;
         let snapshot = SyncPayload {
@@ -2804,6 +3028,74 @@ message_queue_capacity = 4096
     }
 
     #[tokio::test]
+    async fn db_worker_mode_does_not_require_lk_http_configuration() {
+        let temp_dir = TempDir::new().unwrap();
+        let runtime_dir = temp_dir.path().join("runtime");
+        fs::create_dir_all(&runtime_dir).await.unwrap();
+        let config_file = runtime_dir.join("vpn.toml");
+        let hosts_file = runtime_dir.join("hosts.toml");
+        let rules_file = runtime_dir.join("rules.toml");
+        let credentials_file = runtime_dir.join("credentials.toml");
+
+        fs::write(&hosts_file, "").await.unwrap();
+        fs::write(&rules_file, "").await.unwrap();
+        fs::write(&credentials_file, "").await.unwrap();
+        fs::write(
+            runtime_dir.join("tt-link.toml"),
+            "server = \"node-1.example\"\nport = 8443\nprotocol = \"http2\"\n",
+        )
+        .await
+        .unwrap();
+        fs::write(
+            &config_file,
+            format!(
+                "listen_address = \"127.0.0.1:443\"\ncredentials_file = \"{}\"\nrules_file = \"{}\"\n",
+                credentials_file.display(),
+                rules_file.display()
+            ),
+        )
+        .await
+        .unwrap();
+
+        let cfg = Config {
+            lk_base_url: None,
+            runtime_mode: RuntimeMode::DbWorker,
+            lk_db_dsn: "postgres://localhost/lk".to_string(),
+            lk_service_token: None,
+            node_external_id: "node-1".to_string(),
+            node_hostname: "node-1.example".to_string(),
+            node_stage: None,
+            node_cluster: None,
+            node_namespace: None,
+            node_rollout_group: None,
+            trusttunnel_runtime_dir: runtime_dir.clone(),
+            trusttunnel_config_file: config_file,
+            trusttunnel_hosts_file: hosts_file,
+            bootstrap_credentials_source_path: None,
+            trusttunnel_link_config_file: runtime_dir.join("tt-link.toml"),
+            runtime_credentials_path: credentials_file,
+            runtime_primary_marker_path: runtime_dir.join(RUNTIME_PRIMARY_MARKER_FILE),
+            agent_state_path: runtime_dir.join("agent_state.json"),
+            reconcile_interval: Duration::from_secs(60),
+            apply_interval: Duration::from_secs(60),
+            heartbeat_interval: None,
+            sync_path_template: None,
+            sync_report_path: None,
+            apply_cmd: None,
+            runtime_pid_path: None,
+            runtime_process_name: None,
+            agent_version: "test".to_string(),
+            runtime_version: "test".to_string(),
+            pending_sync_reports_path: None,
+            metrics_address: "127.0.0.1:9901".parse().unwrap(),
+        };
+
+        let agent = Agent::new(cfg).await.unwrap();
+        assert!(agent.cfg.lk_base_url.is_none());
+        assert!(agent.cfg.lk_service_token.is_none());
+    }
+
+    #[tokio::test]
     async fn pending_sync_report_outbox_roundtrip() {
         let tmp_dir = TempDir::new().unwrap();
         let path = tmp_dir.path().join("pending_sync_reports.jsonl");
@@ -2860,6 +3152,7 @@ message_queue_capacity = 4096
         assert!(names.contains(&"classic_agent_credentials_count".to_string()));
     }
 
+    #[cfg(feature = "legacy-lk-http")]
     #[tokio::test]
     async fn reconcile_once_valid_config_applies_and_reports_success() {
         let server = MockHttpServer::start().await;
@@ -2918,8 +3211,12 @@ message_queue_capacity = 4096
             .unwrap();
         assert!(report.body.contains("\"last_sync_status\":\"ok\""));
         assert!(report.body.contains("\"applied_revision\":\"v1\""));
+        assert!(report.body.contains("\"external_node_id\":\"node-1\""));
+        assert!(report.body.contains("\"tt_link\":\"tt://"));
+        assert!(report.body.contains("\"config_hash\":\""));
     }
 
+    #[cfg(feature = "legacy-lk-http")]
     #[tokio::test]
     async fn reconcile_once_onboarding_not_active_skips_apply() {
         let server = MockHttpServer::start().await;
@@ -2943,6 +3240,7 @@ message_queue_capacity = 4096
         assert!(report.body.contains("\"last_sync_status\":\"skipped\""));
     }
 
+    #[cfg(feature = "legacy-lk-http")]
     #[tokio::test]
     async fn reconcile_once_sync_required_false_skips_apply() {
         let server = MockHttpServer::start().await;
@@ -2966,6 +3264,7 @@ message_queue_capacity = 4096
         assert!(report.body.contains("\"last_sync_status\":\"skipped\""));
     }
 
+    #[cfg(feature = "legacy-lk-http")]
     #[tokio::test]
     async fn reconcile_once_apply_failure_rolls_back_runtime_credentials() {
         let server = MockHttpServer::start().await;
@@ -3007,6 +3306,7 @@ message_queue_capacity = 4096
         assert_eq!(creds, original);
     }
 
+    #[cfg(feature = "legacy-lk-http")]
     #[tokio::test]
     async fn failed_apply_with_sync_report_error_is_queued_for_retry() {
         let server = MockHttpServer::start().await;
@@ -3062,6 +3362,7 @@ message_queue_capacity = 4096
         assert_eq!(queued[0].status, "error");
     }
 
+    #[cfg(feature = "legacy-lk-http")]
     #[tokio::test]
     async fn register_retries_on_temporary_lk_unavailability() {
         let server = MockHttpServer::start().await;
@@ -3084,6 +3385,7 @@ message_queue_capacity = 4096
         assert!(started.elapsed() >= REGISTER_INITIAL_BACKOFF);
     }
 
+    #[cfg(feature = "legacy-lk-http")]
     #[tokio::test]
     async fn register_payload_uses_canonical_v1_contract() {
         let server = MockHttpServer::start().await;
@@ -3113,6 +3415,7 @@ message_queue_capacity = 4096
         assert!(body.get("trusttunnel_runtime_dir").is_none());
     }
 
+    #[cfg(feature = "legacy-lk-http")]
     #[tokio::test]
     async fn register_bad_request_returns_diagnostic_without_secret_token() {
         let server = MockHttpServer::start().await;
@@ -3147,6 +3450,7 @@ message_queue_capacity = 4096
         assert_eq!(reason, "invalid_node_identity");
     }
 
+    #[cfg(feature = "legacy-lk-http")]
     #[tokio::test]
     async fn heartbeat_loop_is_resilient_to_temporary_lk_errors() {
         let server = MockHttpServer::start().await;
@@ -3181,6 +3485,7 @@ message_queue_capacity = 4096
         assert_eq!(heartbeat_count, 3);
     }
 
+    #[cfg(feature = "legacy-lk-http")]
     #[tokio::test]
     async fn heartbeat_payload_uses_lk_v1_normalized_fields() {
         let server = MockHttpServer::start().await;
@@ -3208,6 +3513,7 @@ message_queue_capacity = 4096
         assert!(body.get("timestamp").is_none());
     }
 
+    #[cfg(feature = "legacy-lk-http")]
     #[tokio::test]
     async fn temporary_lk_sync_failure_does_not_break_subsequent_sync() {
         let server = MockHttpServer::start().await;
@@ -3251,6 +3557,7 @@ message_queue_capacity = 4096
         assert!(agent.reconcile_once().await.is_ok());
     }
 
+    #[cfg(feature = "legacy-lk-http")]
     #[tokio::test]
     async fn sync_http_409_is_handled_without_crash() {
         let server = MockHttpServer::start().await;
@@ -3267,6 +3574,29 @@ message_queue_capacity = 4096
             .filter(|x| x.method == Method::POST && x.path == "/sync-report")
             .count();
         assert_eq!(sync_report_count, 0);
+    }
+
+    #[cfg(feature = "legacy-lk-http")]
+    #[tokio::test]
+    async fn fetch_accounts_uses_current_node_external_id_in_sync_path() {
+        let server = MockHttpServer::start().await;
+        let tmp_dir = TempDir::new().unwrap();
+        let agent = make_agent(&tmp_dir, &server.base_url, None).await;
+        let body = snapshot_json("v5", "active", true, vec![]);
+        server
+            .enqueue(Method::GET, "/sync/node-1", HyperStatusCode::OK, body)
+            .await;
+
+        let response = agent.fetch_accounts_by_node().await.unwrap();
+        assert!(response.is_some());
+
+        let requests = server.captured().await;
+        let sync_paths = requests
+            .iter()
+            .filter(|x| x.method == Method::GET)
+            .map(|x| x.path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(sync_paths, vec!["/sync/node-1".to_string()]);
     }
 
     #[tokio::test]

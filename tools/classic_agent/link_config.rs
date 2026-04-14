@@ -201,4 +201,24 @@ b = "2"
 
         assert_eq!(first.config_hash(), second.config_hash());
     }
+
+    #[test]
+    fn loads_config_from_file() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("tt-link.toml");
+        std::fs::write(
+            &path,
+            r#"
+host = "edge.example.com"
+port = 8443
+protocol = "http2"
+"#,
+        )
+        .unwrap();
+
+        let cfg = LinkGenerationConfig::load_from_file(&path).unwrap();
+        assert_eq!(cfg.server(), "edge.example.com");
+        assert_eq!(cfg.port_or(443), 8443);
+        assert_eq!(cfg.protocol(), DeepLinkProtocol::Http2);
+    }
 }
