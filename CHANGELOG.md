@@ -2,6 +2,8 @@
 
 ## 1.0.28
 
+- [Feature] `classic_agent` now generates deterministic per-account TrustTunnel deep links from synced LK access bundles and sends them back in `sync-report` payloads for LK-side storage and user delivery.
+- [Fix] `classic_agent` sync checksum validation now rejects mismatched 64-hex checksums instead of accepting any hex-like value, preventing false-positive sync applies.
 - [Fix] Docker image builds no longer fail on `docker-entrypoint.sh` copy step because the Dockerfile now uses a build-context-relative path.
 
 - [Fix] `classic_agent` now supports one-time bootstrap import from `TRUSTTUNNEL_BOOTSTRAP_CREDENTIALS_FILE` into `TRUSTTUNNEL_RUNTIME_DIR/<TRUSTTUNNEL_CREDENTIALS_FILE>`, then marks runtime credentials as primary after the first successful sync/apply and stops treating bootstrap storage as primary on restart.

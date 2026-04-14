@@ -24,7 +24,26 @@ COPY tools ./tools
 FROM build-base AS build-endpoint
 RUN cargo build --release --bin trusttunnel_endpoint --bin setup_wizard
 
-FROM build-base AS build-classic-agent
+FROM rust:1.85-bookworm AS build-classic-agent
+ARG ENDPOINT_DIR_NAME="TrustTunnel"
+WORKDIR /home/${ENDPOINT_DIR_NAME}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    clang \
+    libclang-dev \
+    pkg-config \
+    perl \
+    make \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock rust-toolchain.toml Makefile ./
+COPY deeplink ./deeplink
+COPY lib ./lib
+COPY macros ./macros
+COPY tools ./tools
+
 RUN cargo build --release --bin classic_agent
 
 FROM debian:bookworm-slim AS trusttunnel-endpoint

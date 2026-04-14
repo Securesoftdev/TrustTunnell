@@ -3644,6 +3644,7 @@ dependencies = [
  "toml",
  "toml_edit 0.19.15",
  "trusttunnel",
+ "trusttunnel-deeplink",
  "x509-parser",
 ]
 
