@@ -644,7 +644,16 @@ impl Agent {
         };
         self.mark_runtime_as_primary().await?;
         persist_state(&self.cfg.agent_state_path, &self.state).await?;
-        let account_exports = self.batch_tt_link_reconcile(&snapshot).await?;
+        let (account_exports, link_stats) = self.batch_tt_link_reconcile(&snapshot).await?;
+        println!(
+            "tt-link reconcile: updated_total={} skipped_up_to_date={} skipped_disabled={} updated_reasons(empty_link={}, hash_mismatch={}, stale={})",
+            link_stats.updated_total,
+            link_stats.skipped_up_to_date,
+            link_stats.skipped_disabled,
+            link_stats.updated_empty_link,
+            link_stats.updated_hash_mismatch,
+            link_stats.updated_stale
+        );
         for export in &account_exports {
             let error_class = if export.access_bundle_id.is_some() {
                 "bundle_id_present"
@@ -779,7 +788,7 @@ impl Agent {
     async fn batch_tt_link_reconcile(
         &self,
         snapshot: &SyncPayload,
-    ) -> Result<Vec<AccountExportOwned>, String> {
+    ) -> Result<(Vec<AccountExportOwned>, TtLinkReconcileStats), String> {
         build_account_exports(&self.cfg, snapshot)
     }
 
@@ -1422,6 +1431,16 @@ struct AccountExportOwned {
     applied_revision: String,
 }
 
+#[derive(Default)]
+struct TtLinkReconcileStats {
+    updated_total: usize,
+    updated_empty_link: usize,
+    updated_hash_mismatch: usize,
+    updated_stale: usize,
+    skipped_up_to_date: usize,
+    skipped_disabled: usize,
+}
+
 impl PendingSyncReport<'_> {
     fn to_owned_payload(&self) -> PendingSyncReportOwned {
         PendingSyncReportOwned {
@@ -1821,7 +1840,16 @@ async fn persist_pending_sync_reports(
     atomic_write(path, &encoded).await
 }
 
-fn build_account_exports(cfg: &Config, snapshot: &SyncPayload) -> Result<Vec<AccountExportOwned>, String> {
+fn needs_tt_link_regeneration(account: &Account, current_config_hash: &str) -> bool {
+    account.tt_link.trim().is_empty()
+        || account.tt_link_config_hash != current_config_hash
+        || account.tt_link_stale
+}
+
+fn build_account_exports(
+    cfg: &Config,
+    snapshot: &SyncPayload,
+) -> Result<(Vec<AccountExportOwned>, TtLinkReconcileStats), String> {
     let link_config_path =
         resolve_runtime_path(&cfg.trusttunnel_runtime_dir, &cfg.trusttunnel_link_config_file);
     let link_cfg = LinkGenerationConfig::load_from_file(&link_config_path)?;
@@ -1830,11 +1858,17 @@ fn build_account_exports(cfg: &Config, snapshot: &SyncPayload) -> Result<Vec<Acc
     let protocol = link_cfg.protocol().to_string();
     let config_hash = link_cfg.config_hash();
 
-    snapshot
-        .accounts
-        .iter()
-        .filter(|x| x.enabled)
-        .map(|account| {
+    let mut stats = TtLinkReconcileStats::default();
+    let mut exports = Vec::new();
+
+    for account in &snapshot.accounts {
+        if !account.enabled {
+            stats.skipped_disabled += 1;
+            continue;
+        }
+
+        let must_regenerate = needs_tt_link_regeneration(account, &config_hash);
+        let (tt_link, account_config_hash) = if must_regenerate {
             let mut deep_link_builder = DeepLinkConfig::builder()
                 .hostname(endpoint_host.clone())
                 .addresses(vec![format!("{endpoint_host}:{endpoint_port}")])
@@ -1851,20 +1885,37 @@ fn build_account_exports(cfg: &Config, snapshot: &SyncPayload) -> Result<Vec<Acc
             let tt_link = trusttunnel_deeplink::encode(&deep_link)
                 .map_err(|e| format!("failed to encode TT deep-link for {}: {e}", account.username))?;
 
-            Ok(AccountExportOwned {
-                username: account.username.clone(),
-                external_account_id: account.external_account_id.clone(),
-                access_bundle_id: account.access_bundle_id.clone(),
-                active: true,
-                tt_link,
-                endpoint_host: endpoint_host.clone(),
-                endpoint_port,
-                protocol: protocol.clone(),
-                config_hash: config_hash.clone(),
-                applied_revision: snapshot.version.clone(),
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()
+            stats.updated_total += 1;
+            if account.tt_link.trim().is_empty() {
+                stats.updated_empty_link += 1;
+            }
+            if account.tt_link_config_hash != config_hash {
+                stats.updated_hash_mismatch += 1;
+            }
+            if account.tt_link_stale {
+                stats.updated_stale += 1;
+            }
+            (tt_link, config_hash.clone())
+        } else {
+            stats.skipped_up_to_date += 1;
+            (account.tt_link.clone(), account.tt_link_config_hash.clone())
+        };
+
+        exports.push(AccountExportOwned {
+            username: account.username.clone(),
+            external_account_id: account.external_account_id.clone(),
+            access_bundle_id: account.access_bundle_id.clone(),
+            active: true,
+            tt_link,
+            endpoint_host: endpoint_host.clone(),
+            endpoint_port,
+            protocol: protocol.clone(),
+            config_hash: account_config_hash,
+            applied_revision: snapshot.version.clone(),
+        });
+    }
+
+    Ok((exports, stats))
 }
 
 fn resolve_runtime_port(path: &Path) -> Option<u16> {
@@ -2408,6 +2459,9 @@ message_queue_capacity = 4096
                 enabled: false,
                 external_account_id: None,
                 access_bundle_id: None,
+                tt_link: String::new(),
+                tt_link_config_hash: String::new(),
+                tt_link_stale: false,
             },
             Account {
                 username: "a".to_string(),
@@ -2415,6 +2469,9 @@ message_queue_capacity = 4096
                 enabled: true,
                 external_account_id: None,
                 access_bundle_id: None,
+                tt_link: String::new(),
+                tt_link_config_hash: String::new(),
+                tt_link_stale: false,
             },
         ];
 
@@ -2443,6 +2500,9 @@ message_queue_capacity = 4096
                 enabled: true,
                 external_account_id: Some("acc-1".to_string()),
                 access_bundle_id: Some("bundle-1".to_string()),
+                tt_link: String::new(),
+                tt_link_config_hash: String::new(),
+                tt_link_stale: false,
             }],
         };
         let cfg = Config {
@@ -2478,8 +2538,9 @@ message_queue_capacity = 4096
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
         };
 
-        let exports = build_account_exports(&cfg, &snapshot).unwrap();
+        let (exports, stats) = build_account_exports(&cfg, &snapshot).unwrap();
         assert_eq!(exports.len(), 1);
+        assert_eq!(stats.updated_total, 1);
         assert!(exports[0].tt_link.starts_with("tt://"));
         let decoded = trusttunnel_deeplink::decode(&exports[0].tt_link).unwrap();
         assert_eq!(decoded.hostname, "gw.example.com");
@@ -2489,6 +2550,106 @@ message_queue_capacity = 4096
         assert_eq!(decoded.custom_sni, Some("sni.example.com".to_string()));
         assert_eq!(decoded.name, Some("Primary".to_string()));
         assert_eq!(exports[0].config_hash.len(), 64);
+    }
+
+    #[test]
+    fn needs_tt_link_regeneration_predicate_works() {
+        let account = Account {
+            username: "alice".to_string(),
+            password: "secret".to_string(),
+            enabled: true,
+            external_account_id: None,
+            access_bundle_id: None,
+            tt_link: "tt://existing".to_string(),
+            tt_link_config_hash: "hash-1".to_string(),
+            tt_link_stale: false,
+        };
+        assert!(!needs_tt_link_regeneration(&account, "hash-1"));
+        assert!(needs_tt_link_regeneration(&account, "hash-2"));
+        assert!(needs_tt_link_regeneration(
+            &Account {
+                tt_link: String::new(),
+                ..account.clone()
+            },
+            "hash-1"
+        ));
+        assert!(needs_tt_link_regeneration(
+            &Account {
+                tt_link_stale: true,
+                ..account
+            },
+            "hash-1"
+        ));
+    }
+
+    #[test]
+    fn account_exports_reuse_current_tt_link_when_up_to_date() {
+        let temp_dir = TempDir::new().unwrap();
+        let runtime_dir = temp_dir.path();
+        std::fs::write(
+            runtime_dir.join("tt-link.toml"),
+            "host = \"gw.example.com\"\nport = 443\nprotocol = \"http2\"\n",
+        )
+        .unwrap();
+
+        let cfg = Config {
+            lk_base_url: Some("http://localhost".to_string()),
+            runtime_mode: RuntimeMode::DbWorker,
+            lk_db_dsn: "postgres://localhost/lk".to_string(),
+            lk_service_token: Some("token".to_string()),
+            node_external_id: "node-1".to_string(),
+            node_hostname: "node-1.example".to_string(),
+            node_stage: None,
+            node_cluster: None,
+            node_namespace: None,
+            node_rollout_group: None,
+            trusttunnel_runtime_dir: runtime_dir.to_path_buf(),
+            trusttunnel_config_file: PathBuf::from("vpn.toml"),
+            trusttunnel_hosts_file: PathBuf::from("hosts.toml"),
+            bootstrap_credentials_source_path: None,
+            trusttunnel_link_config_file: PathBuf::from("tt-link.toml"),
+            runtime_credentials_path: PathBuf::from("credentials.toml"),
+            runtime_primary_marker_path: PathBuf::from(".runtime_primary_marker"),
+            agent_state_path: PathBuf::from("agent_state.json"),
+            reconcile_interval: Duration::from_secs(10),
+            apply_interval: Duration::from_secs(10),
+            heartbeat_interval: Duration::from_secs(30),
+            sync_path_template: "/sync/{externalNodeId}".to_string(),
+            sync_report_path: "/sync-report".to_string(),
+            apply_cmd: None,
+            runtime_pid_path: PathBuf::from("trusttunnel.pid"),
+            runtime_process_name: "trusttunnel_endpoint".to_string(),
+            agent_version: "test".to_string(),
+            runtime_version: "test".to_string(),
+            pending_sync_reports_path: PathBuf::from("pending_sync_reports.jsonl"),
+            metrics_address: "127.0.0.1:9901".parse().unwrap(),
+        };
+        let config_hash = LinkGenerationConfig::load_from_file(&runtime_dir.join("tt-link.toml"))
+            .unwrap()
+            .config_hash();
+        let snapshot = SyncPayload {
+            version: "rev-1".to_string(),
+            checksum: "0".repeat(64),
+            onboarding_state: "active".to_string(),
+            sync_required: true,
+            accounts: vec![Account {
+                username: "alice".to_string(),
+                password: "secret".to_string(),
+                enabled: true,
+                external_account_id: Some("acc-1".to_string()),
+                access_bundle_id: Some("bundle-1".to_string()),
+                tt_link: "tt://existing".to_string(),
+                tt_link_config_hash: config_hash.clone(),
+                tt_link_stale: false,
+            }],
+        };
+
+        let (exports, stats) = build_account_exports(&cfg, &snapshot).unwrap();
+        assert_eq!(exports.len(), 1);
+        assert_eq!(exports[0].tt_link, "tt://existing");
+        assert_eq!(exports[0].config_hash, config_hash);
+        assert_eq!(stats.updated_total, 0);
+        assert_eq!(stats.skipped_up_to_date, 1);
     }
 
     #[test]
@@ -2642,6 +2803,9 @@ message_queue_capacity = 4096
                 enabled: true,
                 external_account_id: Some("acc-1".to_string()),
                 access_bundle_id: Some("bundle-1".to_string()),
+                tt_link: String::new(),
+                tt_link_config_hash: String::new(),
+                tt_link_stale: false,
             }],
         );
         server
@@ -2738,6 +2902,9 @@ message_queue_capacity = 4096
                 enabled: true,
                 external_account_id: None,
                 access_bundle_id: None,
+                tt_link: String::new(),
+                tt_link_config_hash: String::new(),
+                tt_link_stale: false,
             }],
         );
         server
@@ -2774,6 +2941,9 @@ message_queue_capacity = 4096
                 enabled: true,
                 external_account_id: None,
                 access_bundle_id: None,
+                tt_link: String::new(),
+                tt_link_config_hash: String::new(),
+                tt_link_stale: false,
             }],
         );
         server
@@ -2958,6 +3128,9 @@ message_queue_capacity = 4096
                 enabled: true,
                 external_account_id: None,
                 access_bundle_id: None,
+                tt_link: String::new(),
+                tt_link_config_hash: String::new(),
+                tt_link_stale: false,
             }],
         );
         server
