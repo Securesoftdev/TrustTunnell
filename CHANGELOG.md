@@ -2,6 +2,7 @@
 
 ## 1.0.28
 
+- [Feature] `classic_agent` now reads TT link generation settings from `agent-link-config.toml`-compatible config (with `server_address`, `cert_domain`, `custom_sni`, `protocol`, and `dns_servers`) and exports a full connect bundle payload so LK can store and return ready-to-use TT links without rebuilding deep-link fields.
 - [Feature] `classic_agent` now generates deterministic per-account TrustTunnel deep links from synced LK access bundles and sends them back in `sync-report` payloads for LK-side storage and user delivery.
 - [Fix] `classic_agent` sync checksum validation now rejects mismatched 64-hex checksums instead of accepting any hex-like value, preventing false-positive sync applies.
 - [Fix] Docker image builds no longer fail on `docker-entrypoint.sh` copy step because the Dockerfile now uses a build-context-relative path.

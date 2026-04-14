@@ -412,8 +412,14 @@ pub struct AccountExportPayload<'a> {
     pub access_bundle_id: Option<&'a str>,
     pub active: bool,
     pub tt_link: &'a str,
-    pub endpoint_host: &'a str,
-    pub endpoint_port: u16,
+    pub server_address: &'a str,
+    pub cert_domain: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_sni: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dns_servers: Vec<&'a str>,
     pub protocol: &'a str,
     pub config_hash: &'a str,
     pub applied_revision: &'a str,
@@ -551,5 +557,32 @@ mod tests {
         assert!(value.get("applied").is_none());
         assert!(value.get("details").is_none());
         assert_eq!(value["last_sync_status"], "ok");
+    }
+
+    #[test]
+    fn account_export_payload_serializes_connect_bundle_fields() {
+        let payload = AccountExportPayload {
+            external_node_id: "node-1",
+            username: "alice",
+            external_account_id: Some("acc-1"),
+            access_bundle_id: Some("bundle-1"),
+            active: true,
+            tt_link: "tt://example",
+            server_address: "89.110.100.165:443",
+            cert_domain: "cdn.securesoft.dev",
+            custom_sni: Some("cdn.securesoft.dev"),
+            display_name: Some("Primary"),
+            dns_servers: vec!["8.8.8.8"],
+            protocol: "http2",
+            config_hash: "hash",
+            applied_revision: "rev-1",
+        };
+
+        let value = serde_json::to_value(payload).unwrap();
+        assert_eq!(value["server_address"], "89.110.100.165:443");
+        assert_eq!(value["cert_domain"], "cdn.securesoft.dev");
+        assert_eq!(value["custom_sni"], "cdn.securesoft.dev");
+        assert_eq!(value["display_name"], "Primary");
+        assert_eq!(value["dns_servers"], serde_json::json!(["8.8.8.8"]));
     }
 }
