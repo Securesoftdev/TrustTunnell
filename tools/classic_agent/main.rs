@@ -45,9 +45,9 @@ struct Config {
     node_cluster: String,
     node_namespace: String,
     node_rollout_group: String,
-    node_public_host: Option<String>,
+    node_public_ip: Option<String>,
     node_public_port: Option<u16>,
-    node_display_name: Option<String>,
+    node_sni: Option<String>,
     trusttunnel_runtime_dir: PathBuf,
     trusttunnel_credentials_file: PathBuf,
     trusttunnel_config_file: PathBuf,
@@ -87,14 +87,14 @@ impl Config {
         let trusttunnel_hosts_file: PathBuf = required_env("TRUSTTUNNEL_HOSTS_FILE")?.into();
         let bootstrap_credentials_source_path =
             optional_env("TRUSTTUNNEL_BOOTSTRAP_CREDENTIALS_FILE").map(PathBuf::from);
-        let node_public_host = optional_env("NODE_PUBLIC_HOST");
+        let node_public_ip = optional_env("NODE_PUBLIC_IP").or_else(|| optional_env("NODE_PUBLIC_HOST"));
         let node_public_port = optional_env("NODE_PUBLIC_PORT")
             .map(|raw| {
                 raw.parse::<u16>()
                     .map_err(|e| format!("NODE_PUBLIC_PORT must be u16: {e}"))
             })
             .transpose()?;
-        let node_display_name = optional_env("NODE_DISPLAY_NAME");
+        let node_sni = optional_env("NODE_SNI");
 
         let runtime_credentials_path = trusttunnel_runtime_dir.join(&trusttunnel_credentials_file);
         let runtime_primary_marker_path = trusttunnel_runtime_dir.join(RUNTIME_PRIMARY_MARKER_FILE);
@@ -139,9 +139,9 @@ impl Config {
             node_cluster,
             node_namespace,
             node_rollout_group,
-            node_public_host,
+            node_public_ip,
             node_public_port,
-            node_display_name,
+            node_sni,
             trusttunnel_runtime_dir,
             trusttunnel_credentials_file,
             trusttunnel_config_file,
@@ -188,6 +188,7 @@ impl Agent {
     async fn new(cfg: Config) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
+            .no_proxy()
             .build()
             .map_err(|e| format!("failed to build HTTP client: {e}"))?;
 
@@ -199,9 +200,9 @@ impl Agent {
             node_cluster: cfg.node_cluster.clone(),
             node_namespace: cfg.node_namespace.clone(),
             node_rollout_group: cfg.node_rollout_group.clone(),
-            node_public_host: cfg.node_public_host.clone(),
+            node_public_ip: cfg.node_public_ip.clone(),
             node_public_port: cfg.node_public_port,
-            node_display_name: cfg.node_display_name.clone(),
+            node_sni: cfg.node_sni.clone(),
             trusttunnel_runtime_dir: path_to_string(&cfg.trusttunnel_runtime_dir)?.to_string(),
             trusttunnel_credentials_file: path_to_string(&cfg.trusttunnel_credentials_file)?
                 .to_string(),
@@ -626,7 +627,11 @@ impl Agent {
     }
 
     async fn send_sync_report_payload(&self, report: &PendingSyncReport<'_>) -> Result<(), String> {
-        let onboarding = OnboardingPayload::from_metadata(&self.node_metadata);
+        let onboarding = OnboardingPayload::from_metadata(
+            &self.node_metadata,
+            env!("CARGO_PKG_VERSION"),
+            &self.cfg.runtime_version,
+        );
         onboarding.validate_compatibility()?;
         let payload = SyncReportPayload {
             onboarding,
@@ -740,7 +745,11 @@ impl Agent {
     }
 
     async fn send_heartbeat(&self) -> Result<(), HeartbeatFailure> {
-        let onboarding = OnboardingPayload::from_metadata(&self.node_metadata);
+        let onboarding = OnboardingPayload::from_metadata(
+            &self.node_metadata,
+            env!("CARGO_PKG_VERSION"),
+            &self.cfg.runtime_version,
+        );
         onboarding
             .validate_compatibility()
             .map_err(HeartbeatFailure::PayloadValidation)?;
@@ -759,8 +768,6 @@ impl Agent {
             external_node_id: &self.cfg.node_external_id,
             current_revision: &self.state.version,
             health_status,
-            agent_version: env!("CARGO_PKG_VERSION"),
-            runtime_version: &self.cfg.runtime_version,
             active_clients: runtime_status.active_clients,
             cpu_percent: runtime_status.cpu_percent,
             memory_percent: runtime_status.memory_percent,
@@ -807,7 +814,11 @@ impl Agent {
     }
 
     async fn send_register_once(&self) -> Result<RegisterAttemptOutcome, RegisterError> {
-        let payload = OnboardingPayload::from_metadata(&self.node_metadata);
+        let payload = OnboardingPayload::from_metadata(
+            &self.node_metadata,
+            env!("CARGO_PKG_VERSION"),
+            &self.cfg.runtime_version,
+        );
         payload
             .validate_compatibility()
             .map_err(RegisterError::Permanent)?;
@@ -815,7 +826,7 @@ impl Agent {
             .lk_api
             .register(&payload)
             .await
-            .map_err(RegisterError::Temporary)?;
+            .map_err(|err| RegisterError::Temporary(err.to_string()))?;
 
         let status = response.status();
         if status.is_success() {
@@ -826,14 +837,29 @@ impl Agent {
             return Ok(RegisterAttemptOutcome::AlreadyRegistered);
         }
 
+        let response_body = response
+            .text()
+            .await
+            .unwrap_or_else(|err| format!("failed to read response body: {err}"));
+        let endpoint = format!(
+            "{}{}",
+            self.cfg.lk_base_url.trim_end_matches('/'),
+            self.cfg.register_path
+        );
+        let payload_keys = payload_key_list(&payload);
+        let reason_summary = summarize_register_reason(status, &response_body);
+        let details = format!(
+            "register failure: status={status} endpoint={endpoint} payload_keys={payload_keys} reason={reason_summary} response_body={response_body}"
+        );
+
         if is_temporary_http_status(status) {
             return Err(RegisterError::Temporary(format!(
-                "register request returned temporary HTTP {status}"
+                "register request returned temporary HTTP {status}; {details}"
             )));
         }
 
         Err(RegisterError::Permanent(format!(
-            "register request returned HTTP {status}"
+            "register request returned HTTP {status}; {details}"
         )))
     }
 
@@ -1697,11 +1723,13 @@ fn log_sync_skip(snapshot: &SyncPayload, reason: &str) {
 }
 
 
+#[derive(Debug)]
 enum RegisterAttemptOutcome {
     Registered,
     AlreadyRegistered,
 }
 
+#[derive(Debug)]
 enum RegisterError {
     Temporary(String),
     Permanent(String),
@@ -1727,6 +1755,42 @@ fn is_temporary_http_status(status: StatusCode) -> bool {
     status == StatusCode::REQUEST_TIMEOUT
         || status == StatusCode::TOO_MANY_REQUESTS
         || status.is_server_error()
+}
+
+fn payload_key_list(payload: &OnboardingPayload<'_>) -> String {
+    serde_json::to_value(payload)
+        .ok()
+        .and_then(|v| {
+            v.as_object().map(|obj| {
+                let mut keys = obj.keys().cloned().collect::<Vec<String>>();
+                keys.sort();
+                keys.join(",")
+            })
+        })
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
+fn summarize_register_reason(status: StatusCode, body: &str) -> &'static str {
+    if status == StatusCode::BAD_REQUEST {
+        let normalized = body.to_ascii_lowercase();
+        if normalized.contains("missing") {
+            return "missing_field";
+        }
+        if normalized.contains("contract_version") {
+            return "invalid_contract_version";
+        }
+        if normalized.contains("identity") || normalized.contains("external_id") {
+            return "invalid_node_identity";
+        }
+        return "validation_mismatch";
+    }
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        return "auth_failed";
+    }
+    if status.is_server_error() {
+        return "server_error";
+    }
+    "unexpected_http_status"
 }
 
 #[cfg(test)]
@@ -1915,9 +1979,9 @@ message_queue_capacity = 4096
             node_cluster: "cluster-a".to_string(),
             node_namespace: "default".to_string(),
             node_rollout_group: "g1".to_string(),
-            node_public_host: None,
+            node_public_ip: None,
             node_public_port: None,
-            node_display_name: None,
+            node_sni: None,
             trusttunnel_runtime_dir: runtime_dir.clone(),
             trusttunnel_credentials_file: credentials_file_rel,
             trusttunnel_config_file: config_file.clone(),
@@ -2308,6 +2372,66 @@ message_queue_capacity = 4096
         let started = std::time::Instant::now();
         agent.bootstrap_register().await;
         assert!(started.elapsed() >= REGISTER_INITIAL_BACKOFF);
+    }
+
+    #[tokio::test]
+    async fn register_payload_uses_canonical_v1_contract() {
+        let server = MockHttpServer::start().await;
+        let tmp_dir = TempDir::new().unwrap();
+        let agent = make_agent(&tmp_dir, &server.base_url, None).await;
+        server
+            .enqueue(Method::POST, "/register", HyperStatusCode::OK, "")
+            .await;
+
+        let outcome = agent.send_register_once().await.unwrap();
+        assert!(matches!(outcome, RegisterAttemptOutcome::Registered));
+
+        let requests = server.captured().await;
+        let register = requests
+            .iter()
+            .find(|x| x.method == Method::POST && x.path == "/register")
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&register.body).unwrap();
+        assert_eq!(body["contract_version"], "v1");
+        assert_eq!(body["hostname"], "node-1.example");
+        assert_eq!(body["node_identity"]["external_id"], "node-1");
+        assert_eq!(body["agent_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(body["runtime_version"], "test");
+        assert!(body.get("node_external_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn register_bad_request_returns_diagnostic_without_secret_token() {
+        let server = MockHttpServer::start().await;
+        let tmp_dir = TempDir::new().unwrap();
+        let agent = make_agent(&tmp_dir, &server.base_url, None).await;
+        server
+            .enqueue(
+                Method::POST,
+                "/register",
+                HyperStatusCode::BAD_REQUEST,
+                r#"{"error":"missing field: contract_version"}"#,
+            )
+            .await;
+
+        let err = agent.send_register_once().await.unwrap_err();
+        let rendered = match err {
+            RegisterError::Permanent(detail) => detail,
+            RegisterError::Temporary(detail) => detail,
+        };
+        assert!(rendered.contains("status=400 Bad Request"));
+        assert!(rendered.contains("missing_field"));
+        assert!(rendered.contains("response_body={\"error\":\"missing field: contract_version\"}"));
+        assert!(!rendered.contains("test-token"));
+    }
+
+    #[test]
+    fn register_reason_summary_detects_invalid_node_identity() {
+        let reason = summarize_register_reason(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"invalid node identity"}"#,
+        );
+        assert_eq!(reason, "invalid_node_identity");
     }
 
     #[tokio::test]

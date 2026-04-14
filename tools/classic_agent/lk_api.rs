@@ -1,5 +1,6 @@
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fmt;
 
 pub const DEFAULT_SYNC_PATH_TEMPLATE: &str = "/internal/trusttunnel/v1/nodes/{externalNodeId}/sync";
@@ -42,15 +43,23 @@ impl LkApiClient {
     pub async fn register(
         &self,
         payload: &OnboardingPayload<'_>,
-    ) -> Result<reqwest::Response, String> {
+    ) -> Result<reqwest::Response, RegisterRequestError> {
+        let endpoint = self.endpoint(&self.register_path);
+        let payload_value = serde_json::to_value(payload)
+            .map_err(|e| RegisterRequestError::Network(format!("register payload serialization failed: {e}")))?;
         self.client
-            .post(self.endpoint(&self.register_path))
+            .post(endpoint)
             .header("Authorization", format!("Bearer {}", self.service_token))
             .header("X-Internal-Agent-Token", &self.service_token)
             .json(payload)
             .send()
             .await
-            .map_err(|e| format!("register request failed: {e}"))
+            .map_err(|e| {
+                RegisterRequestError::Network(format!(
+                    "register request failed: {e}; payload_keys={}",
+                    payload_top_level_keys(&payload_value)
+                ))
+            })
     }
 
     pub async fn heartbeat(&self, payload: &HeartbeatPayload<'_>) -> Result<(), HeartbeatError> {
@@ -144,9 +153,9 @@ pub struct NodeMetadata {
     pub node_cluster: String,
     pub node_namespace: String,
     pub node_rollout_group: String,
-    pub node_public_host: Option<String>,
+    pub node_public_ip: Option<String>,
     pub node_public_port: Option<u16>,
-    pub node_display_name: Option<String>,
+    pub node_sni: Option<String>,
     pub trusttunnel_runtime_dir: String,
     pub trusttunnel_credentials_file: String,
     pub trusttunnel_config_file: String,
@@ -211,32 +220,40 @@ fn default_sync_required() -> bool {
     true
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 pub struct OnboardingPayload<'a> {
-    #[serde(rename = "node_external_id", alias = "externalNodeId")]
-    pub node_external_id: &'a str,
-    #[serde(rename = "node_hostname", alias = "nodeHostname")]
-    pub node_hostname: &'a str,
-    #[serde(rename = "node_stage", alias = "nodeStage")]
-    pub node_stage: &'a str,
-    #[serde(rename = "node_cluster", alias = "nodeCluster")]
-    pub node_cluster: &'a str,
-    #[serde(rename = "node_namespace", alias = "nodeNamespace")]
-    pub node_namespace: &'a str,
-    #[serde(rename = "node_rollout_group", alias = "nodeRolloutGroup")]
-    pub node_rollout_group: &'a str,
-    #[serde(rename = "node_public_host", alias = "publicHost")]
-    pub node_public_host: Option<&'a str>,
-    #[serde(rename = "node_public_port", alias = "publicPort")]
-    pub node_public_port: Option<u16>,
-    #[serde(rename = "node_display_name", alias = "displayName")]
-    pub node_display_name: Option<&'a str>,
-    pub trusttunnel_runtime_dir: &'a str,
-    pub trusttunnel_credentials_file: &'a str,
-    pub trusttunnel_config_file: &'a str,
-    pub trusttunnel_hosts_file: &'a str,
-    pub active_path: &'static str,
-    pub modified_enabled: bool,
+    pub contract_version: &'static str,
+    pub hostname: &'a str,
+    pub agent_version: &'a str,
+    pub runtime_version: &'a str,
+    pub node_identity: NodeIdentityPayload<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trusttunnel_runtime_dir: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trusttunnel_credentials_file: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trusttunnel_config_file: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trusttunnel_hosts_file: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_path: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modified_enabled: Option<bool>,
+}
+
+#[derive(Serialize)]
+pub struct NodeIdentityPayload<'a> {
+    pub external_id: &'a str,
+    pub stage: &'a str,
+    pub cluster: &'a str,
+    pub namespace: &'a str,
+    pub rollout_group: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_ip: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sni: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -246,8 +263,6 @@ pub struct HeartbeatPayload<'a> {
     pub external_node_id: &'a str,
     pub current_revision: &'a str,
     pub health_status: &'a str,
-    pub agent_version: &'a str,
-    pub runtime_version: &'a str,
     pub active_clients: u64,
     pub cpu_percent: f64,
     pub memory_percent: f64,
@@ -256,40 +271,67 @@ pub struct HeartbeatPayload<'a> {
 }
 
 impl<'a> OnboardingPayload<'a> {
-    pub fn from_metadata(metadata: &'a NodeMetadata) -> Self {
+    pub fn from_metadata(
+        metadata: &'a NodeMetadata,
+        agent_version: &'a str,
+        runtime_version: &'a str,
+    ) -> Self {
         Self {
-            node_external_id: &metadata.node_external_id,
-            node_hostname: &metadata.node_hostname,
-            node_stage: &metadata.node_stage,
-            node_cluster: &metadata.node_cluster,
-            node_namespace: &metadata.node_namespace,
-            node_rollout_group: &metadata.node_rollout_group,
-            node_public_host: metadata.node_public_host.as_deref(),
-            node_public_port: metadata.node_public_port,
-            node_display_name: metadata.node_display_name.as_deref(),
-            trusttunnel_runtime_dir: &metadata.trusttunnel_runtime_dir,
-            trusttunnel_credentials_file: &metadata.trusttunnel_credentials_file,
-            trusttunnel_config_file: &metadata.trusttunnel_config_file,
-            trusttunnel_hosts_file: &metadata.trusttunnel_hosts_file,
-            active_path: "classic",
-            modified_enabled: false,
+            contract_version: "v1",
+            hostname: &metadata.node_hostname,
+            agent_version,
+            runtime_version,
+            node_identity: NodeIdentityPayload {
+                external_id: &metadata.node_external_id,
+                stage: &metadata.node_stage,
+                cluster: &metadata.node_cluster,
+                namespace: &metadata.node_namespace,
+                rollout_group: &metadata.node_rollout_group,
+                public_ip: metadata.node_public_ip.as_deref(),
+                public_port: metadata.node_public_port,
+                sni: metadata.node_sni.as_deref(),
+            },
+            trusttunnel_runtime_dir: Some(&metadata.trusttunnel_runtime_dir),
+            trusttunnel_credentials_file: Some(&metadata.trusttunnel_credentials_file),
+            trusttunnel_config_file: Some(&metadata.trusttunnel_config_file),
+            trusttunnel_hosts_file: Some(&metadata.trusttunnel_hosts_file),
+            active_path: Some("classic"),
+            modified_enabled: Some(false),
         }
     }
 
     pub fn validate_compatibility(&self) -> Result<(), String> {
-        if self.node_external_id.trim().is_empty() {
+        if self.contract_version != "v1" {
+            return Err(
+                "onboarding payload compatibility check failed: contract_version must be v1"
+                    .to_string(),
+            );
+        }
+        if self.node_identity.external_id.trim().is_empty() {
             return Err(
                 "onboarding payload compatibility check failed: node_external_id is empty"
                     .to_string(),
             );
         }
-        if self.node_hostname.trim().is_empty() {
+        if self.hostname.trim().is_empty() {
             return Err(
-                "onboarding payload compatibility check failed: node_hostname is empty"
+                "onboarding payload compatibility check failed: hostname is empty"
                     .to_string(),
             );
         }
-        if self.node_stage.trim().is_empty() {
+        if self.agent_version.trim().is_empty() {
+            return Err(
+                "onboarding payload compatibility check failed: agent_version is empty"
+                    .to_string(),
+            );
+        }
+        if self.runtime_version.trim().is_empty() {
+            return Err(
+                "onboarding payload compatibility check failed: runtime_version is empty"
+                    .to_string(),
+            );
+        }
+        if self.node_identity.stage.trim().is_empty() {
             return Err(
                 "onboarding payload compatibility check failed: node_stage is empty".to_string(),
             );
@@ -304,6 +346,19 @@ pub enum HeartbeatError {
     ClientHttp(StatusCode),
     ServerHttp(StatusCode),
     UnexpectedStatus(StatusCode),
+}
+
+#[derive(Debug)]
+pub enum RegisterRequestError {
+    Network(String),
+}
+
+impl fmt::Display for RegisterRequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RegisterRequestError::Network(msg) => write!(f, "{msg}"),
+        }
+    }
 }
 
 impl HeartbeatError {
@@ -342,6 +397,15 @@ pub struct SyncReportPayload<'a> {
     pub checksum: &'a str,
     pub applied: bool,
     pub details: &'a str,
+}
+
+pub fn payload_top_level_keys(payload: &Value) -> String {
+    let mut keys = payload
+        .as_object()
+        .map(|obj| obj.keys().cloned().collect::<Vec<String>>())
+        .unwrap_or_default();
+    keys.sort();
+    keys.join(",")
 }
 
 #[cfg(test)]
@@ -395,16 +459,46 @@ mod tests {
             node_cluster: "c1".to_string(),
             node_namespace: "ns".to_string(),
             node_rollout_group: "r1".to_string(),
-            node_public_host: None,
+            node_public_ip: None,
             node_public_port: None,
-            node_display_name: None,
+            node_sni: None,
             trusttunnel_runtime_dir: "/tmp".to_string(),
             trusttunnel_credentials_file: "credentials.toml".to_string(),
             trusttunnel_config_file: "vpn.toml".to_string(),
             trusttunnel_hosts_file: "hosts.toml".to_string(),
         };
 
-        let payload = OnboardingPayload::from_metadata(&metadata);
+        let payload = OnboardingPayload::from_metadata(&metadata, "1.2.3", "runtime-1");
         assert!(payload.validate_compatibility().is_err());
+    }
+
+    #[test]
+    fn onboarding_payload_serializes_canonical_v1_shape() {
+        let metadata = NodeMetadata {
+            node_external_id: "ext-1".to_string(),
+            node_hostname: "node-1".to_string(),
+            node_stage: "prod".to_string(),
+            node_cluster: "cluster-a".to_string(),
+            node_namespace: "edge".to_string(),
+            node_rollout_group: "blue".to_string(),
+            node_public_ip: Some("203.0.113.10".to_string()),
+            node_public_port: Some(443),
+            node_sni: Some("vpn.example.com".to_string()),
+            trusttunnel_runtime_dir: "/var/lib/trusttunnel".to_string(),
+            trusttunnel_credentials_file: "credentials.toml".to_string(),
+            trusttunnel_config_file: "vpn.toml".to_string(),
+            trusttunnel_hosts_file: "hosts.toml".to_string(),
+        };
+
+        let payload = OnboardingPayload::from_metadata(&metadata, "2.0.0", "runtime-2");
+        let value = serde_json::to_value(payload).unwrap();
+
+        assert_eq!(value["contract_version"], "v1");
+        assert_eq!(value["hostname"], "node-1");
+        assert_eq!(value["agent_version"], "2.0.0");
+        assert_eq!(value["runtime_version"], "runtime-2");
+        assert_eq!(value["node_identity"]["external_id"], "ext-1");
+        assert_eq!(value["node_identity"]["public_ip"], "203.0.113.10");
+        assert!(value.get("node_external_id").is_none());
     }
 }
