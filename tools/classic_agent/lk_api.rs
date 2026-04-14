@@ -217,6 +217,14 @@ pub struct Account {
     pub password: String,
     #[serde(default = "default_enabled", alias = "isEnabled")]
     pub enabled: bool,
+    #[serde(default = "default_assigned", alias = "isAssigned")]
+    pub assigned: bool,
+    #[serde(default, alias = "isFree")]
+    pub free: bool,
+    #[serde(default, alias = "isRevoked")]
+    pub revoked: bool,
+    #[serde(default, alias = "isFrozen")]
+    pub frozen: bool,
     #[serde(default, alias = "accountId", alias = "credentialId")]
     pub external_account_id: Option<String>,
     #[serde(default, alias = "accessBundleId", alias = "bundleId")]
@@ -230,6 +238,10 @@ pub struct Account {
 }
 
 fn default_enabled() -> bool {
+    true
+}
+
+fn default_assigned() -> bool {
     true
 }
 
