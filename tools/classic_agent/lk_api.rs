@@ -397,6 +397,7 @@ pub struct AccountExportPayload<'a> {
     pub endpoint_host: &'a str,
     pub endpoint_port: u16,
     pub protocol: &'a str,
+    pub config_hash: &'a str,
     pub applied_revision: &'a str,
 }
 

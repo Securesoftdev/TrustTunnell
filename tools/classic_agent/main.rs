@@ -1,12 +1,14 @@
 mod lk_api;
+mod link_config;
 
 use lk_api::{
     Account, AccountExportPayload, HeartbeatPayload, HeartbeatStats, LkApiClient, NodeMetadata,
     OnboardingPayload, SyncPayload, SyncReportPayload, SyncResponse, DEFAULT_SYNC_PATH_TEMPLATE,
     DEFAULT_SYNC_REPORT_PATH, DEFAULT_HEARTBEAT_PATH, DEFAULT_REGISTER_PATH,
 };
+use link_config::LinkGenerationConfig;
 use reqwest::StatusCode;
-use trusttunnel_deeplink::{DeepLinkConfig, Protocol as DeepLinkProtocol};
+use trusttunnel_deeplink::DeepLinkConfig;
 use serde::{Deserialize, Serialize};
 use std::fs::read_dir;
 use std::net::SocketAddr;
@@ -66,10 +68,6 @@ struct Config {
     runtime_version: String,
     pending_sync_reports_path: PathBuf,
     metrics_address: SocketAddr,
-    tt_link_host: Option<String>,
-    tt_link_port: Option<u16>,
-    tt_link_protocol: DeepLinkProtocol,
-    tt_link_custom_sni: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,16 +159,6 @@ impl Config {
         let runtime_version =
             optional_env_nonempty("TRUSTTUNNEL_RUNTIME_VERSION").unwrap_or_else(|| "unknown".to_string());
         let pending_sync_reports_path = trusttunnel_runtime_dir.join(SYNC_REPORT_OUTBOX_FILE);
-        let tt_link_host = optional_env_nonempty("TRUSTTUNNEL_TT_LINK_HOST");
-        let tt_link_port = std::env::var("TRUSTTUNNEL_TT_LINK_PORT")
-            .ok()
-            .map(|x| x.parse::<u16>().map_err(|e| format!("TRUSTTUNNEL_TT_LINK_PORT must be valid u16: {e}")))
-            .transpose()?;
-        let tt_link_protocol = optional_env_nonempty("TRUSTTUNNEL_TT_LINK_PROTOCOL")
-            .map(|x| parse_tt_link_protocol(&x))
-            .transpose()?
-            .unwrap_or(DeepLinkProtocol::Http2);
-        let tt_link_custom_sni = optional_env_nonempty("TRUSTTUNNEL_TT_LINK_CUSTOM_SNI");
         let metrics_address = std::env::var("AGENT_METRICS_ADDRESS")
             .unwrap_or_else(|_| "127.0.0.1:9901".to_string())
             .parse::<SocketAddr>()
@@ -207,10 +195,6 @@ impl Config {
             runtime_version,
             pending_sync_reports_path,
             metrics_address,
-            tt_link_host,
-            tt_link_port,
-            tt_link_protocol,
-            tt_link_custom_sni,
         };
         cfg.validate_paths()?;
         Ok(cfg)
@@ -840,6 +824,7 @@ impl Agent {
                     endpoint_host: &item.endpoint_host,
                     endpoint_port: item.endpoint_port,
                     protocol: &item.protocol,
+                    config_hash: &item.config_hash,
                     applied_revision: &item.applied_revision,
                 })
                 .collect::<Vec<_>>()
@@ -1433,6 +1418,7 @@ struct AccountExportOwned {
     endpoint_host: String,
     endpoint_port: u16,
     protocol: String,
+    config_hash: String,
     applied_revision: String,
 }
 
@@ -1836,28 +1822,30 @@ async fn persist_pending_sync_reports(
 }
 
 fn build_account_exports(cfg: &Config, snapshot: &SyncPayload) -> Result<Vec<AccountExportOwned>, String> {
-    let endpoint_host = cfg
-        .tt_link_host
-        .clone()
-        .unwrap_or_else(|| cfg.node_hostname.clone());
-    let endpoint_port = match cfg.tt_link_port {
-        Some(port) => port,
-        None => resolve_runtime_port(&cfg.trusttunnel_config_file).unwrap_or(443),
-    };
-    let protocol = cfg.tt_link_protocol.to_string();
+    let link_config_path =
+        resolve_runtime_path(&cfg.trusttunnel_runtime_dir, &cfg.trusttunnel_link_config_file);
+    let link_cfg = LinkGenerationConfig::load_from_file(&link_config_path)?;
+    let endpoint_host = link_cfg.server().to_string();
+    let endpoint_port = link_cfg.port_or(resolve_runtime_port(&cfg.trusttunnel_config_file).unwrap_or(443));
+    let protocol = link_cfg.protocol().to_string();
+    let config_hash = link_cfg.config_hash();
 
     snapshot
         .accounts
         .iter()
         .filter(|x| x.enabled)
         .map(|account| {
-            let deep_link = DeepLinkConfig::builder()
+            let mut deep_link_builder = DeepLinkConfig::builder()
                 .hostname(endpoint_host.clone())
                 .addresses(vec![format!("{endpoint_host}:{endpoint_port}")])
                 .username(account.username.clone())
                 .password(account.password.clone())
-                .custom_sni(cfg.tt_link_custom_sni.clone())
-                .upstream_protocol(cfg.tt_link_protocol)
+                .custom_sni(link_cfg.custom_sni())
+                .upstream_protocol(link_cfg.protocol());
+            if let Some(display_name) = link_cfg.display_name() {
+                deep_link_builder = deep_link_builder.name(Some(display_name));
+            }
+            let deep_link = deep_link_builder
                 .build()
                 .map_err(|e| format!("failed to build TT deep-link config for {}: {e}", account.username))?;
             let tt_link = trusttunnel_deeplink::encode(&deep_link)
@@ -1872,6 +1860,7 @@ fn build_account_exports(cfg: &Config, snapshot: &SyncPayload) -> Result<Vec<Acc
                 endpoint_host: endpoint_host.clone(),
                 endpoint_port,
                 protocol: protocol.clone(),
+                config_hash: config_hash.clone(),
                 applied_revision: snapshot.version.clone(),
             })
         })
@@ -1885,16 +1874,6 @@ fn resolve_runtime_port(path: &Path) -> Option<u16> {
     listen_address
         .rsplit_once(':')
         .and_then(|(_, port)| port.parse::<u16>().ok())
-}
-
-fn parse_tt_link_protocol(raw: &str) -> Result<DeepLinkProtocol, String> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "http2" => Ok(DeepLinkProtocol::Http2),
-        "http3" => Ok(DeepLinkProtocol::Http3),
-        other => Err(format!(
-            "TRUSTTUNNEL_TT_LINK_PROTOCOL must be either http2 or http3, got: {other}"
-        )),
-    }
 }
 
 fn required_env(name: &str) -> Result<String, String> {
@@ -2353,6 +2332,12 @@ message_queue_capacity = 4096
             rules_file.display()
         );
         fs::write(&config_file, settings).await.unwrap();
+        fs::write(
+            runtime_dir.join("tt-link.toml"),
+            "server = \"node-1.example\"\nport = 8443\nprotocol = \"http2\"\n",
+        )
+        .await
+        .unwrap();
 
         let cfg = Config {
             lk_base_url: Some(base_url.to_string()),
@@ -2385,10 +2370,6 @@ message_queue_capacity = 4096
             runtime_version: "test".to_string(),
             pending_sync_reports_path: runtime_dir.join(SYNC_REPORT_OUTBOX_FILE),
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
-            tt_link_host: Some("node-1.example".to_string()),
-            tt_link_port: Some(8443),
-            tt_link_protocol: DeepLinkProtocol::Http2,
-            tt_link_custom_sni: None,
         };
 
         Agent::new(cfg).await.unwrap()
@@ -2444,6 +2425,13 @@ message_queue_capacity = 4096
 
     #[test]
     fn account_exports_generate_valid_tt_links() {
+        let temp_dir = TempDir::new().unwrap();
+        let runtime_dir = temp_dir.path();
+        std::fs::write(
+            runtime_dir.join("tt-link.toml"),
+            "host = \"gw.example.com\"\nport = 443\nprotocol = \"http2\"\ncustom_sni = \"sni.example.com\"\ndisplay_name = \"Primary\"\n",
+        )
+        .unwrap();
         let snapshot = SyncPayload {
             version: "rev-1".to_string(),
             checksum: "0".repeat(64),
@@ -2468,7 +2456,7 @@ message_queue_capacity = 4096
             node_cluster: None,
             node_namespace: None,
             node_rollout_group: None,
-            trusttunnel_runtime_dir: PathBuf::from("."),
+            trusttunnel_runtime_dir: runtime_dir.to_path_buf(),
             trusttunnel_config_file: PathBuf::from("vpn.toml"),
             trusttunnel_hosts_file: PathBuf::from("hosts.toml"),
             bootstrap_credentials_source_path: None,
@@ -2488,10 +2476,6 @@ message_queue_capacity = 4096
             runtime_version: "test".to_string(),
             pending_sync_reports_path: PathBuf::from("pending_sync_reports.jsonl"),
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
-            tt_link_host: Some("gw.example.com".to_string()),
-            tt_link_port: Some(443),
-            tt_link_protocol: DeepLinkProtocol::Http2,
-            tt_link_custom_sni: Some("sni.example.com".to_string()),
         };
 
         let exports = build_account_exports(&cfg, &snapshot).unwrap();
@@ -2502,6 +2486,9 @@ message_queue_capacity = 4096
         assert_eq!(decoded.addresses, vec!["gw.example.com:443".to_string()]);
         assert_eq!(decoded.username, "alice");
         assert_eq!(decoded.password, "secret");
+        assert_eq!(decoded.custom_sni, Some("sni.example.com".to_string()));
+        assert_eq!(decoded.name, Some("Primary".to_string()));
+        assert_eq!(exports[0].config_hash.len(), 64);
     }
 
     #[test]
