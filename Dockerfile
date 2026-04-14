@@ -40,6 +40,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml Makefile ./
 COPY deeplink ./deeplink
+COPY endpoint ./endpoint
 COPY lib ./lib
 COPY macros ./macros
 COPY tools ./tools
