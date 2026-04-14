@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM rust:1.85-bookworm AS build
+FROM rust:1.85-bookworm AS build-base
 ARG ENDPOINT_DIR_NAME="TrustTunnel"
 WORKDIR /home/${ENDPOINT_DIR_NAME}
 
@@ -21,7 +21,11 @@ COPY lib ./lib
 COPY macros ./macros
 COPY tools ./tools
 
-RUN cargo build --release --bin trusttunnel_endpoint --bin setup_wizard --bin classic_agent
+FROM build-base AS build-endpoint
+RUN cargo build --release --bin trusttunnel_endpoint --bin setup_wizard
+
+FROM build-base AS build-classic-agent
+RUN cargo build --release --bin classic_agent
 
 FROM debian:bookworm-slim AS trusttunnel-endpoint
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -29,8 +33,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /home/TrustTunnel/target/release/setup_wizard /usr/local/bin/
-COPY --from=build /home/TrustTunnel/target/release/trusttunnel_endpoint /usr/local/bin/
+COPY --from=build-endpoint /home/TrustTunnel/target/release/setup_wizard /usr/local/bin/
+COPY --from=build-endpoint /home/TrustTunnel/target/release/trusttunnel_endpoint /usr/local/bin/
 RUN ln -s /usr/local/bin/trusttunnel_endpoint /usr/local/bin/trusttunnel-endpoint \
     && ln -s /usr/local/bin/setup_wizard /bin/setup_wizard \
     && ln -s /usr/local/bin/trusttunnel_endpoint /bin/trusttunnel_endpoint
@@ -45,6 +49,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /home/TrustTunnel/target/release/classic_agent /bin/
+COPY --from=build-classic-agent /home/TrustTunnel/target/release/classic_agent /bin/
 WORKDIR /runtime
 ENTRYPOINT ["/bin/classic_agent"]

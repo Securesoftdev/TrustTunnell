@@ -88,7 +88,7 @@ impl LkApiClient {
         Err(HeartbeatError::UnexpectedStatus(status))
     }
 
-    pub async fn sync(&self, external_node_id: &str) -> Result<(SyncPayload, Vec<u8>), String> {
+    pub async fn sync(&self, external_node_id: &str) -> Result<SyncResponse, String> {
         let path = self
             .sync_path_template
             .replace("{externalNodeId}", external_node_id);
@@ -100,6 +100,14 @@ impl LkApiClient {
             .send()
             .await
             .map_err(|e| format!("LK snapshot request failed: {e}"))?;
+
+        if response.status() == StatusCode::CONFLICT {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unavailable>".to_string());
+            return Ok(SyncResponse::Conflict { details: body });
+        }
 
         if response.status() != StatusCode::OK {
             return Err(format!(
@@ -116,7 +124,7 @@ impl LkApiClient {
             .map_err(|e| format!("failed to parse LK snapshot JSON: {e}"))?;
         parsed.validate_compatibility()?;
 
-        Ok((parsed, bytes.to_vec()))
+        Ok(SyncResponse::Snapshot((parsed, bytes.to_vec())))
     }
 
     pub async fn sync_report(&self, payload: &SyncReportPayload<'_>) -> Result<(), String> {
@@ -153,6 +161,12 @@ pub struct NodeMetadata {
     pub node_cluster: Option<String>,
     pub node_namespace: Option<String>,
     pub node_rollout_group: Option<String>,
+}
+
+#[derive(Debug)]
+pub enum SyncResponse {
+    Snapshot((SyncPayload, Vec<u8>)),
+    Conflict { details: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -234,16 +248,20 @@ pub struct OnboardingPayload<'a> {
 
 #[derive(Serialize)]
 pub struct HeartbeatPayload<'a> {
-    #[serde(flatten)]
-    pub onboarding: OnboardingPayload<'a>,
+    pub contract_version: &'static str,
     pub external_node_id: &'a str,
-    pub current_revision: &'a str,
+    pub current_revision: Option<&'a str>,
     pub health_status: &'a str,
+    pub stats: HeartbeatStats<'a>,
+}
+
+#[derive(Serialize)]
+pub struct HeartbeatStats<'a> {
     pub active_clients: u64,
     pub cpu_percent: f64,
     pub memory_percent: f64,
+    pub sync_lag_sec: u64,
     pub last_apply_status: &'a str,
-    pub timestamp: String,
 }
 
 impl<'a> OnboardingPayload<'a> {
@@ -352,12 +370,12 @@ impl fmt::Display for HeartbeatError {
 
 #[derive(Serialize)]
 pub struct SyncReportPayload<'a> {
-    #[serde(flatten)]
-    pub onboarding: OnboardingPayload<'a>,
-    pub version: &'a str,
-    pub checksum: &'a str,
-    pub applied: bool,
-    pub details: &'a str,
+    pub contract_version: &'static str,
+    pub external_node_id: &'a str,
+    pub applied_revision: &'a str,
+    pub last_sync_status: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_sync_error: Option<&'a str>,
 }
 
 pub fn payload_top_level_keys(payload: &Value) -> String {
@@ -451,5 +469,45 @@ mod tests {
         assert_eq!(value["rollout_group"], "blue");
         assert!(value.get("node_identity").is_none());
         assert!(value.get("trusttunnel_runtime_dir").is_none());
+    }
+
+    #[test]
+    fn heartbeat_payload_uses_nested_stats_and_nullable_revision() {
+        let payload = HeartbeatPayload {
+            contract_version: "v1",
+            external_node_id: "n-1",
+            current_revision: None,
+            health_status: "ok",
+            stats: HeartbeatStats {
+                active_clients: 1,
+                cpu_percent: 0.3,
+                memory_percent: 1.4,
+                sync_lag_sec: 0,
+                last_apply_status: "pending",
+            },
+        };
+
+        let value = serde_json::to_value(payload).unwrap();
+        assert!(value.get("stats").is_some());
+        assert!(value.get("active_clients").is_none());
+        assert!(value["current_revision"].is_null());
+    }
+
+    #[test]
+    fn sync_report_payload_uses_v1_fields() {
+        let payload = SyncReportPayload {
+            contract_version: "v1",
+            external_node_id: "n-1",
+            applied_revision: "rev-1",
+            last_sync_status: "ok",
+            last_sync_error: None,
+        };
+
+        let value = serde_json::to_value(payload).unwrap();
+        assert!(value.get("version").is_none());
+        assert!(value.get("checksum").is_none());
+        assert!(value.get("applied").is_none());
+        assert!(value.get("details").is_none());
+        assert_eq!(value["last_sync_status"], "ok");
     }
 }
