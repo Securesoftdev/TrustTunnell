@@ -221,6 +221,12 @@ pub struct Account {
     pub external_account_id: Option<String>,
     #[serde(default, alias = "accessBundleId", alias = "bundleId")]
     pub access_bundle_id: Option<String>,
+    #[serde(default, alias = "ttLink")]
+    pub tt_link: String,
+    #[serde(default, alias = "ttLinkConfigHash")]
+    pub tt_link_config_hash: String,
+    #[serde(default, alias = "ttLinkStale")]
+    pub tt_link_stale: bool,
 }
 
 fn default_enabled() -> bool {
