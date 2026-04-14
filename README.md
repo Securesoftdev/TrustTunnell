@@ -468,6 +468,11 @@ Repository Docker build has two production targets:
 - Endpoint image target: `trusttunnel-endpoint`
 - Classic agent image target: `trusttunnel-classic-agent`
 
+GitHub Actions image workflows:
+
+- `.github/workflows/build-images.yml` builds and publishes both production images and is intentionally manual (`workflow_dispatch`). Use this workflow when endpoint-related changes must be built and published together with the sidecar image.
+- `.github/workflows/build-classic-agent-image.yml` builds and publishes only the classic agent sidecar image. Use this workflow for sidecar-only changes and for regular pull request validation of sidecar image builds.
+
 Build commands:
 
 ```sh
