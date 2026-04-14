@@ -722,20 +722,26 @@ impl Agent {
     }
 
     async fn send_heartbeat(&self) -> Result<(), HeartbeatFailure> {
-        let onboarding = OnboardingPayload::from_metadata(
-            &self.node_metadata,
-            &self.cfg.agent_version,
-            &self.cfg.runtime_version,
-        );
-        onboarding
-            .validate_compatibility()
-            .map_err(HeartbeatFailure::PayloadValidation)?;
         let runtime_status = RuntimeStatus::collect(
             &self.cfg.runtime_pid_path,
             &self.cfg.runtime_process_name,
             &self.cfg.runtime_credentials_path,
         );
-        let health_status = runtime_status.health_status();
+        let normalized_payload = normalize_heartbeat_payload(
+            &self.state.version,
+            runtime_status.health_status(),
+            &self.last_apply_status,
+            &self.cfg.agent_version,
+            &self.cfg.runtime_version,
+        );
+        let onboarding = OnboardingPayload::from_metadata(
+            &self.node_metadata,
+            &normalized_payload.agent_version,
+            &normalized_payload.runtime_version,
+        );
+        onboarding
+            .validate_compatibility()
+            .map_err(HeartbeatFailure::PayloadValidation)?;
         self.metrics
             .endpoint_process_status
             .with_label_values(&[&self.cfg.node_external_id])
@@ -743,12 +749,12 @@ impl Agent {
         let payload = HeartbeatPayload {
             onboarding,
             external_node_id: &self.cfg.node_external_id,
-            current_revision: &self.state.version,
-            health_status,
+            current_revision: &normalized_payload.current_revision,
+            health_status: normalized_payload.health_status,
             active_clients: runtime_status.active_clients,
             cpu_percent: runtime_status.cpu_percent,
             memory_percent: runtime_status.memory_percent,
-            last_apply_status: &self.last_apply_status,
+            last_apply_status: &normalized_payload.last_apply_status,
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
         self.lk_api
@@ -1200,6 +1206,48 @@ impl PendingSyncReportOwned {
     }
 }
 
+struct NormalizedHeartbeatPayload {
+    current_revision: String,
+    health_status: &'static str,
+    last_apply_status: String,
+    agent_version: String,
+    runtime_version: String,
+}
+
+fn normalize_heartbeat_payload(
+    current_revision: &str,
+    health_status: &str,
+    last_apply_status: &str,
+    agent_version: &str,
+    runtime_version: &str,
+) -> NormalizedHeartbeatPayload {
+    NormalizedHeartbeatPayload {
+        current_revision: normalize_required_string(current_revision, "unknown"),
+        health_status: normalize_health_status(health_status),
+        last_apply_status: normalize_required_string(last_apply_status, "unknown"),
+        agent_version: normalize_required_string(agent_version, "unknown"),
+        runtime_version: normalize_required_string(runtime_version, "unknown"),
+    }
+}
+
+fn normalize_required_string(value: &str, fallback: &str) -> String {
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        return fallback.to_string();
+    }
+    normalized.to_string()
+}
+
+fn normalize_health_status(raw_status: &str) -> &'static str {
+    let status = raw_status.trim().to_ascii_lowercase();
+    match status.as_str() {
+        "healthy" | "alive" | "ready" | "ok" => "ok",
+        "warning" | "degraded" | "limited" => "degraded",
+        "dead" | "stopped" | "offline" | "fatal" | "failed" | "disabled" => "disabled",
+        _ => "degraded",
+    }
+}
+
 impl RuntimeStatus {
     fn collect(runtime_pid_path: &Path, process_name: &str, credentials_file: &Path) -> Self {
         let pid = read_pid(runtime_pid_path).or_else(|| find_pid_by_name(process_name));
@@ -1637,6 +1685,33 @@ mod runtime_status_tests {
         };
 
         assert_eq!(status.health_status(), "healthy");
+    }
+
+    #[test]
+    fn normalize_heartbeat_payload_falls_back_to_non_empty_contract_fields() {
+        let payload = normalize_heartbeat_payload("", "dead", "", "", "");
+
+        assert_eq!(payload.current_revision, "unknown");
+        assert_eq!(payload.health_status, "disabled");
+        assert_eq!(payload.last_apply_status, "unknown");
+        assert_eq!(payload.agent_version, "unknown");
+        assert_eq!(payload.runtime_version, "unknown");
+    }
+
+    #[test]
+    fn normalize_health_status_maps_legacy_values_to_lk_contract() {
+        assert_eq!(normalize_health_status("healthy"), "ok");
+        assert_eq!(normalize_health_status("alive"), "ok");
+        assert_eq!(normalize_health_status("ready"), "ok");
+        assert_eq!(normalize_health_status("warning"), "degraded");
+        assert_eq!(normalize_health_status("limited"), "degraded");
+        assert_eq!(normalize_health_status("offline"), "disabled");
+        assert_eq!(normalize_health_status("failed"), "disabled");
+    }
+
+    #[test]
+    fn normalize_health_status_uses_safe_default_for_unknown_values() {
+        assert_eq!(normalize_health_status("something-new"), "degraded");
     }
 }
 
@@ -2446,6 +2521,34 @@ message_queue_capacity = 4096
             .filter(|x| x.method == Method::POST && x.path == "/heartbeat")
             .count();
         assert_eq!(heartbeat_count, 3);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_payload_uses_lk_v1_normalized_fields() {
+        let server = MockHttpServer::start().await;
+        let tmp_dir = TempDir::new().unwrap();
+        let mut agent = make_agent(&tmp_dir, &server.base_url, None).await;
+        agent.state.version = "".to_string();
+        agent.last_apply_status = "".to_string();
+        server
+            .enqueue(Method::POST, "/heartbeat", HyperStatusCode::OK, "")
+            .await;
+
+        agent.send_heartbeat().await.unwrap();
+
+        let requests = server.captured().await;
+        let heartbeat = requests
+            .iter()
+            .find(|x| x.method == Method::POST && x.path == "/heartbeat")
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&heartbeat.body).unwrap();
+        assert_eq!(body["contract_version"], "v1");
+        assert_eq!(body["current_revision"], "unknown");
+        assert_eq!(body["health_status"], "disabled");
+        assert_eq!(body["agent_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(body["runtime_version"], "test");
+        assert_eq!(body["last_apply_status"], "unknown");
+        assert_ne!(body["timestamp"], "");
     }
 
     #[tokio::test]

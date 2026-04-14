@@ -31,6 +31,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Detect endpoint image changes
+        id: changed
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            endpoint_image:
+              - 'Dockerfile'
+              - 'docker-entrypoint.sh'
+              - 'endpoint/**'
+              - 'lib/**'
+              - 'deeplink/**'
+              - 'macros/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.github/workflows/build-images.yml'
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -62,6 +79,7 @@ jobs:
           password: ${{ github.token }}
 
       - name: Extract endpoint image metadata
+        if: steps.changed.outputs.endpoint_image == 'true'
         id: endpoint-meta
         uses: docker/metadata-action@v5
         with:
@@ -71,6 +89,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build endpoint image
+        if: steps.changed.outputs.endpoint_image == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -78,6 +97,10 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.endpoint-meta.outputs.tags }}
           labels: ${{ steps.endpoint-meta.outputs.labels }}
+
+      - name: Endpoint image build skipped
+        if: steps.changed.outputs.endpoint_image != 'true'
+        run: echo "No endpoint-related changes detected; skipping trusttunnel-endpoint image build/publish."
 
       - name: Extract classic agent image metadata
         id: classic-meta
