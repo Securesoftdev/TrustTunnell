@@ -41,17 +41,12 @@ struct Config {
     lk_service_token: String,
     node_external_id: String,
     node_hostname: String,
-    node_stage: String,
-    node_cluster: String,
-    node_namespace: String,
-    node_rollout_group: String,
-    node_public_ip: Option<String>,
-    node_public_port: Option<u16>,
-    node_sni: Option<String>,
+    node_stage: Option<String>,
+    node_cluster: Option<String>,
+    node_namespace: Option<String>,
+    node_rollout_group: Option<String>,
     trusttunnel_runtime_dir: PathBuf,
-    trusttunnel_credentials_file: PathBuf,
     trusttunnel_config_file: PathBuf,
-    trusttunnel_hosts_file: PathBuf,
     bootstrap_credentials_source_path: Option<PathBuf>,
     runtime_credentials_path: PathBuf,
     runtime_primary_marker_path: PathBuf,
@@ -65,6 +60,7 @@ struct Config {
     apply_cmd: Option<String>,
     runtime_pid_path: PathBuf,
     runtime_process_name: String,
+    agent_version: String,
     runtime_version: String,
     pending_sync_reports_path: PathBuf,
     metrics_address: SocketAddr,
@@ -76,26 +72,17 @@ impl Config {
         let lk_service_token = required_env("LK_SERVICE_TOKEN")?;
         let node_external_id = required_env("NODE_EXTERNAL_ID")?;
         let node_hostname = required_env("NODE_HOSTNAME")?;
-        let node_stage = required_env("NODE_STAGE")?;
-        let node_cluster = required_env("NODE_CLUSTER")?;
-        let node_namespace = required_env("NODE_NAMESPACE")?;
-        let node_rollout_group = required_env("NODE_ROLLOUT_GROUP")?;
+        let node_stage = optional_env_nonempty("NODE_STAGE");
+        let node_cluster = optional_env_nonempty("NODE_CLUSTER");
+        let node_namespace = optional_env_nonempty("NODE_NAMESPACE");
+        let node_rollout_group = optional_env_nonempty("NODE_ROLLOUT_GROUP");
         let trusttunnel_runtime_dir: PathBuf = required_env("TRUSTTUNNEL_RUNTIME_DIR")?.into();
         let trusttunnel_credentials_file: PathBuf =
             required_env("TRUSTTUNNEL_CREDENTIALS_FILE")?.into();
         let trusttunnel_config_file: PathBuf = required_env("TRUSTTUNNEL_CONFIG_FILE")?.into();
-        let trusttunnel_hosts_file: PathBuf = required_env("TRUSTTUNNEL_HOSTS_FILE")?.into();
+        let _trusttunnel_hosts_file: PathBuf = required_env("TRUSTTUNNEL_HOSTS_FILE")?.into();
         let bootstrap_credentials_source_path =
             optional_env("TRUSTTUNNEL_BOOTSTRAP_CREDENTIALS_FILE").map(PathBuf::from);
-        let node_public_ip = optional_env("NODE_PUBLIC_IP").or_else(|| optional_env("NODE_PUBLIC_HOST"));
-        let node_public_port = optional_env("NODE_PUBLIC_PORT")
-            .map(|raw| {
-                raw.parse::<u16>()
-                    .map_err(|e| format!("NODE_PUBLIC_PORT must be u16: {e}"))
-            })
-            .transpose()?;
-        let node_sni = optional_env("NODE_SNI");
-
         let runtime_credentials_path = trusttunnel_runtime_dir.join(&trusttunnel_credentials_file);
         let runtime_primary_marker_path = trusttunnel_runtime_dir.join(RUNTIME_PRIMARY_MARKER_FILE);
         let agent_state_path = std::env::var("AGENT_STATE_PATH")
@@ -122,8 +109,10 @@ impl Config {
             .unwrap_or_else(|_| trusttunnel_runtime_dir.join("trusttunnel.pid"));
         let runtime_process_name = std::env::var("TRUSTTUNNEL_RUNTIME_PROCESS_NAME")
             .unwrap_or_else(|_| "trusttunnel_endpoint".to_string());
-        let runtime_version = std::env::var("TRUSTTUNNEL_RUNTIME_VERSION")
-            .unwrap_or_else(|_| "unknown".to_string());
+        let agent_version = optional_env_nonempty("TRUSTTUNNEL_AGENT_VERSION")
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+        let runtime_version =
+            optional_env_nonempty("TRUSTTUNNEL_RUNTIME_VERSION").unwrap_or_else(|| "unknown".to_string());
         let pending_sync_reports_path = trusttunnel_runtime_dir.join(SYNC_REPORT_OUTBOX_FILE);
         let metrics_address = std::env::var("AGENT_METRICS_ADDRESS")
             .unwrap_or_else(|_| "127.0.0.1:9901".to_string())
@@ -139,13 +128,8 @@ impl Config {
             node_cluster,
             node_namespace,
             node_rollout_group,
-            node_public_ip,
-            node_public_port,
-            node_sni,
             trusttunnel_runtime_dir,
-            trusttunnel_credentials_file,
             trusttunnel_config_file,
-            trusttunnel_hosts_file,
             bootstrap_credentials_source_path,
             runtime_credentials_path,
             runtime_primary_marker_path,
@@ -159,6 +143,7 @@ impl Config {
             apply_cmd,
             runtime_pid_path,
             runtime_process_name,
+            agent_version,
             runtime_version,
             pending_sync_reports_path,
             metrics_address,
@@ -200,14 +185,6 @@ impl Agent {
             node_cluster: cfg.node_cluster.clone(),
             node_namespace: cfg.node_namespace.clone(),
             node_rollout_group: cfg.node_rollout_group.clone(),
-            node_public_ip: cfg.node_public_ip.clone(),
-            node_public_port: cfg.node_public_port,
-            node_sni: cfg.node_sni.clone(),
-            trusttunnel_runtime_dir: path_to_string(&cfg.trusttunnel_runtime_dir)?.to_string(),
-            trusttunnel_credentials_file: path_to_string(&cfg.trusttunnel_credentials_file)?
-                .to_string(),
-            trusttunnel_config_file: path_to_string(&cfg.trusttunnel_config_file)?.to_string(),
-            trusttunnel_hosts_file: path_to_string(&cfg.trusttunnel_hosts_file)?.to_string(),
         };
         let lk_api = LkApiClient::new(
             client,
@@ -629,7 +606,7 @@ impl Agent {
     async fn send_sync_report_payload(&self, report: &PendingSyncReport<'_>) -> Result<(), String> {
         let onboarding = OnboardingPayload::from_metadata(
             &self.node_metadata,
-            env!("CARGO_PKG_VERSION"),
+            &self.cfg.agent_version,
             &self.cfg.runtime_version,
         );
         onboarding.validate_compatibility()?;
@@ -747,7 +724,7 @@ impl Agent {
     async fn send_heartbeat(&self) -> Result<(), HeartbeatFailure> {
         let onboarding = OnboardingPayload::from_metadata(
             &self.node_metadata,
-            env!("CARGO_PKG_VERSION"),
+            &self.cfg.agent_version,
             &self.cfg.runtime_version,
         );
         onboarding
@@ -816,7 +793,7 @@ impl Agent {
     async fn send_register_once(&self) -> Result<RegisterAttemptOutcome, RegisterError> {
         let payload = OnboardingPayload::from_metadata(
             &self.node_metadata,
-            env!("CARGO_PKG_VERSION"),
+            &self.cfg.agent_version,
             &self.cfg.runtime_version,
         );
         payload
@@ -1669,6 +1646,10 @@ fn optional_env(name: &str) -> Option<String> {
         .and_then(|raw| non_empty_value(name, raw).ok())
 }
 
+fn optional_env_nonempty(name: &str) -> Option<String> {
+    optional_env(name).filter(|value| !value.trim().is_empty())
+}
+
 fn non_empty_value(name: &str, raw: String) -> Result<String, String> {
     let value = raw.trim();
     if value.is_empty() {
@@ -1975,17 +1956,12 @@ message_queue_capacity = 4096
             lk_service_token: "token".to_string(),
             node_external_id: "node-1".to_string(),
             node_hostname: "node-1.example".to_string(),
-            node_stage: "prod".to_string(),
-            node_cluster: "cluster-a".to_string(),
-            node_namespace: "default".to_string(),
-            node_rollout_group: "g1".to_string(),
-            node_public_ip: None,
-            node_public_port: None,
-            node_sni: None,
+            node_stage: Some("prod".to_string()),
+            node_cluster: Some("cluster-a".to_string()),
+            node_namespace: Some("default".to_string()),
+            node_rollout_group: Some("g1".to_string()),
             trusttunnel_runtime_dir: runtime_dir.clone(),
-            trusttunnel_credentials_file: credentials_file_rel,
             trusttunnel_config_file: config_file.clone(),
-            trusttunnel_hosts_file: hosts_file,
             bootstrap_credentials_source_path: None,
             runtime_credentials_path: credentials_file_abs,
             runtime_primary_marker_path: runtime_dir.join(RUNTIME_PRIMARY_MARKER_FILE),
@@ -1999,6 +1975,7 @@ message_queue_capacity = 4096
             apply_cmd: apply_cmd.map(ToString::to_string),
             runtime_pid_path: runtime_dir.join("trusttunnel.pid"),
             runtime_process_name: "trusttunnel_endpoint".to_string(),
+            agent_version: env!("CARGO_PKG_VERSION").to_string(),
             runtime_version: "test".to_string(),
             pending_sync_reports_path: runtime_dir.join(SYNC_REPORT_OUTBOX_FILE),
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
@@ -2393,11 +2370,14 @@ message_queue_capacity = 4096
             .unwrap();
         let body: serde_json::Value = serde_json::from_str(&register.body).unwrap();
         assert_eq!(body["contract_version"], "v1");
+        assert_eq!(body["external_node_id"], "node-1");
         assert_eq!(body["hostname"], "node-1.example");
-        assert_eq!(body["node_identity"]["external_id"], "node-1");
         assert_eq!(body["agent_version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(body["runtime_version"], "test");
-        assert!(body.get("node_external_id").is_none());
+        assert_eq!(body["stage"], "prod");
+        assert_eq!(body["cluster"], "cluster-a");
+        assert!(body.get("node_identity").is_none());
+        assert!(body.get("trusttunnel_runtime_dir").is_none());
     }
 
     #[tokio::test]
