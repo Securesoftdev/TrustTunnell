@@ -2,12 +2,11 @@ mod lk_api;
 
 use lk_api::{
     Account, AccountExportPayload, HeartbeatPayload, HeartbeatStats, LkApiClient, NodeMetadata,
-    OnboardingPayload, SyncPayload, SyncReportPayload, SyncResponse,
-    DEFAULT_HEARTBEAT_PATH, DEFAULT_REGISTER_PATH, DEFAULT_SYNC_PATH_TEMPLATE,
-    DEFAULT_SYNC_REPORT_PATH,
+    OnboardingPayload, SyncPayload, SyncReportPayload, SyncResponse, DEFAULT_SYNC_PATH_TEMPLATE,
+    DEFAULT_SYNC_REPORT_PATH, DEFAULT_HEARTBEAT_PATH, DEFAULT_REGISTER_PATH,
 };
-use trusttunnel_deeplink::{DeepLinkConfig, Protocol as DeepLinkProtocol};
 use reqwest::StatusCode;
+use trusttunnel_deeplink::{DeepLinkConfig, Protocol as DeepLinkProtocol};
 use serde::{Deserialize, Serialize};
 use std::fs::read_dir;
 use std::net::SocketAddr;
@@ -25,18 +24,19 @@ use toml_edit::value;
 use trusttunnel::settings::Settings;
 use prometheus::{Encoder, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder};
 
+const SYNC_REPORT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const SYNC_REPORT_MAX_BACKOFF: Duration = Duration::from_secs(300);
 const REGISTER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const REGISTER_MAX_BACKOFF: Duration = Duration::from_secs(60);
 const HEARTBEAT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const HEARTBEAT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const HEARTBEAT_MAX_ATTEMPTS: usize = 3;
-const SYNC_REPORT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-const SYNC_REPORT_MAX_BACKOFF: Duration = Duration::from_secs(300);
 const SYNC_REPORT_OUTBOX_FILE: &str = "pending_sync_reports.jsonl";
 const RUNTIME_PRIMARY_MARKER_FILE: &str = ".runtime_credentials_primary";
 
 #[derive(Clone)]
 struct Config {
+    runtime_mode: RuntimeMode,
     lk_base_url: String,
     lk_service_token: String,
     node_external_id: String,
@@ -53,11 +53,8 @@ struct Config {
     runtime_primary_marker_path: PathBuf,
     agent_state_path: PathBuf,
     poll_interval: Duration,
-    heartbeat_interval: Duration,
     sync_path_template: String,
     sync_report_path: String,
-    heartbeat_path: String,
-    register_path: String,
     apply_cmd: Option<String>,
     runtime_pid_path: PathBuf,
     runtime_process_name: String,
@@ -71,8 +68,31 @@ struct Config {
     tt_link_custom_sni: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeMode {
+    DbWorker,
+    LegacyHttp,
+}
+
+impl RuntimeMode {
+    fn from_env() -> Result<Self, String> {
+        match optional_env_nonempty("CLASSIC_AGENT_RUNTIME_MODE")
+            .unwrap_or_else(|| "db_worker".to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "db_worker" => Ok(Self::DbWorker),
+            "legacy_http" => Ok(Self::LegacyHttp),
+            other => Err(format!(
+                "CLASSIC_AGENT_RUNTIME_MODE must be one of: db_worker, legacy_http; got {other}"
+            )),
+        }
+    }
+}
+
 impl Config {
     fn from_env() -> Result<Self, String> {
+        let runtime_mode = RuntimeMode::from_env()?;
         let lk_base_url = required_env("LK_BASE_URL")?;
         let lk_service_token = required_env("LK_SERVICE_TOKEN")?;
         let node_external_id = required_env("NODE_EXTERNAL_ID")?;
@@ -96,16 +116,11 @@ impl Config {
             .into();
 
         let poll_interval = duration_required_from_env("AGENT_POLL_INTERVAL_SEC")?;
-        let heartbeat_interval = duration_required_from_env("AGENT_HEARTBEAT_INTERVAL_SEC")?;
 
         let sync_path_template = std::env::var("LK_SYNC_PATH_TEMPLATE")
             .unwrap_or_else(|_| DEFAULT_SYNC_PATH_TEMPLATE.to_string());
         let sync_report_path = std::env::var("LK_SYNC_REPORT_PATH")
             .unwrap_or_else(|_| DEFAULT_SYNC_REPORT_PATH.to_string());
-        let heartbeat_path = std::env::var("LK_HEARTBEAT_PATH")
-            .unwrap_or_else(|_| DEFAULT_HEARTBEAT_PATH.to_string());
-        let register_path =
-            std::env::var("LK_REGISTER_PATH").unwrap_or_else(|_| DEFAULT_REGISTER_PATH.to_string());
 
         let apply_cmd = std::env::var("TRUSTTUNNEL_APPLY_CMD")
             .ok()
@@ -137,6 +152,7 @@ impl Config {
 
         let cfg = Self {
             lk_base_url,
+            runtime_mode,
             lk_service_token,
             node_external_id,
             node_hostname,
@@ -152,11 +168,8 @@ impl Config {
             runtime_primary_marker_path,
             agent_state_path,
             poll_interval,
-            heartbeat_interval,
             sync_path_template,
             sync_report_path,
-            heartbeat_path,
-            register_path,
             apply_cmd,
             runtime_pid_path,
             runtime_process_name,
@@ -263,8 +276,8 @@ impl Agent {
             client,
             cfg.lk_base_url.clone(),
             cfg.lk_service_token.clone(),
-            cfg.register_path.clone(),
-            cfg.heartbeat_path.clone(),
+            DEFAULT_REGISTER_PATH.to_string(),
+            DEFAULT_HEARTBEAT_PATH.to_string(),
             cfg.sync_report_path.clone(),
             cfg.sync_path_template.clone(),
         );
@@ -309,12 +322,42 @@ impl Agent {
             std::process::exit(2);
         }
 
+        match self.cfg.runtime_mode {
+            RuntimeMode::DbWorker => self.run_db_worker_loop().await,
+            RuntimeMode::LegacyHttp => self.run_legacy_http_loop().await,
+        }
+    }
+
+    async fn run_db_worker_loop(&mut self) {
+        let mut poll_tick = interval(self.cfg.poll_interval);
+        poll_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut backoff = Duration::from_secs(1);
+
+        loop {
+            poll_tick.tick().await;
+            match self.reconcile_once().await {
+                Ok(()) => backoff = Duration::from_secs(1),
+                Err(err) => {
+                    log_error(
+                        "reconcile_failed",
+                        &self.cfg.node_external_id,
+                        "reconcile",
+                        "failed",
+                        &err,
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff.saturating_mul(2), Duration::from_secs(300));
+                }
+            }
+        }
+    }
+
+    async fn run_legacy_http_loop(&mut self) {
         self.bootstrap_register().await;
 
         let mut poll_tick = interval(self.cfg.poll_interval);
         poll_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
-        let mut heartbeat_tick = interval(self.cfg.heartbeat_interval);
+        let mut heartbeat_tick = interval(Duration::from_secs(30));
         heartbeat_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut sync_report_tick = interval(Duration::from_secs(1));
         sync_report_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -324,13 +367,13 @@ impl Agent {
         loop {
             tokio::select! {
                 _ = poll_tick.tick() => {
-                    match self.sync_once().await {
+                    match self.reconcile_once().await {
                         Ok(()) => backoff = Duration::from_secs(1),
                         Err(err) => {
                             log_error(
-                                "snapshot_sync_failed",
+                                "snapshot_reconcile_failed",
                                 &self.cfg.node_external_id,
-                                "sync",
+                                "reconcile",
                                 "failed",
                                 &err,
                             );
@@ -385,8 +428,8 @@ impl Agent {
         }
     }
 
-    async fn sync_once(&mut self) -> Result<(), String> {
-        let Some((snapshot, raw_body)) = self.pull_snapshot().await? else {
+    async fn reconcile_once(&mut self) -> Result<(), String> {
+        let Some((snapshot, raw_body)) = self.fetch_accounts_by_node().await? else {
             return Ok(());
         };
         let node = self.cfg.node_external_id.clone();
@@ -394,7 +437,7 @@ impl Agent {
 
         if snapshot.onboarding_state != "active" {
             let details = format!(
-                "sync apply skipped: onboarding_state={}, expected=active",
+                "reconcile skipped: onboarding_state={}, expected=active",
                 snapshot.onboarding_state
             );
             log_sync_skip(&snapshot, &details);
@@ -402,35 +445,35 @@ impl Agent {
             self.send_sync_report(&snapshot.version, "skipped", Some(&details), None)
                 .await?;
             self.metrics
-                .sync_total
+                .reconcile_total
                 .with_label_values(&[&node, &snapshot.version, "skipped", "onboarding_state"])
                 .inc();
             log_event(
                 "info",
                 &snapshot.version,
                 &node,
-                "sync_skipped",
+                "reconcile_skipped",
                 "onboarding_state",
             );
             return Ok(());
         }
 
         if !snapshot.sync_required {
-            let details = "sync apply skipped: sync_required=false".to_string();
+            let details = "reconcile skipped: sync_required=false".to_string();
             log_sync_skip(&snapshot, &details);
             self.last_apply_status = "skipped".to_string();
             self.send_sync_report(&snapshot.version, "skipped", Some(&details), None)
                 .await?;
             self.metrics
-                .sync_total
-                .with_label_values(&[&node, &snapshot.version, "skipped", "sync_not_required"])
+                .reconcile_total
+                .with_label_values(&[&node, &snapshot.version, "skipped", "reconcile_not_required"])
                 .inc();
             log_event(
                 "info",
                 &snapshot.version,
                 &node,
-                "sync_skipped",
-                "sync_not_required",
+                "reconcile_skipped",
+                "reconcile_not_required",
             );
             return Ok(());
         }
@@ -441,18 +484,18 @@ impl Agent {
             self.send_sync_report(&snapshot.version, "error", Some(detail), None)
                 .await?;
             self.metrics
-                .sync_total
+                .reconcile_total
                 .with_label_values(&[&node, &snapshot.version, "failed", "invalid_checksum"])
                 .inc();
             self.metrics
-                .last_failed_sync
+                .last_failed_reconcile
                 .with_label_values(&[&node])
                 .set(chrono::Utc::now().timestamp());
             log_event(
                 "error",
                 &snapshot.version,
                 &node,
-                "sync_failed",
+                "reconcile_failed",
                 "invalid_checksum",
             );
             return Err(detail.to_string());
@@ -469,19 +512,19 @@ impl Agent {
             && self.state.credentials_sha256 == rendered_sha
         {
             println!(
-                "snapshot unchanged, skip rewrite/apply: version={}, checksum={}",
+                "reconcile unchanged, skip rewrite/apply: version={}, checksum={}",
                 snapshot.version, snapshot.checksum
             );
             self.metrics
-                .sync_total
+                .reconcile_total
                 .with_label_values(&[&node, &snapshot.version, "unchanged", "none"])
                 .inc();
-            log_event("info", &snapshot.version, &node, "sync_unchanged", "none");
+            log_event("info", &snapshot.version, &node, "reconcile_unchanged", "none");
             return Ok(());
         }
 
         println!(
-            "snapshot changed: version={} checksum={} accounts={} enabled={}",
+            "reconcile changed: version={} checksum={} accounts={} enabled={}",
             snapshot.version,
             snapshot.checksum,
             snapshot.accounts.len(),
@@ -546,14 +589,14 @@ impl Agent {
 
         if !apply_ok {
             self.metrics
-                .sync_total
+                .reconcile_total
                 .with_label_values(&[&node, &snapshot.version, "failed", "apply"])
                 .inc();
             self.metrics
-                .last_failed_sync
+                .last_failed_reconcile
                 .with_label_values(&[&node])
                 .set(chrono::Utc::now().timestamp());
-            log_event("error", &snapshot.version, &node, "sync_failed", "apply");
+            log_event("error", &snapshot.version, &node, "reconcile_failed", "apply");
             self.send_sync_report(&snapshot.version, "error", Some(&apply_details), None)
                 .await?;
             return Err(apply_details);
@@ -566,31 +609,36 @@ impl Agent {
         };
         self.mark_runtime_as_primary().await?;
         persist_state(&self.cfg.agent_state_path, &self.state).await?;
-        let account_exports = build_account_exports(&self.cfg, &snapshot)?;
+        let account_exports = self.batch_tt_link_reconcile(&snapshot).await?;
         for export in &account_exports {
+            let error_class = if export.access_bundle_id.is_some() {
+                "bundle_id_present"
+            } else {
+                "bundle_id_missing"
+            };
+            self.metrics
+                .tt_link_generation_total
+                .with_label_values(&[&node, &snapshot.version, "success", error_class])
+                .inc();
             log_event(
                 "info",
                 &snapshot.version,
                 &node,
                 "tt_link_generated",
-                if export.access_bundle_id.is_some() {
-                    "bundle_id_present"
-                } else {
-                    "bundle_id_missing"
-                },
+                error_class,
             );
         }
         self.send_sync_report(&snapshot.version, "ok", None, Some(&account_exports))
             .await?;
         self.metrics
-            .sync_total
+            .reconcile_total
             .with_label_values(&[&node, &snapshot.version, "success", "none"])
             .inc();
         self.metrics
-            .last_successful_sync
+            .last_successful_reconcile
             .with_label_values(&[&node])
             .set(chrono::Utc::now().timestamp());
-        log_event("info", &snapshot.version, &node, "sync_success", "none");
+        log_event("info", &snapshot.version, &node, "reconcile_success", "none");
 
         Ok(())
     }
@@ -671,7 +719,7 @@ impl Agent {
         atomic_write(&self.cfg.runtime_primary_marker_path, b"runtime_credentials_primary\n").await
     }
 
-    async fn pull_snapshot(&self) -> Result<Option<(SyncPayload, Vec<u8>)>, String> {
+    async fn fetch_accounts_by_node(&self) -> Result<Option<(SyncPayload, Vec<u8>)>, String> {
         match self.lk_api.sync(&self.cfg.node_external_id).await? {
             SyncResponse::Snapshot(payload) => Ok(Some(payload)),
             SyncResponse::Conflict { details } => {
@@ -682,15 +730,22 @@ impl Agent {
                     detail
                 };
                 log_error(
-                    "sync_conflict",
+                    "reconcile_conflict",
                     &self.cfg.node_external_id,
-                    "sync",
+                    "reconcile",
                     "http_409_conflict",
-                    &format!("LK sync conflict: {reason}"),
+                    &format!("account fetch conflict: {reason}"),
                 );
                 Ok(None)
             }
         }
+    }
+
+    async fn batch_tt_link_reconcile(
+        &self,
+        snapshot: &SyncPayload,
+    ) -> Result<Vec<AccountExportOwned>, String> {
+        build_account_exports(&self.cfg, snapshot)
     }
 
     async fn send_sync_report(
@@ -818,7 +873,7 @@ impl Agent {
             match self.send_heartbeat().await {
                 Ok(()) => {
                     self.metrics
-                        .heartbeat_status
+                        .runtime_health_status
                         .with_label_values(&[&self.cfg.node_external_id])
                         .set(1);
                     return;
@@ -829,7 +884,7 @@ impl Agent {
                         "error",
                         self.state.applied_revision.as_deref().unwrap_or("none"),
                         &self.cfg.node_external_id,
-                        "heartbeat_failed",
+                        "runtime_health_failed",
                         err.kind(),
                     );
                     eprintln!(
@@ -841,7 +896,7 @@ impl Agent {
                     );
                     if is_last {
                         self.metrics
-                            .heartbeat_status
+                            .runtime_health_status
                             .with_label_values(&[&self.cfg.node_external_id])
                             .set(0);
                         return;
@@ -889,7 +944,7 @@ impl Agent {
             .await
             .map_err(|err| {
                 self.metrics
-                    .heartbeat_total
+                    .runtime_health_total
                     .with_label_values(&[
                         &self.cfg.node_external_id,
                         self.state.applied_revision.as_deref().unwrap_or("none"),
@@ -900,7 +955,7 @@ impl Agent {
                 HeartbeatFailure::Api(err)
             })?;
         self.metrics
-            .heartbeat_total
+            .runtime_health_total
             .with_label_values(&[
                 &self.cfg.node_external_id,
                 self.state.applied_revision.as_deref().unwrap_or("none"),
@@ -912,7 +967,7 @@ impl Agent {
             "info",
             self.state.applied_revision.as_deref().unwrap_or("none"),
             &self.cfg.node_external_id,
-            "heartbeat_success",
+            "runtime_health_success",
             "none",
         );
 
@@ -954,7 +1009,7 @@ impl Agent {
         let endpoint = format!(
             "{}{}",
             self.cfg.lk_base_url.trim_end_matches('/'),
-            self.cfg.register_path
+            "/register"
         );
         let payload_keys = payload_key_list(&payload);
         let reason_summary = summarize_register_reason(status, &response_body);
@@ -1151,54 +1206,63 @@ struct RuntimeStatus {
 
 struct AgentMetrics {
     registry: Registry,
-    sync_total: IntCounterVec,
-    heartbeat_total: IntCounterVec,
+    reconcile_total: IntCounterVec,
+    tt_link_generation_total: IntCounterVec,
+    runtime_health_total: IntCounterVec,
     apply_total: IntCounterVec,
-    last_successful_sync: IntGaugeVec,
-    last_failed_sync: IntGaugeVec,
+    last_successful_reconcile: IntGaugeVec,
+    last_failed_reconcile: IntGaugeVec,
     apply_duration_ms: IntGaugeVec,
     credentials_count: IntGaugeVec,
-    heartbeat_status: IntGaugeVec,
+    runtime_health_status: IntGaugeVec,
     endpoint_process_status: IntGaugeVec,
 }
 
 impl AgentMetrics {
     fn new(node: &str) -> Result<Self, String> {
         let registry = Registry::new();
-        let sync_total = IntCounterVec::new(
-            Opts::new("classic_agent_sync_total", "Total sync attempts by status"),
+        let reconcile_total = IntCounterVec::new(
+            Opts::new("classic_agent_reconcile_total", "Total sync attempts by status"),
             &["node", "revision", "status", "error_class"],
         )
-        .map_err(|e| format!("failed to create sync_total metric: {e}"))?;
-        let heartbeat_total = IntCounterVec::new(
+        .map_err(|e| format!("failed to create reconcile_total metric: {e}"))?;
+        let runtime_health_total = IntCounterVec::new(
             Opts::new(
-                "classic_agent_heartbeat_total",
-                "Total heartbeat attempts by status",
+                "classic_agent_runtime_health_total",
+                "Total runtime health report attempts by status",
             ),
             &["node", "revision", "status", "error_class"],
         )
-        .map_err(|e| format!("failed to create heartbeat_total metric: {e}"))?;
+        .map_err(|e| format!("failed to create runtime_health_total metric: {e}"))?;
+        let tt_link_generation_total = IntCounterVec::new(
+            Opts::new(
+                "classic_agent_tt_link_generation_total",
+                "Total TT-link generation events by status",
+            ),
+            &["node", "revision", "status", "error_class"],
+        )
+        .map_err(|e| format!("failed to create tt_link_generation_total metric: {e}"))?;
         let apply_total = IntCounterVec::new(
             Opts::new("classic_agent_apply_total", "Total apply attempts by status"),
             &["node", "revision", "status", "error_class"],
         )
         .map_err(|e| format!("failed to create apply_total metric: {e}"))?;
-        let last_successful_sync = IntGaugeVec::new(
+        let last_successful_reconcile = IntGaugeVec::new(
             Opts::new(
-                "classic_agent_last_successful_sync_timestamp_seconds",
-                "Unix timestamp of the latest successful sync",
+                "classic_agent_last_successful_reconcile_timestamp_seconds",
+                "Unix timestamp of the latest successful reconcile",
             ),
             &["node"],
         )
-        .map_err(|e| format!("failed to create last_successful_sync metric: {e}"))?;
-        let last_failed_sync = IntGaugeVec::new(
+        .map_err(|e| format!("failed to create last_successful_reconcile metric: {e}"))?;
+        let last_failed_reconcile = IntGaugeVec::new(
             Opts::new(
-                "classic_agent_last_failed_sync_timestamp_seconds",
-                "Unix timestamp of the latest failed sync",
+                "classic_agent_last_failed_reconcile_timestamp_seconds",
+                "Unix timestamp of the latest failed reconcile",
             ),
             &["node"],
         )
-        .map_err(|e| format!("failed to create last_failed_sync metric: {e}"))?;
+        .map_err(|e| format!("failed to create last_failed_reconcile metric: {e}"))?;
         let apply_duration_ms = IntGaugeVec::new(
             Opts::new(
                 "classic_agent_apply_duration_milliseconds",
@@ -1215,14 +1279,14 @@ impl AgentMetrics {
             &["node"],
         )
         .map_err(|e| format!("failed to create credentials_count metric: {e}"))?;
-        let heartbeat_status = IntGaugeVec::new(
+        let runtime_health_status = IntGaugeVec::new(
             Opts::new(
-                "classic_agent_heartbeat_status",
-                "Current heartbeat status, 1 for success and 0 for failure",
+                "classic_agent_runtime_health_status",
+                "Current runtime health report status, 1 for success and 0 for failure",
             ),
             &["node"],
         )
-        .map_err(|e| format!("failed to create heartbeat_status metric: {e}"))?;
+        .map_err(|e| format!("failed to create runtime_health_status metric: {e}"))?;
         let endpoint_process_status = IntGaugeVec::new(
             Opts::new(
                 "classic_agent_endpoint_process_status",
@@ -1233,20 +1297,23 @@ impl AgentMetrics {
         .map_err(|e| format!("failed to create endpoint_process_status metric: {e}"))?;
 
         registry
-            .register(Box::new(sync_total.clone()))
-            .map_err(|e| format!("failed to register sync_total metric: {e}"))?;
+            .register(Box::new(reconcile_total.clone()))
+            .map_err(|e| format!("failed to register reconcile_total metric: {e}"))?;
         registry
-            .register(Box::new(heartbeat_total.clone()))
-            .map_err(|e| format!("failed to register heartbeat_total metric: {e}"))?;
+            .register(Box::new(runtime_health_total.clone()))
+            .map_err(|e| format!("failed to register runtime_health_total metric: {e}"))?;
+        registry
+            .register(Box::new(tt_link_generation_total.clone()))
+            .map_err(|e| format!("failed to register tt_link_generation_total metric: {e}"))?;
         registry
             .register(Box::new(apply_total.clone()))
             .map_err(|e| format!("failed to register apply_total metric: {e}"))?;
         registry
-            .register(Box::new(last_successful_sync.clone()))
-            .map_err(|e| format!("failed to register last_successful_sync metric: {e}"))?;
+            .register(Box::new(last_successful_reconcile.clone()))
+            .map_err(|e| format!("failed to register last_successful_reconcile metric: {e}"))?;
         registry
-            .register(Box::new(last_failed_sync.clone()))
-            .map_err(|e| format!("failed to register last_failed_sync metric: {e}"))?;
+            .register(Box::new(last_failed_reconcile.clone()))
+            .map_err(|e| format!("failed to register last_failed_reconcile metric: {e}"))?;
         registry
             .register(Box::new(apply_duration_ms.clone()))
             .map_err(|e| format!("failed to register apply_duration metric: {e}"))?;
@@ -1254,30 +1321,31 @@ impl AgentMetrics {
             .register(Box::new(credentials_count.clone()))
             .map_err(|e| format!("failed to register credentials_count metric: {e}"))?;
         registry
-            .register(Box::new(heartbeat_status.clone()))
-            .map_err(|e| format!("failed to register heartbeat_status metric: {e}"))?;
+            .register(Box::new(runtime_health_status.clone()))
+            .map_err(|e| format!("failed to register runtime_health_status metric: {e}"))?;
         registry
             .register(Box::new(endpoint_process_status.clone()))
             .map_err(|e| format!("failed to register endpoint_process_status metric: {e}"))?;
 
         let labels = &[node];
-        last_successful_sync.with_label_values(labels).set(0);
-        last_failed_sync.with_label_values(labels).set(0);
+        last_successful_reconcile.with_label_values(labels).set(0);
+        last_failed_reconcile.with_label_values(labels).set(0);
         apply_duration_ms.with_label_values(labels).set(0);
         credentials_count.with_label_values(labels).set(0);
-        heartbeat_status.with_label_values(labels).set(0);
+        runtime_health_status.with_label_values(labels).set(0);
         endpoint_process_status.with_label_values(labels).set(0);
 
         Ok(Self {
             registry,
-            sync_total,
-            heartbeat_total,
+            reconcile_total,
+            tt_link_generation_total,
+            runtime_health_total,
             apply_total,
-            last_successful_sync,
-            last_failed_sync,
+            last_successful_reconcile,
+            last_failed_reconcile,
             apply_duration_ms,
             credentials_count,
-            heartbeat_status,
+            runtime_health_status,
             endpoint_process_status,
         })
     }
@@ -1974,7 +2042,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 fn log_sync_skip(snapshot: &SyncPayload, reason: &str) {
     println!(
-        "sync skip: reason={} version={} checksum={} onboarding_state={} sync_required={}",
+        "reconcile skip: reason={} version={} checksum={} onboarding_state={} sync_required={}",
         reason,
         snapshot.version,
         snapshot.checksum,
@@ -2233,6 +2301,7 @@ message_queue_capacity = 4096
 
         let cfg = Config {
             lk_base_url: base_url.to_string(),
+            runtime_mode: RuntimeMode::DbWorker,
             lk_service_token: "token".to_string(),
             node_external_id: "node-1".to_string(),
             node_hostname: "node-1.example".to_string(),
@@ -2248,11 +2317,8 @@ message_queue_capacity = 4096
             runtime_primary_marker_path: runtime_dir.join(RUNTIME_PRIMARY_MARKER_FILE),
             agent_state_path: runtime_dir.join("agent_state.json"),
             poll_interval: Duration::from_secs(60),
-            heartbeat_interval: Duration::from_secs(60),
             sync_path_template: "/sync/{externalNodeId}".to_string(),
             sync_report_path: "/sync-report".to_string(),
-            heartbeat_path: "/heartbeat".to_string(),
-            register_path: "/register".to_string(),
             apply_cmd: apply_cmd.map(ToString::to_string),
             runtime_pid_path: runtime_dir.join("trusttunnel.pid"),
             runtime_process_name: "trusttunnel_endpoint".to_string(),
@@ -2334,6 +2400,7 @@ message_queue_capacity = 4096
         };
         let cfg = Config {
             lk_base_url: "http://localhost".to_string(),
+            runtime_mode: RuntimeMode::DbWorker,
             lk_service_token: "token".to_string(),
             node_external_id: "node-1".to_string(),
             node_hostname: "node-1.example".to_string(),
@@ -2349,11 +2416,8 @@ message_queue_capacity = 4096
             runtime_primary_marker_path: PathBuf::from(".runtime_primary_marker"),
             agent_state_path: PathBuf::from("agent_state.json"),
             poll_interval: Duration::from_secs(10),
-            heartbeat_interval: Duration::from_secs(10),
             sync_path_template: "/sync/{externalNodeId}".to_string(),
             sync_report_path: "/sync-report".to_string(),
-            heartbeat_path: "/heartbeat".to_string(),
-            register_path: "/register".to_string(),
             apply_cmd: None,
             runtime_pid_path: PathBuf::from("trusttunnel.pid"),
             runtime_process_name: "trusttunnel_endpoint".to_string(),
@@ -2499,19 +2563,19 @@ message_queue_capacity = 4096
 
         assert!(!names.is_empty());
         assert!(names.contains(
-            &"classic_agent_last_successful_sync_timestamp_seconds".to_string()
+            &"classic_agent_last_successful_reconcile_timestamp_seconds".to_string()
         ));
         assert!(names.contains(
-            &"classic_agent_last_failed_sync_timestamp_seconds".to_string()
+            &"classic_agent_last_failed_reconcile_timestamp_seconds".to_string()
         ));
         assert!(names.contains(&"classic_agent_apply_duration_milliseconds".to_string()));
         assert!(names.contains(&"classic_agent_credentials_count".to_string()));
-        assert!(names.contains(&"classic_agent_heartbeat_status".to_string()));
+        assert!(names.contains(&"classic_agent_runtime_health_status".to_string()));
         assert!(names.contains(&"classic_agent_endpoint_process_status".to_string()));
     }
 
     #[tokio::test]
-    async fn sync_once_valid_config_applies_and_reports_success() {
+    async fn reconcile_once_valid_config_applies_and_reports_success() {
         let server = MockHttpServer::start().await;
         let tmp_dir = TempDir::new().unwrap();
         let mut agent = make_agent(&tmp_dir, &server.base_url, Some("true")).await;
@@ -2542,7 +2606,7 @@ message_queue_capacity = 4096
             .enqueue(Method::POST, "/sync-report", HyperStatusCode::OK, "")
             .await;
 
-        agent.sync_once().await.unwrap();
+        agent.reconcile_once().await.unwrap();
         let creds = fs::read_to_string(&agent.cfg.runtime_credentials_path)
             .await
             .unwrap();
@@ -2560,7 +2624,7 @@ message_queue_capacity = 4096
     }
 
     #[tokio::test]
-    async fn sync_once_onboarding_not_active_skips_apply() {
+    async fn reconcile_once_onboarding_not_active_skips_apply() {
         let server = MockHttpServer::start().await;
         let tmp_dir = TempDir::new().unwrap();
         let mut agent = make_agent(&tmp_dir, &server.base_url, Some("true")).await;
@@ -2572,7 +2636,7 @@ message_queue_capacity = 4096
             .enqueue(Method::POST, "/sync-report", HyperStatusCode::OK, "")
             .await;
 
-        agent.sync_once().await.unwrap();
+        agent.reconcile_once().await.unwrap();
         assert_eq!(agent.last_apply_status, "skipped");
         let requests = server.captured().await;
         let report = requests
@@ -2583,7 +2647,7 @@ message_queue_capacity = 4096
     }
 
     #[tokio::test]
-    async fn sync_once_sync_required_false_skips_apply() {
+    async fn reconcile_once_sync_required_false_skips_apply() {
         let server = MockHttpServer::start().await;
         let tmp_dir = TempDir::new().unwrap();
         let mut agent = make_agent(&tmp_dir, &server.base_url, Some("true")).await;
@@ -2595,7 +2659,7 @@ message_queue_capacity = 4096
             .enqueue(Method::POST, "/sync-report", HyperStatusCode::OK, "")
             .await;
 
-        agent.sync_once().await.unwrap();
+        agent.reconcile_once().await.unwrap();
         assert_eq!(agent.last_apply_status, "skipped");
         let requests = server.captured().await;
         let report = requests
@@ -2606,7 +2670,7 @@ message_queue_capacity = 4096
     }
 
     #[tokio::test]
-    async fn sync_once_apply_failure_rolls_back_runtime_credentials() {
+    async fn reconcile_once_apply_failure_rolls_back_runtime_credentials() {
         let server = MockHttpServer::start().await;
         let tmp_dir = TempDir::new().unwrap();
         let mut agent = make_agent(&tmp_dir, &server.base_url, Some("false")).await;
@@ -2633,7 +2697,7 @@ message_queue_capacity = 4096
             .enqueue(Method::POST, "/sync-report", HyperStatusCode::OK, "")
             .await;
 
-        let err = agent.sync_once().await.unwrap_err();
+        let err = agent.reconcile_once().await.unwrap_err();
         assert!(err.contains("rollback"));
         let creds = fs::read(&agent.cfg.runtime_credentials_path).await.unwrap();
         assert_eq!(creds, original);
@@ -2674,7 +2738,7 @@ message_queue_capacity = 4096
             )
             .await;
 
-        let _ = agent.sync_once().await.unwrap_err();
+        let _ = agent.reconcile_once().await.unwrap_err();
         assert!(fs::try_exists(&agent.cfg.pending_sync_reports_path).await.unwrap());
         let queued = load_pending_sync_reports(&agent.cfg.pending_sync_reports_path)
             .await
@@ -2861,8 +2925,8 @@ message_queue_capacity = 4096
             .enqueue(Method::POST, "/sync-report", HyperStatusCode::OK, "")
             .await;
 
-        assert!(agent.sync_once().await.is_err());
-        assert!(agent.sync_once().await.is_ok());
+        assert!(agent.reconcile_once().await.is_err());
+        assert!(agent.reconcile_once().await.is_ok());
     }
 
     #[tokio::test]
@@ -2874,7 +2938,7 @@ message_queue_capacity = 4096
             .enqueue(Method::GET, "/sync/node-1", HyperStatusCode::CONFLICT, "onboarding_not_ready")
             .await;
 
-        assert!(agent.sync_once().await.is_ok());
+        assert!(agent.reconcile_once().await.is_ok());
         let requests = server.captured().await;
         let sync_report_count = requests
             .iter()

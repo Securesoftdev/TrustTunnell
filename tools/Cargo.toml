@@ -4,6 +4,10 @@ version = "0.1.0"
 authors = ["Sergei Gunchenko <s.gunchenko@adguard.com>"]
 edition = "2021"
 
+[features]
+default = []
+legacy-lk-http = []
+
 [[bin]]
 name = "setup_wizard"
 path = "setup_wizard/main.rs"
