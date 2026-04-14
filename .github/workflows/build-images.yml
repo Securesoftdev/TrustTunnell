@@ -43,6 +43,19 @@ jobs:
               - 'lib/**'
               - 'deeplink/**'
               - 'macros/**'
+              - 'tools/setup_wizard/**'
+              - 'tools/Cargo.toml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.github/workflows/build-images.yml'
+            classic_agent_image:
+              - 'Dockerfile'
+              - 'tools/classic_agent/**'
+              - 'tools/Cargo.toml'
+              - 'lib/**'
+              - 'deeplink/**'
+              - 'macros/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
@@ -103,6 +116,7 @@ jobs:
         run: echo "No endpoint-related changes detected; skipping trusttunnel-endpoint image build/publish."
 
       - name: Extract classic agent image metadata
+        if: steps.changed.outputs.classic_agent_image == 'true'
         id: classic-meta
         uses: docker/metadata-action@v5
         with:
@@ -112,6 +126,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build classic agent image
+        if: steps.changed.outputs.classic_agent_image == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -119,3 +134,7 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.classic-meta.outputs.tags }}
           labels: ${{ steps.classic-meta.outputs.labels }}
+
+      - name: Classic agent image build skipped
+        if: steps.changed.outputs.classic_agent_image != 'true'
+        run: echo "No classic-agent-related changes detected; skipping trusttunnel-classic-agent image build/publish."

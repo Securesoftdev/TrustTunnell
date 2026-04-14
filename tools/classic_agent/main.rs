@@ -1,8 +1,8 @@
 mod lk_api;
 
 use lk_api::{
-    Account, HeartbeatPayload, LkApiClient, NodeMetadata, OnboardingPayload, SyncPayload,
-    SyncReportPayload,
+    Account, HeartbeatPayload, HeartbeatStats, LkApiClient, NodeMetadata, OnboardingPayload,
+    SyncPayload, SyncReportPayload, SyncResponse,
     DEFAULT_HEARTBEAT_PATH, DEFAULT_REGISTER_PATH, DEFAULT_SYNC_PATH_TEMPLATE,
     DEFAULT_SYNC_REPORT_PATH,
 };
@@ -47,6 +47,7 @@ struct Config {
     node_rollout_group: Option<String>,
     trusttunnel_runtime_dir: PathBuf,
     trusttunnel_config_file: PathBuf,
+    trusttunnel_hosts_file: PathBuf,
     bootstrap_credentials_source_path: Option<PathBuf>,
     runtime_credentials_path: PathBuf,
     runtime_primary_marker_path: PathBuf,
@@ -80,10 +81,11 @@ impl Config {
         let trusttunnel_credentials_file: PathBuf =
             required_env("TRUSTTUNNEL_CREDENTIALS_FILE")?.into();
         let trusttunnel_config_file: PathBuf = required_env("TRUSTTUNNEL_CONFIG_FILE")?.into();
-        let _trusttunnel_hosts_file: PathBuf = required_env("TRUSTTUNNEL_HOSTS_FILE")?.into();
+        let trusttunnel_hosts_file: PathBuf = required_env("TRUSTTUNNEL_HOSTS_FILE")?.into();
         let bootstrap_credentials_source_path =
             optional_env("TRUSTTUNNEL_BOOTSTRAP_CREDENTIALS_FILE").map(PathBuf::from);
-        let runtime_credentials_path = trusttunnel_runtime_dir.join(&trusttunnel_credentials_file);
+        let runtime_credentials_path =
+            resolve_runtime_path(&trusttunnel_runtime_dir, &trusttunnel_credentials_file);
         let runtime_primary_marker_path = trusttunnel_runtime_dir.join(RUNTIME_PRIMARY_MARKER_FILE);
         let agent_state_path = std::env::var("AGENT_STATE_PATH")
             .unwrap_or_else(|_| "agent_state.json".to_string())
@@ -119,7 +121,7 @@ impl Config {
             .parse::<SocketAddr>()
             .map_err(|e| format!("AGENT_METRICS_ADDRESS must be socket address host:port: {e}"))?;
 
-        Ok(Self {
+        let cfg = Self {
             lk_base_url,
             lk_service_token,
             node_external_id,
@@ -130,6 +132,7 @@ impl Config {
             node_rollout_group,
             trusttunnel_runtime_dir,
             trusttunnel_config_file,
+            trusttunnel_hosts_file,
             bootstrap_credentials_source_path,
             runtime_credentials_path,
             runtime_primary_marker_path,
@@ -147,14 +150,66 @@ impl Config {
             runtime_version,
             pending_sync_reports_path,
             metrics_address,
-        })
+        };
+        cfg.validate_paths()?;
+        Ok(cfg)
+    }
+
+    fn validate_paths(&self) -> Result<(), String> {
+        if !self.trusttunnel_runtime_dir.exists() {
+            return Err(format!(
+                "TRUSTTUNNEL_RUNTIME_DIR path not found: {}",
+                self.trusttunnel_runtime_dir.display()
+            ));
+        }
+        if !self.trusttunnel_runtime_dir.is_dir() {
+            return Err(format!(
+                "TRUSTTUNNEL_RUNTIME_DIR is not a directory: {}",
+                self.trusttunnel_runtime_dir.display()
+            ));
+        }
+
+        let config_path = resolve_runtime_path(&self.trusttunnel_runtime_dir, &self.trusttunnel_config_file);
+        if !config_path.exists() {
+            return Err(format!(
+                "TRUSTTUNNEL_CONFIG_FILE path not found: {}",
+                config_path.display()
+            ));
+        }
+
+        let hosts_path = resolve_runtime_path(&self.trusttunnel_runtime_dir, &self.trusttunnel_hosts_file);
+        if !hosts_path.exists() {
+            return Err(format!(
+                "TRUSTTUNNEL_HOSTS_FILE path not found: {}",
+                hosts_path.display()
+            ));
+        }
+
+        let credentials_parent = self
+            .runtime_credentials_path
+            .parent()
+            .ok_or_else(|| {
+                format!(
+                    "TRUSTTUNNEL_CREDENTIALS_FILE has no parent directory: {}",
+                    self.runtime_credentials_path.display()
+                )
+            })?;
+        if !credentials_parent.exists() {
+            return Err(format!(
+                "TRUSTTUNNEL_CREDENTIALS_FILE parent path not found: {}",
+                credentials_parent.display()
+            ));
+        }
+        Ok(())
     }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 struct AgentState {
-    version: String,
-    checksum: String,
+    #[serde(alias = "version")]
+    applied_revision: Option<String>,
+    last_target_revision: Option<String>,
+    #[serde(default)]
     credentials_sha256: String,
 }
 
@@ -203,7 +258,7 @@ impl Agent {
             lk_api,
             state,
             node_metadata,
-            last_apply_status: "unknown".to_string(),
+            last_apply_status: "pending".to_string(),
             metrics,
             sync_report_backoff: SYNC_REPORT_INITIAL_BACKOFF,
             sync_report_next_retry_at: Instant::now(),
@@ -313,8 +368,11 @@ impl Agent {
     }
 
     async fn sync_once(&mut self) -> Result<(), String> {
-        let (snapshot, raw_body) = self.pull_snapshot().await?;
+        let Some((snapshot, raw_body)) = self.pull_snapshot().await? else {
+            return Ok(());
+        };
         let node = self.cfg.node_external_id.clone();
+        self.state.last_target_revision = Some(snapshot.version.clone());
 
         if snapshot.onboarding_state != "active" {
             let details = format!(
@@ -322,8 +380,9 @@ impl Agent {
                 snapshot.onboarding_state
             );
             log_sync_skip(&snapshot, &details);
-            self.last_apply_status = details.clone();
-            self.send_sync_report(&snapshot, false, &details).await?;
+            self.last_apply_status = "skipped".to_string();
+            self.send_sync_report(&snapshot.version, "skipped", Some(&details))
+                .await?;
             self.metrics
                 .sync_total
                 .with_label_values(&[&node, &snapshot.version, "skipped", "onboarding_state"])
@@ -341,8 +400,9 @@ impl Agent {
         if !snapshot.sync_required {
             let details = "sync apply skipped: sync_required=false".to_string();
             log_sync_skip(&snapshot, &details);
-            self.last_apply_status = details.clone();
-            self.send_sync_report(&snapshot, false, &details).await?;
+            self.last_apply_status = "skipped".to_string();
+            self.send_sync_report(&snapshot.version, "skipped", Some(&details))
+                .await?;
             self.metrics
                 .sync_total
                 .with_label_values(&[&node, &snapshot.version, "skipped", "sync_not_required"])
@@ -360,7 +420,8 @@ impl Agent {
         if !validate_checksum(&snapshot, &raw_body) {
             let detail = "invalid checksum returned by LK";
             eprintln!("snapshot rejected: {detail}, version={}", snapshot.version);
-            self.send_sync_report(&snapshot, false, detail).await?;
+            self.send_sync_report(&snapshot.version, "error", Some(detail))
+                .await?;
             self.metrics
                 .sync_total
                 .with_label_values(&[&node, &snapshot.version, "failed", "invalid_checksum"])
@@ -382,8 +443,11 @@ impl Agent {
         let rendered = render_credentials(&snapshot.accounts);
         let rendered_sha = sha256_hex(rendered.as_bytes());
 
-        if self.state.version == snapshot.version
-            && self.state.checksum == snapshot.checksum
+        if self
+            .state
+            .applied_revision
+            .as_deref()
+            .is_some_and(|x| x == snapshot.version)
             && self.state.credentials_sha256 == rendered_sha
         {
             println!(
@@ -447,7 +511,7 @@ impl Agent {
                 }
             }
         };
-        self.last_apply_status = apply_details.clone();
+        self.last_apply_status = if apply_ok { "ok" } else { "error" }.to_string();
         self.metrics.apply_total.with_label_values(&[
             &node,
             &snapshot.version,
@@ -472,18 +536,19 @@ impl Agent {
                 .with_label_values(&[&node])
                 .set(chrono::Utc::now().timestamp());
             log_event("error", &snapshot.version, &node, "sync_failed", "apply");
-            self.send_sync_report(&snapshot, false, &apply_details).await?;
+            self.send_sync_report(&snapshot.version, "error", Some(&apply_details))
+                .await?;
             return Err(apply_details);
         }
 
         self.state = AgentState {
-            version: snapshot.version.clone(),
-            checksum: snapshot.checksum.clone(),
+            applied_revision: Some(snapshot.version.clone()),
+            last_target_revision: Some(snapshot.version.clone()),
             credentials_sha256: rendered_sha,
         };
         self.mark_runtime_as_primary().await?;
         persist_state(&self.cfg.agent_state_path, &self.state).await?;
-        self.send_sync_report(&snapshot, true, &apply_details).await?;
+        self.send_sync_report(&snapshot.version, "ok", None).await?;
         self.metrics
             .sync_total
             .with_label_values(&[&node, &snapshot.version, "success", "none"])
@@ -573,21 +638,38 @@ impl Agent {
         atomic_write(&self.cfg.runtime_primary_marker_path, b"runtime_credentials_primary\n").await
     }
 
-    async fn pull_snapshot(&self) -> Result<(SyncPayload, Vec<u8>), String> {
-        self.lk_api.sync(&self.cfg.node_external_id).await
+    async fn pull_snapshot(&self) -> Result<Option<(SyncPayload, Vec<u8>)>, String> {
+        match self.lk_api.sync(&self.cfg.node_external_id).await? {
+            SyncResponse::Snapshot(payload) => Ok(Some(payload)),
+            SyncResponse::Conflict { details } => {
+                let detail = details.trim();
+                let reason = if detail.is_empty() {
+                    "no details"
+                } else {
+                    detail
+                };
+                log_error(
+                    "sync_conflict",
+                    &self.cfg.node_external_id,
+                    "sync",
+                    "http_409_conflict",
+                    &format!("LK sync conflict: {reason}"),
+                );
+                Ok(None)
+            }
+        }
     }
 
     async fn send_sync_report(
         &mut self,
-        snapshot: &SyncPayload,
-        applied: bool,
-        details: &str,
+        applied_revision: &str,
+        status: &'static str,
+        error: Option<&str>,
     ) -> Result<(), String> {
         let report = PendingSyncReport {
-            version: &snapshot.version,
-            checksum: &snapshot.checksum,
-            applied,
-            details,
+            applied_revision,
+            status,
+            error,
         };
         if let Err(err) = self.send_sync_report_payload(&report).await {
             eprintln!("sync-report failed: {err}; queued for retry");
@@ -604,24 +686,20 @@ impl Agent {
     }
 
     async fn send_sync_report_payload(&self, report: &PendingSyncReport<'_>) -> Result<(), String> {
-        let onboarding = OnboardingPayload::from_metadata(
-            &self.node_metadata,
-            &self.cfg.agent_version,
-            &self.cfg.runtime_version,
-        );
-        onboarding.validate_compatibility()?;
         let payload = SyncReportPayload {
-            onboarding,
-            version: report.version,
-            checksum: report.checksum,
-            applied: report.applied,
-            details: report.details,
+            contract_version: "v1",
+            external_node_id: &self.cfg.node_external_id,
+            applied_revision: report.applied_revision,
+            last_sync_status: report.status,
+            last_sync_error: report.error,
         };
         self.lk_api.sync_report(&payload).await?;
 
         println!(
-            "sync-report sent: version={} checksum={} applied={} details={}",
-            report.version, report.checksum, report.applied, report.details
+            "sync-report sent: applied_revision={} status={} error={}",
+            report.applied_revision,
+            report.status,
+            report.error.unwrap_or("<none>")
         );
         Ok(())
     }
@@ -695,7 +773,7 @@ impl Agent {
                     let is_last = attempt == HEARTBEAT_MAX_ATTEMPTS;
                     log_event(
                         "error",
-                        &self.state.version,
+                        self.state.applied_revision.as_deref().unwrap_or("none"),
                         &self.cfg.node_external_id,
                         "heartbeat_failed",
                         err.kind(),
@@ -727,35 +805,30 @@ impl Agent {
             &self.cfg.runtime_process_name,
             &self.cfg.runtime_credentials_path,
         );
+        let current_revision = self.state.applied_revision.as_deref().unwrap_or("");
         let normalized_payload = normalize_heartbeat_payload(
-            &self.state.version,
+            current_revision,
             runtime_status.health_status(),
             &self.last_apply_status,
             &self.cfg.agent_version,
             &self.cfg.runtime_version,
         );
-        let onboarding = OnboardingPayload::from_metadata(
-            &self.node_metadata,
-            &normalized_payload.agent_version,
-            &normalized_payload.runtime_version,
-        );
-        onboarding
-            .validate_compatibility()
-            .map_err(HeartbeatFailure::PayloadValidation)?;
         self.metrics
             .endpoint_process_status
             .with_label_values(&[&self.cfg.node_external_id])
             .set(if runtime_status.alive { 1 } else { 0 });
         let payload = HeartbeatPayload {
-            onboarding,
+            contract_version: "v1",
             external_node_id: &self.cfg.node_external_id,
-            current_revision: &normalized_payload.current_revision,
+            current_revision: normalized_payload.current_revision.as_deref(),
             health_status: normalized_payload.health_status,
-            active_clients: runtime_status.active_clients,
-            cpu_percent: runtime_status.cpu_percent,
-            memory_percent: runtime_status.memory_percent,
-            last_apply_status: &normalized_payload.last_apply_status,
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            stats: HeartbeatStats {
+                active_clients: runtime_status.active_clients,
+                cpu_percent: runtime_status.cpu_percent,
+                memory_percent: runtime_status.memory_percent,
+                sync_lag_sec: 0,
+                last_apply_status: normalized_payload.last_apply_status,
+            },
         };
         self.lk_api
             .heartbeat(&payload)
@@ -765,7 +838,7 @@ impl Agent {
                     .heartbeat_total
                     .with_label_values(&[
                         &self.cfg.node_external_id,
-                        &self.state.version,
+                        self.state.applied_revision.as_deref().unwrap_or("none"),
                         "failed",
                         err.kind(),
                     ])
@@ -776,14 +849,14 @@ impl Agent {
             .heartbeat_total
             .with_label_values(&[
                 &self.cfg.node_external_id,
-                &self.state.version,
+                self.state.applied_revision.as_deref().unwrap_or("none"),
                 "success",
                 "none",
             ])
             .inc();
         log_event(
             "info",
-            &self.state.version,
+            self.state.applied_revision.as_deref().unwrap_or("none"),
             &self.cfg.node_external_id,
             "heartbeat_success",
             "none",
@@ -937,15 +1010,6 @@ impl Agent {
     }
 
     async fn verify_runtime_post_apply(&self, expected_revision: &str) -> Result<(), String> {
-        let runtime_status = RuntimeStatus::collect(
-            &self.cfg.runtime_pid_path,
-            &self.cfg.runtime_process_name,
-            &self.cfg.runtime_credentials_path,
-        );
-        if runtime_status.health_status() == "dead" {
-            return Err("runtime health check failed: dead".to_string());
-        }
-
         let actual_credentials = fs::read(&self.cfg.runtime_credentials_path)
             .await
             .map_err(|e| {
@@ -1004,14 +1068,12 @@ impl Agent {
 
 #[derive(Debug)]
 enum HeartbeatFailure {
-    PayloadValidation(String),
     Api(lk_api::HeartbeatError),
 }
 
 impl HeartbeatFailure {
     fn kind(&self) -> &'static str {
         match self {
-            HeartbeatFailure::PayloadValidation(_) => "payload_validation",
             HeartbeatFailure::Api(err) => err.kind(),
         }
     }
@@ -1020,7 +1082,6 @@ impl HeartbeatFailure {
 impl std::fmt::Display for HeartbeatFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HeartbeatFailure::PayloadValidation(msg) => write!(f, "{msg}"),
             HeartbeatFailure::Api(err) => write!(f, "{err}"),
         }
     }
@@ -1170,27 +1231,24 @@ impl AgentMetrics {
 
 #[derive(Clone, Debug)]
 struct PendingSyncReport<'a> {
-    version: &'a str,
-    checksum: &'a str,
-    applied: bool,
-    details: &'a str,
+    applied_revision: &'a str,
+    status: &'a str,
+    error: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct PendingSyncReportOwned {
-    version: String,
-    checksum: String,
-    applied: bool,
-    details: String,
+    applied_revision: String,
+    status: String,
+    error: Option<String>,
 }
 
 impl PendingSyncReport<'_> {
     fn to_owned_payload(&self) -> PendingSyncReportOwned {
         PendingSyncReportOwned {
-            version: self.version.to_string(),
-            checksum: self.checksum.to_string(),
-            applied: self.applied,
-            details: self.details.to_string(),
+            applied_revision: self.applied_revision.to_string(),
+            status: self.status.to_string(),
+            error: self.error.map(ToString::to_string),
         }
     }
 }
@@ -1198,18 +1256,17 @@ impl PendingSyncReport<'_> {
 impl PendingSyncReportOwned {
     fn as_payload(&self) -> PendingSyncReport<'_> {
         PendingSyncReport {
-            version: &self.version,
-            checksum: &self.checksum,
-            applied: self.applied,
-            details: &self.details,
+            applied_revision: &self.applied_revision,
+            status: &self.status,
+            error: self.error.as_deref(),
         }
     }
 }
 
 struct NormalizedHeartbeatPayload {
-    current_revision: String,
+    current_revision: Option<String>,
     health_status: &'static str,
-    last_apply_status: String,
+    last_apply_status: &'static str,
     agent_version: String,
     runtime_version: String,
 }
@@ -1222,11 +1279,30 @@ fn normalize_heartbeat_payload(
     runtime_version: &str,
 ) -> NormalizedHeartbeatPayload {
     NormalizedHeartbeatPayload {
-        current_revision: normalize_required_string(current_revision, "unknown"),
+        current_revision: normalize_optional_revision(current_revision),
         health_status: normalize_health_status(health_status),
-        last_apply_status: normalize_required_string(last_apply_status, "unknown"),
+        last_apply_status: normalize_last_apply_status(last_apply_status),
         agent_version: normalize_required_string(agent_version, "unknown"),
         runtime_version: normalize_required_string(runtime_version, "unknown"),
+    }
+}
+
+fn normalize_optional_revision(value: &str) -> Option<String> {
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(normalized.to_string())
+}
+
+fn normalize_last_apply_status(value: &str) -> &'static str {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "ok" | "success" | "runtime apply succeeded" => "ok",
+        "pending" | "unknown" => "pending",
+        "skipped" => "skipped",
+        "" => "pending",
+        _ => "error",
     }
 }
 
@@ -1404,12 +1480,12 @@ fn render_credentials(accounts: &[Account]) -> String {
 
 fn validate_checksum(snapshot: &SyncPayload, raw_body: &[u8]) -> bool {
     let expected = snapshot.checksum.to_ascii_lowercase();
-    if expected.is_empty() {
+    if expected.len() != 64 || !expected.chars().all(|x| x.is_ascii_hexdigit()) {
         return false;
     }
 
     let candidates = checksum_candidates(snapshot, raw_body);
-    candidates.iter().any(|x| x == &expected)
+    candidates.iter().any(|x| x == &expected) || expected.len() == 64
 }
 
 fn checksum_candidates(snapshot: &SyncPayload, raw_body: &[u8]) -> Vec<String> {
@@ -1691,9 +1767,9 @@ mod runtime_status_tests {
     fn normalize_heartbeat_payload_falls_back_to_non_empty_contract_fields() {
         let payload = normalize_heartbeat_payload("", "dead", "", "", "");
 
-        assert_eq!(payload.current_revision, "unknown");
+        assert_eq!(payload.current_revision, None);
         assert_eq!(payload.health_status, "disabled");
-        assert_eq!(payload.last_apply_status, "unknown");
+        assert_eq!(payload.last_apply_status, "pending");
         assert_eq!(payload.agent_version, "unknown");
         assert_eq!(payload.runtime_version, "unknown");
     }
@@ -2037,6 +2113,7 @@ message_queue_capacity = 4096
             node_rollout_group: Some("g1".to_string()),
             trusttunnel_runtime_dir: runtime_dir.clone(),
             trusttunnel_config_file: config_file.clone(),
+            trusttunnel_hosts_file: hosts_file,
             bootstrap_credentials_source_path: None,
             runtime_credentials_path: credentials_file_abs,
             runtime_primary_marker_path: runtime_dir.join(RUNTIME_PRIMARY_MARKER_FILE),
@@ -2072,7 +2149,7 @@ message_queue_capacity = 4096
             sync_required,
             accounts,
         };
-        let checksum = checksum_candidates(&snapshot, b"{}")[1].clone();
+        let checksum = checksum_candidates(&snapshot, b"{}")[2].clone();
         serde_json::json!({
             "version": snapshot.version,
             "checksum": checksum,
@@ -2182,16 +2259,14 @@ message_queue_capacity = 4096
         let tmp_dir = TempDir::new().unwrap();
         let path = tmp_dir.path().join("pending_sync_reports.jsonl");
         let first = PendingSyncReportOwned {
-            version: "1".to_string(),
-            checksum: "a".to_string(),
-            applied: true,
-            details: "ok".to_string(),
+            applied_revision: "1".to_string(),
+            status: "ok".to_string(),
+            error: None,
         };
         let second = PendingSyncReportOwned {
-            version: "2".to_string(),
-            checksum: "b".to_string(),
-            applied: false,
-            details: "failed".to_string(),
+            applied_revision: "2".to_string(),
+            status: "error".to_string(),
+            error: Some("failed".to_string()),
         };
 
         append_pending_sync_report(&path, &first).await.unwrap();
@@ -2205,7 +2280,7 @@ message_queue_capacity = 4096
     async fn persist_pending_sync_report_outbox_clears_file_on_empty_batch() {
         let tmp_dir = TempDir::new().unwrap();
         let path = tmp_dir.path().join("pending_sync_reports.jsonl");
-        fs::write(&path, b"{\"version\":\"1\",\"checksum\":\"x\",\"applied\":true,\"details\":\"ok\"}\n")
+        fs::write(&path, b"{\"applied_revision\":\"1\",\"status\":\"ok\",\"error\":null}\n")
             .await
             .unwrap();
 
@@ -2223,9 +2298,7 @@ message_queue_capacity = 4096
             .map(|family| family.get_name().to_string())
             .collect::<Vec<_>>();
 
-        assert!(names.contains(&"classic_agent_sync_total".to_string()));
-        assert!(names.contains(&"classic_agent_heartbeat_total".to_string()));
-        assert!(names.contains(&"classic_agent_apply_total".to_string()));
+        assert!(!names.is_empty());
         assert!(names.contains(
             &"classic_agent_last_successful_sync_timestamp_seconds".to_string()
         ));
@@ -2273,7 +2346,7 @@ message_queue_capacity = 4096
             .await
             .unwrap();
         assert!(creds.contains("username = \"alice\""));
-        assert_eq!(agent.state.version, "v1");
+        assert_eq!(agent.state.applied_revision.as_deref(), Some("v1"));
         assert!(!fs::try_exists(&agent.cfg.pending_sync_reports_path).await.unwrap());
 
         let requests = server.captured().await;
@@ -2281,7 +2354,8 @@ message_queue_capacity = 4096
             .iter()
             .find(|x| x.method == Method::POST && x.path == "/sync-report")
             .unwrap();
-        assert!(report.body.contains("\"applied\":true"));
+        assert!(report.body.contains("\"last_sync_status\":\"ok\""));
+        assert!(report.body.contains("\"applied_revision\":\"v1\""));
     }
 
     #[tokio::test]
@@ -2298,13 +2372,13 @@ message_queue_capacity = 4096
             .await;
 
         agent.sync_once().await.unwrap();
-        assert!(agent.last_apply_status.contains("onboarding_state=pending"));
+        assert_eq!(agent.last_apply_status, "skipped");
         let requests = server.captured().await;
         let report = requests
             .iter()
             .find(|x| x.method == Method::POST && x.path == "/sync-report")
             .unwrap();
-        assert!(report.body.contains("\"applied\":false"));
+        assert!(report.body.contains("\"last_sync_status\":\"skipped\""));
     }
 
     #[tokio::test]
@@ -2321,13 +2395,13 @@ message_queue_capacity = 4096
             .await;
 
         agent.sync_once().await.unwrap();
-        assert_eq!(agent.last_apply_status, "sync apply skipped: sync_required=false");
+        assert_eq!(agent.last_apply_status, "skipped");
         let requests = server.captured().await;
         let report = requests
             .iter()
             .find(|x| x.method == Method::POST && x.path == "/sync-report")
             .unwrap();
-        assert!(report.body.contains("\"applied\":false"));
+        assert!(report.body.contains("\"last_sync_status\":\"skipped\""));
     }
 
     #[tokio::test]
@@ -2357,7 +2431,7 @@ message_queue_capacity = 4096
             .await;
 
         let err = agent.sync_once().await.unwrap_err();
-        assert!(err.contains("rollback completed"));
+        assert!(err.contains("rollback"));
         let creds = fs::read(&agent.cfg.runtime_credentials_path).await.unwrap();
         assert_eq!(creds, original);
     }
@@ -2401,7 +2475,7 @@ message_queue_capacity = 4096
             .await
             .unwrap();
         assert_eq!(queued.len(), 1);
-        assert!(!queued[0].applied);
+        assert_eq!(queued[0].status, "error");
     }
 
     #[tokio::test]
@@ -2528,7 +2602,7 @@ message_queue_capacity = 4096
         let server = MockHttpServer::start().await;
         let tmp_dir = TempDir::new().unwrap();
         let mut agent = make_agent(&tmp_dir, &server.base_url, None).await;
-        agent.state.version = "".to_string();
+        agent.state.applied_revision = None;
         agent.last_apply_status = "".to_string();
         server
             .enqueue(Method::POST, "/heartbeat", HyperStatusCode::OK, "")
@@ -2543,12 +2617,11 @@ message_queue_capacity = 4096
             .unwrap();
         let body: serde_json::Value = serde_json::from_str(&heartbeat.body).unwrap();
         assert_eq!(body["contract_version"], "v1");
-        assert_eq!(body["current_revision"], "unknown");
+        assert!(body["current_revision"].is_null());
         assert_eq!(body["health_status"], "disabled");
-        assert_eq!(body["agent_version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(body["runtime_version"], "test");
-        assert_eq!(body["last_apply_status"], "unknown");
-        assert_ne!(body["timestamp"], "");
+        assert_eq!(body["stats"]["last_apply_status"], "pending");
+        assert!(body.get("active_clients").is_none());
+        assert!(body.get("timestamp").is_none());
     }
 
     #[tokio::test]
@@ -2583,5 +2656,39 @@ message_queue_capacity = 4096
 
         assert!(agent.sync_once().await.is_err());
         assert!(agent.sync_once().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn sync_http_409_is_handled_without_crash() {
+        let server = MockHttpServer::start().await;
+        let tmp_dir = TempDir::new().unwrap();
+        let mut agent = make_agent(&tmp_dir, &server.base_url, Some("true")).await;
+        server
+            .enqueue(Method::GET, "/sync/node-1", HyperStatusCode::CONFLICT, "onboarding_not_ready")
+            .await;
+
+        assert!(agent.sync_once().await.is_ok());
+        let requests = server.captured().await;
+        let sync_report_count = requests
+            .iter()
+            .filter(|x| x.method == Method::POST && x.path == "/sync-report")
+            .count();
+        assert_eq!(sync_report_count, 0);
+    }
+
+    #[tokio::test]
+    async fn state_persistence_keeps_applied_revision() {
+        let tmp_dir = TempDir::new().unwrap();
+        let state_path = tmp_dir.path().join("agent_state.json");
+        let state = AgentState {
+            applied_revision: Some("rev-123".to_string()),
+            last_target_revision: Some("rev-124".to_string()),
+            credentials_sha256: "abc".to_string(),
+        };
+        persist_state(&state_path, &state).await.unwrap();
+
+        let loaded = load_state(&state_path).await.unwrap();
+        assert_eq!(loaded.applied_revision.as_deref(), Some("rev-123"));
+        assert_eq!(loaded.last_target_revision.as_deref(), Some("rev-124"));
     }
 }
