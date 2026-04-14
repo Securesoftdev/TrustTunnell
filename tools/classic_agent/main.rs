@@ -536,7 +536,8 @@ impl Agent {
             return Err(detail.to_string());
         }
 
-        let rendered = render_credentials(&snapshot.accounts);
+        let runtime_accounts = fetch_active_accounts_for_runtime(&snapshot.accounts);
+        let rendered = render_credentials(&runtime_accounts);
         let rendered_sha = sha256_hex(rendered.as_bytes());
 
         if self
@@ -563,12 +564,12 @@ impl Agent {
             snapshot.version,
             snapshot.checksum,
             snapshot.accounts.len(),
-            snapshot.accounts.iter().filter(|a| a.enabled).count()
+            runtime_accounts.len()
         );
         self.metrics
             .credentials_count
             .with_label_values(&[&node])
-            .set(snapshot.accounts.iter().filter(|a| a.enabled).count() as i64);
+            .set(runtime_accounts.len() as i64);
 
         let previous_runtime_credentials = fs::read(&self.cfg.runtime_credentials_path).await.ok();
         let tmp_credentials_path = self
@@ -1662,15 +1663,18 @@ async fn main() {
     agent.run().await;
 }
 
-fn render_credentials(accounts: &[Account]) -> String {
-    let mut enabled = accounts
+fn fetch_active_accounts_for_runtime(accounts: &[Account]) -> Vec<&Account> {
+    let mut active = accounts
         .iter()
-        .filter(|x| x.enabled)
-        .collect::<Vec<&Account>>();
-    enabled.sort_by(|a, b| a.username.cmp(&b.username));
+        .filter(|x| x.enabled && x.assigned && !x.free && !x.revoked && !x.frozen)
+        .collect::<Vec<_>>();
+    active.sort_by(|a, b| a.username.cmp(&b.username));
+    active
+}
 
+fn render_credentials(accounts: &[&Account]) -> String {
     let mut out = String::new();
-    for a in enabled {
+    for a in accounts {
         out.push_str("[[client]]\n");
         out.push_str(&format!("username = {:?}\n", a.username));
         out.push_str(&format!("password = {:?}\n\n", a.password));
@@ -2457,6 +2461,10 @@ message_queue_capacity = 4096
                 username: "b".to_string(),
                 password: "p2".to_string(),
                 enabled: false,
+                assigned: true,
+                free: false,
+                revoked: false,
+                frozen: false,
                 external_account_id: None,
                 access_bundle_id: None,
                 tt_link: String::new(),
@@ -2467,6 +2475,10 @@ message_queue_capacity = 4096
                 username: "a".to_string(),
                 password: "p1".to_string(),
                 enabled: true,
+                assigned: true,
+                free: false,
+                revoked: false,
+                frozen: false,
                 external_account_id: None,
                 access_bundle_id: None,
                 tt_link: String::new(),
@@ -2475,9 +2487,67 @@ message_queue_capacity = 4096
             },
         ];
 
-        let rendered = render_credentials(&accounts);
+        let runtime_accounts = fetch_active_accounts_for_runtime(&accounts);
+        let rendered = render_credentials(&runtime_accounts);
         assert!(rendered.contains("username = \"a\""));
         assert!(!rendered.contains("username = \"b\""));
+    }
+
+    #[test]
+    fn runtime_filters_exclude_frozen_and_revoked_accounts() {
+        let accounts = vec![
+            Account {
+                username: "active".to_string(),
+                password: "p1".to_string(),
+                enabled: true,
+                assigned: true,
+                free: false,
+                revoked: false,
+                frozen: false,
+                external_account_id: None,
+                access_bundle_id: None,
+                tt_link: "tt://active".to_string(),
+                tt_link_config_hash: "hash".to_string(),
+                tt_link_stale: false,
+            },
+            Account {
+                username: "frozen".to_string(),
+                password: "p2".to_string(),
+                enabled: true,
+                assigned: true,
+                free: false,
+                revoked: false,
+                frozen: true,
+                external_account_id: None,
+                access_bundle_id: None,
+                tt_link: "tt://frozen".to_string(),
+                tt_link_config_hash: "hash".to_string(),
+                tt_link_stale: false,
+            },
+            Account {
+                username: "revoked".to_string(),
+                password: "p3".to_string(),
+                enabled: true,
+                assigned: true,
+                free: false,
+                revoked: true,
+                frozen: false,
+                external_account_id: None,
+                access_bundle_id: None,
+                tt_link: "tt://revoked".to_string(),
+                tt_link_config_hash: "hash".to_string(),
+                tt_link_stale: false,
+            },
+        ];
+
+        let runtime_accounts = fetch_active_accounts_for_runtime(&accounts);
+        assert_eq!(runtime_accounts.len(), 1);
+        assert_eq!(runtime_accounts[0].username, "active");
+
+        let rendered = render_credentials(&runtime_accounts);
+        assert!(rendered.contains("username = \"active\""));
+        assert!(!rendered.contains("username = \"frozen\""));
+        assert!(!rendered.contains("username = \"revoked\""));
     }
 
     #[test]
@@ -2498,6 +2568,10 @@ message_queue_capacity = 4096
                 username: "alice".to_string(),
                 password: "secret".to_string(),
                 enabled: true,
+                assigned: true,
+                free: false,
+                revoked: false,
+                frozen: false,
                 external_account_id: Some("acc-1".to_string()),
                 access_bundle_id: Some("bundle-1".to_string()),
                 tt_link: String::new(),
@@ -2558,6 +2632,10 @@ message_queue_capacity = 4096
             username: "alice".to_string(),
             password: "secret".to_string(),
             enabled: true,
+            assigned: true,
+            free: false,
+            revoked: false,
+            frozen: false,
             external_account_id: None,
             access_bundle_id: None,
             tt_link: "tt://existing".to_string(),
@@ -2636,6 +2714,10 @@ message_queue_capacity = 4096
                 username: "alice".to_string(),
                 password: "secret".to_string(),
                 enabled: true,
+                assigned: true,
+                free: false,
+                revoked: false,
+                frozen: false,
                 external_account_id: Some("acc-1".to_string()),
                 access_bundle_id: Some("bundle-1".to_string()),
                 tt_link: "tt://existing".to_string(),
@@ -2801,6 +2883,10 @@ message_queue_capacity = 4096
                 username: "alice".to_string(),
                 password: "secret".to_string(),
                 enabled: true,
+                assigned: true,
+                free: false,
+                revoked: false,
+                frozen: false,
                 external_account_id: Some("acc-1".to_string()),
                 access_bundle_id: Some("bundle-1".to_string()),
                 tt_link: String::new(),
@@ -2900,6 +2986,10 @@ message_queue_capacity = 4096
                 username: "alice".to_string(),
                 password: "new".to_string(),
                 enabled: true,
+                assigned: true,
+                free: false,
+                revoked: false,
+                frozen: false,
                 external_account_id: None,
                 access_bundle_id: None,
                 tt_link: String::new(),
@@ -2939,6 +3029,10 @@ message_queue_capacity = 4096
                 username: "alice".to_string(),
                 password: "new".to_string(),
                 enabled: true,
+                assigned: true,
+                free: false,
+                revoked: false,
+                frozen: false,
                 external_account_id: None,
                 access_bundle_id: None,
                 tt_link: String::new(),
@@ -3126,6 +3220,10 @@ message_queue_capacity = 4096
                 username: "ok".to_string(),
                 password: "ok".to_string(),
                 enabled: true,
+                assigned: true,
+                free: false,
+                revoked: false,
+                frozen: false,
                 external_account_id: None,
                 access_bundle_id: None,
                 tt_link: String::new(),
