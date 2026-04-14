@@ -1,13 +1,12 @@
 use serde::Deserialize;
-use std::collections::BTreeMap;
 use std::path::Path;
 use trusttunnel_deeplink::Protocol as DeepLinkProtocol;
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct LinkGenerationConfig {
-    #[serde(alias = "host")]
-    server: String,
-    port: Option<u16>,
+    node_external_id: String,
+    server_address: String,
+    cert_domain: String,
     #[serde(default)]
     custom_sni: Option<String>,
     #[serde(default = "default_protocol", deserialize_with = "deserialize_protocol")]
@@ -15,7 +14,7 @@ pub(crate) struct LinkGenerationConfig {
     #[serde(default)]
     display_name: Option<String>,
     #[serde(default)]
-    additional_deeplink_params: BTreeMap<String, String>,
+    dns_servers: Vec<String>,
 }
 
 impl LinkGenerationConfig {
@@ -32,37 +31,110 @@ impl LinkGenerationConfig {
         Ok(parsed)
     }
 
+    pub(crate) fn load_from_file_or_legacy_env(
+        path: &Path,
+        node_external_id: &str,
+    ) -> Result<Self, String> {
+        match Self::load_from_file(path) {
+            Ok(cfg) => Ok(cfg),
+            Err(file_err) => {
+                let Some(legacy) = Self::load_from_legacy_env(node_external_id)? else {
+                    return Err(file_err);
+                };
+                println!(
+                    "link generation config file unavailable, using legacy TT link env variables"
+                );
+                Ok(legacy)
+            }
+        }
+    }
+
+    fn load_from_legacy_env(node_external_id: &str) -> Result<Option<Self>, String> {
+        let Some(host) = optional_env_nonempty("TRUSTTUNNEL_TT_LINK_HOST") else {
+            return Ok(None);
+        };
+        let port = optional_env_nonempty("TRUSTTUNNEL_TT_LINK_PORT")
+            .and_then(|raw| raw.parse::<u16>().ok())
+            .unwrap_or(443);
+        let protocol = optional_env_nonempty("TRUSTTUNNEL_TT_LINK_PROTOCOL")
+            .map(|raw| parse_protocol(&raw))
+            .transpose()?
+            .unwrap_or_else(default_protocol);
+        let custom_sni = optional_env_nonempty("TRUSTTUNNEL_TT_LINK_CUSTOM_SNI");
+        let display_name = optional_env_nonempty("TRUSTTUNNEL_TT_LINK_DISPLAY_NAME");
+        let cert_domain = optional_env_nonempty("TRUSTTUNNEL_TT_LINK_CERT_DOMAIN")
+            .unwrap_or_else(|| host.trim().to_string());
+        let dns_servers = optional_env_nonempty("TRUSTTUNNEL_TT_LINK_DNS_SERVERS")
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let cfg = Self {
+            node_external_id: node_external_id.trim().to_string(),
+            server_address: format!("{}:{}", host.trim(), port),
+            cert_domain,
+            custom_sni,
+            protocol,
+            display_name,
+            dns_servers,
+        };
+        cfg.validate()?;
+        Ok(Some(cfg))
+    }
+
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if self.server.trim().is_empty() {
-            return Err("link generation config validation failed: server/host is empty".to_string());
+        if self.node_external_id.trim().is_empty() {
+            return Err("link generation config validation failed: node_external_id is empty".to_string());
+        }
+        if self.server_address.trim().is_empty() {
+            return Err("link generation config validation failed: server_address is empty".to_string());
+        }
+        if self.cert_domain.trim().is_empty() {
+            return Err("link generation config validation failed: cert_domain is empty".to_string());
+        }
+        if self
+            .dns_servers
+            .iter()
+            .any(|server| server.trim().is_empty())
+        {
+            return Err(
+                "link generation config validation failed: dns_servers contains empty value"
+                    .to_string(),
+            );
         }
         Ok(())
     }
 
     pub(crate) fn config_hash(&self) -> String {
         let canonical = CanonicalLinkGenerationConfig {
-            server: self.server.trim(),
-            port: self.port.unwrap_or(443),
-            custom_sni: self.custom_sni.as_deref().map(str::trim).filter(|x| !x.is_empty()),
+            node_external_id: self.node_external_id().to_string(),
+            server_address: self.server_address().to_string(),
+            cert_domain: self.cert_domain().to_string(),
+            custom_sni: self.custom_sni(),
             protocol: self.protocol.to_string(),
-            display_name: self
-                .display_name
-                .as_deref()
-                .map(str::trim)
-                .filter(|x| !x.is_empty()),
-            additional_deeplink_params: self.additional_deeplink_params.clone(),
+            display_name: self.display_name(),
+            dns_servers: self.dns_servers(),
         };
         let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
         let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
         hex::encode(digest.as_ref())
     }
 
-    pub(crate) fn server(&self) -> &str {
-        self.server.trim()
+    pub(crate) fn node_external_id(&self) -> &str {
+        self.node_external_id.trim()
     }
 
-    pub(crate) fn port_or(&self, default_port: u16) -> u16 {
-        self.port.unwrap_or(default_port)
+    pub(crate) fn server_address(&self) -> &str {
+        self.server_address.trim()
+    }
+
+    pub(crate) fn cert_domain(&self) -> &str {
+        self.cert_domain.trim()
     }
 
     pub(crate) fn custom_sni(&self) -> Option<String> {
@@ -84,16 +156,26 @@ impl LinkGenerationConfig {
             .filter(|x| !x.is_empty())
             .map(ToString::to_string)
     }
+
+    pub(crate) fn dns_servers(&self) -> Vec<String> {
+        self.dns_servers
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .collect()
+    }
 }
 
 #[derive(serde::Serialize)]
-struct CanonicalLinkGenerationConfig<'a> {
-    server: &'a str,
-    port: u16,
-    custom_sni: Option<&'a str>,
+struct CanonicalLinkGenerationConfig {
+    node_external_id: String,
+    server_address: String,
+    cert_domain: String,
+    custom_sni: Option<String>,
     protocol: String,
-    display_name: Option<&'a str>,
-    additional_deeplink_params: BTreeMap<String, String>,
+    display_name: Option<String>,
+    dns_servers: Vec<String>,
 }
 
 fn default_protocol() -> DeepLinkProtocol {
@@ -118,6 +200,13 @@ fn parse_protocol(raw: &str) -> Result<DeepLinkProtocol, String> {
     }
 }
 
+fn optional_env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,46 +214,46 @@ mod tests {
     #[test]
     fn parses_and_validates_config_toml() {
         let raw = r#"
-host = "edge.example.com"
-port = 8443
-custom_sni = "sni.example.com"
+node_external_id = "node-a"
+server_address = "89.110.100.165:443"
+cert_domain = "cdn.securesoft.dev"
+custom_sni = "sni.securesoft.dev"
 protocol = "http3"
 display_name = "My VPN"
-
-[additional_deeplink_params]
-region = "eu"
-env = "prod"
+dns_servers = ["8.8.8.8", "1.1.1.1"]
 "#;
         let cfg = toml::from_str::<LinkGenerationConfig>(raw).unwrap();
 
-        assert_eq!(cfg.server(), "edge.example.com");
-        assert_eq!(cfg.port_or(443), 8443);
-        assert_eq!(cfg.custom_sni(), Some("sni.example.com".to_string()));
+        assert_eq!(cfg.node_external_id(), "node-a");
+        assert_eq!(cfg.server_address(), "89.110.100.165:443");
+        assert_eq!(cfg.cert_domain(), "cdn.securesoft.dev");
+        assert_eq!(cfg.custom_sni(), Some("sni.securesoft.dev".to_string()));
         assert_eq!(cfg.protocol(), DeepLinkProtocol::Http3);
         assert_eq!(cfg.display_name(), Some("My VPN".to_string()));
-        assert_eq!(
-            cfg.additional_deeplink_params.get("region"),
-            Some(&"eu".to_string())
-        );
+        assert_eq!(cfg.dns_servers(), vec!["8.8.8.8", "1.1.1.1"]);
     }
 
     #[test]
     fn rejects_invalid_config_values() {
-        let invalid_host = toml::from_str::<LinkGenerationConfig>(
+        let invalid_server_address = toml::from_str::<LinkGenerationConfig>(
             r#"
-server = "   "
+node_external_id = "node-a"
+server_address = "   "
+cert_domain = "cdn.securesoft.dev"
 protocol = "http2"
 "#,
         )
         .unwrap();
         let invalid_protocol = toml::from_str::<LinkGenerationConfig>(
             r#"
-server = "edge.example.com"
+node_external_id = "node-a"
+server_address = "edge.example.com:443"
+cert_domain = "cdn.securesoft.dev"
 protocol = "quic"
 "#,
         );
 
-        assert!(invalid_host.validate().is_err());
+        assert!(invalid_server_address.validate().is_err());
         assert!(invalid_protocol.is_err());
     }
 
@@ -172,29 +261,25 @@ protocol = "quic"
     fn hash_is_stable_for_equivalent_configs() {
         let first = toml::from_str::<LinkGenerationConfig>(
             r#"
-host = " edge.example.com "
-port = 443
-custom_sni = " sni.example.com "
+node_external_id = " node-a "
+server_address = " 89.110.100.165:443 "
+cert_domain = " cdn.securesoft.dev "
+custom_sni = " sni.securesoft.dev "
 protocol = "http2"
 display_name = " Link Name "
-
-[additional_deeplink_params]
-b = "2"
-a = "1"
+dns_servers = [" 8.8.8.8 ", "1.1.1.1"]
 "#,
         )
         .unwrap();
         let second = toml::from_str::<LinkGenerationConfig>(
             r#"
-server = "edge.example.com"
+node_external_id = "node-a"
+server_address = "89.110.100.165:443"
+cert_domain = "cdn.securesoft.dev"
+custom_sni = "sni.securesoft.dev"
 protocol = "http2"
 display_name = "Link Name"
-custom_sni = "sni.example.com"
-port = 443
-
-[additional_deeplink_params]
-a = "1"
-b = "2"
+dns_servers = ["8.8.8.8", "1.1.1.1"]
 "#,
         )
         .unwrap();
@@ -203,22 +288,28 @@ b = "2"
     }
 
     #[test]
-    fn loads_config_from_file() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let path = temp_dir.path().join("tt-link.toml");
-        std::fs::write(
-            &path,
-            r#"
-host = "edge.example.com"
-port = 8443
-protocol = "http2"
-"#,
-        )
-        .unwrap();
+    fn loads_legacy_env_when_file_not_used() {
+        std::env::set_var("TRUSTTUNNEL_TT_LINK_HOST", "legacy.example.com");
+        std::env::set_var("TRUSTTUNNEL_TT_LINK_PORT", "8443");
+        std::env::set_var("TRUSTTUNNEL_TT_LINK_PROTOCOL", "http3");
+        std::env::set_var("TRUSTTUNNEL_TT_LINK_CUSTOM_SNI", "sni.example.com");
+        std::env::set_var("TRUSTTUNNEL_TT_LINK_DNS_SERVERS", "8.8.8.8,1.1.1.1");
 
-        let cfg = LinkGenerationConfig::load_from_file(&path).unwrap();
-        assert_eq!(cfg.server(), "edge.example.com");
-        assert_eq!(cfg.port_or(443), 8443);
-        assert_eq!(cfg.protocol(), DeepLinkProtocol::Http2);
+        let cfg = LinkGenerationConfig::load_from_legacy_env("node-a")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(cfg.node_external_id(), "node-a");
+        assert_eq!(cfg.server_address(), "legacy.example.com:8443");
+        assert_eq!(cfg.cert_domain(), "legacy.example.com");
+        assert_eq!(cfg.custom_sni(), Some("sni.example.com".to_string()));
+        assert_eq!(cfg.protocol(), DeepLinkProtocol::Http3);
+        assert_eq!(cfg.dns_servers(), vec!["8.8.8.8", "1.1.1.1"]);
+
+        std::env::remove_var("TRUSTTUNNEL_TT_LINK_HOST");
+        std::env::remove_var("TRUSTTUNNEL_TT_LINK_PORT");
+        std::env::remove_var("TRUSTTUNNEL_TT_LINK_PROTOCOL");
+        std::env::remove_var("TRUSTTUNNEL_TT_LINK_CUSTOM_SNI");
+        std::env::remove_var("TRUSTTUNNEL_TT_LINK_DNS_SERVERS");
     }
 }

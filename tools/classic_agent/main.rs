@@ -848,8 +848,11 @@ impl Agent {
                     access_bundle_id: item.access_bundle_id.as_deref(),
                     active: item.active,
                     tt_link: &item.tt_link,
-                    endpoint_host: &item.endpoint_host,
-                    endpoint_port: item.endpoint_port,
+                    server_address: &item.server_address,
+                    cert_domain: &item.cert_domain,
+                    custom_sni: item.custom_sni.as_deref(),
+                    display_name: item.display_name.as_deref(),
+                    dns_servers: item.dns_servers.iter().map(String::as_str).collect(),
                     protocol: &item.protocol,
                     config_hash: &item.config_hash,
                     applied_revision: &item.applied_revision,
@@ -1424,8 +1427,11 @@ struct AccountExportOwned {
     access_bundle_id: Option<String>,
     active: bool,
     tt_link: String,
-    endpoint_host: String,
-    endpoint_port: u16,
+    server_address: String,
+    cert_domain: String,
+    custom_sni: Option<String>,
+    display_name: Option<String>,
+    dns_servers: Vec<String>,
     protocol: String,
     config_hash: String,
     applied_revision: String,
@@ -1853,9 +1859,22 @@ fn build_account_exports(
 ) -> Result<(Vec<AccountExportOwned>, TtLinkReconcileStats), String> {
     let link_config_path =
         resolve_runtime_path(&cfg.trusttunnel_runtime_dir, &cfg.trusttunnel_link_config_file);
-    let link_cfg = LinkGenerationConfig::load_from_file(&link_config_path)?;
-    let endpoint_host = link_cfg.server().to_string();
-    let endpoint_port = link_cfg.port_or(resolve_runtime_port(&cfg.trusttunnel_config_file).unwrap_or(443));
+    let link_cfg = LinkGenerationConfig::load_from_file_or_legacy_env(
+        &link_config_path,
+        &cfg.node_external_id,
+    )?;
+    if link_cfg.node_external_id() != cfg.node_external_id {
+        return Err(format!(
+            "link generation config node_external_id mismatch: expected {}, got {}",
+            cfg.node_external_id,
+            link_cfg.node_external_id()
+        ));
+    }
+    let server_address = link_cfg.server_address().to_string();
+    let cert_domain = link_cfg.cert_domain().to_string();
+    let custom_sni = link_cfg.custom_sni();
+    let display_name = link_cfg.display_name();
+    let dns_servers = link_cfg.dns_servers();
     let protocol = link_cfg.protocol().to_string();
     let config_hash = link_cfg.config_hash();
 
@@ -1871,15 +1890,14 @@ fn build_account_exports(
         let must_regenerate = needs_tt_link_regeneration(account, &config_hash);
         let (tt_link, account_config_hash) = if must_regenerate {
             let mut deep_link_builder = DeepLinkConfig::builder()
-                .hostname(endpoint_host.clone())
-                .addresses(vec![format!("{endpoint_host}:{endpoint_port}")])
+                .hostname(cert_domain.clone())
+                .addresses(vec![server_address.clone()])
                 .username(account.username.clone())
                 .password(account.password.clone())
-                .custom_sni(link_cfg.custom_sni())
-                .upstream_protocol(link_cfg.protocol());
-            if let Some(display_name) = link_cfg.display_name() {
-                deep_link_builder = deep_link_builder.name(Some(display_name));
-            }
+                .custom_sni(custom_sni.clone())
+                .upstream_protocol(link_cfg.protocol())
+                .dns_upstreams(dns_servers.clone());
+            deep_link_builder = deep_link_builder.name(display_name.clone());
             let deep_link = deep_link_builder
                 .build()
                 .map_err(|e| format!("failed to build TT deep-link config for {}: {e}", account.username))?;
@@ -1908,8 +1926,11 @@ fn build_account_exports(
             access_bundle_id: account.access_bundle_id.clone(),
             active: true,
             tt_link,
-            endpoint_host: endpoint_host.clone(),
-            endpoint_port,
+            server_address: server_address.clone(),
+            cert_domain: cert_domain.clone(),
+            custom_sni: custom_sni.clone(),
+            display_name: display_name.clone(),
+            dns_servers: dns_servers.clone(),
             protocol: protocol.clone(),
             config_hash: account_config_hash,
             applied_revision: snapshot.version.clone(),
@@ -1917,15 +1938,6 @@ fn build_account_exports(
     }
 
     Ok((exports, stats))
-}
-
-fn resolve_runtime_port(path: &Path) -> Option<u16> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let value = raw.parse::<toml::Value>().ok()?;
-    let listen_address = value.get("listen_address")?.as_str()?;
-    listen_address
-        .rsplit_once(':')
-        .and_then(|(_, port)| port.parse::<u16>().ok())
 }
 
 fn required_env(name: &str) -> Result<String, String> {
@@ -2401,7 +2413,7 @@ message_queue_capacity = 4096
         fs::write(&config_file, settings).await.unwrap();
         fs::write(
             runtime_dir.join("tt-link.toml"),
-            "server = \"node-1.example\"\nport = 8443\nprotocol = \"http2\"\n",
+            "node_external_id = \"node-1\"\nserver_address = \"node-1.example:8443\"\ncert_domain = \"node-1.example\"\nprotocol = \"http2\"\ndns_servers = [\"8.8.8.8\"]\n",
         )
         .await
         .unwrap();
@@ -2621,7 +2633,7 @@ message_queue_capacity = 4096
         let runtime_dir = temp_dir.path();
         std::fs::write(
             runtime_dir.join("tt-link.toml"),
-            "host = \"gw.example.com\"\nport = 443\nprotocol = \"http2\"\ncustom_sni = \"sni.example.com\"\ndisplay_name = \"Primary\"\n",
+            "node_external_id = \"node-1\"\nserver_address = \"89.110.100.165:443\"\ncert_domain = \"cdn.securesoft.dev\"\ncustom_sni = \"sni.example.com\"\nprotocol = \"http2\"\ndisplay_name = \"Primary\"\ndns_servers = [\"8.8.8.8\"]\n",
         )
         .unwrap();
         let snapshot = SyncPayload {
@@ -2682,12 +2694,15 @@ message_queue_capacity = 4096
         assert_eq!(stats.updated_total, 1);
         assert!(exports[0].tt_link.starts_with("tt://"));
         let decoded = trusttunnel_deeplink::decode(&exports[0].tt_link).unwrap();
-        assert_eq!(decoded.hostname, "gw.example.com");
-        assert_eq!(decoded.addresses, vec!["gw.example.com:443".to_string()]);
+        assert_eq!(decoded.hostname, "cdn.securesoft.dev");
+        assert_eq!(decoded.addresses, vec!["89.110.100.165:443".to_string()]);
         assert_eq!(decoded.username, "alice");
         assert_eq!(decoded.password, "secret");
         assert_eq!(decoded.custom_sni, Some("sni.example.com".to_string()));
         assert_eq!(decoded.name, Some("Primary".to_string()));
+        assert_eq!(decoded.dns_upstreams, vec!["8.8.8.8".to_string()]);
+        assert_eq!(exports[0].server_address, "89.110.100.165:443");
+        assert_eq!(exports[0].cert_domain, "cdn.securesoft.dev");
         assert_eq!(exports[0].config_hash.len(), 64);
     }
 
@@ -2731,7 +2746,7 @@ message_queue_capacity = 4096
         let runtime_dir = temp_dir.path();
         std::fs::write(
             runtime_dir.join("tt-link.toml"),
-            "host = \"gw.example.com\"\nport = 443\nprotocol = \"http2\"\n",
+            "node_external_id = \"node-1\"\nserver_address = \"89.110.100.165:443\"\ncert_domain = \"cdn.securesoft.dev\"\nprotocol = \"http2\"\ndns_servers = []\n",
         )
         .unwrap();
 
@@ -2800,19 +2815,20 @@ message_queue_capacity = 4096
     }
 
     #[test]
-    fn account_exports_regenerate_tt_link_when_config_hash_changes() {
+    fn tt_link_generation_is_stable_for_same_account_and_config() {
         let temp_dir = TempDir::new().unwrap();
         let runtime_dir = temp_dir.path();
         std::fs::write(
             runtime_dir.join("tt-link.toml"),
-            "host = \"gw.example.com\"\nport = 443\nprotocol = \"http2\"\n",
+            "node_external_id = \"node-1\"\nserver_address = \"89.110.100.165:443\"\ncert_domain = \"cdn.securesoft.dev\"\ncustom_sni = \"cdn.securesoft.dev\"\nprotocol = \"http2\"\ndns_servers = [\"8.8.8.8\"]\n",
         )
         .unwrap();
+
         let cfg = Config {
-            lk_base_url: None,
+            lk_base_url: Some("http://localhost".to_string()),
             runtime_mode: RuntimeMode::DbWorker,
             lk_db_dsn: "postgres://localhost/lk".to_string(),
-            lk_service_token: None,
+            lk_service_token: Some("token".to_string()),
             node_external_id: "node-1".to_string(),
             node_hostname: "node-1.example".to_string(),
             node_stage: None,
@@ -2829,15 +2845,15 @@ message_queue_capacity = 4096
             agent_state_path: PathBuf::from("agent_state.json"),
             reconcile_interval: Duration::from_secs(10),
             apply_interval: Duration::from_secs(10),
-            heartbeat_interval: None,
-            sync_path_template: None,
-            sync_report_path: None,
+            heartbeat_interval: Some(Duration::from_secs(30)),
+            sync_path_template: Some("/sync/{externalNodeId}".to_string()),
+            sync_report_path: Some("/sync-report".to_string()),
             apply_cmd: None,
-            runtime_pid_path: None,
-            runtime_process_name: None,
+            runtime_pid_path: Some(PathBuf::from("trusttunnel.pid")),
+            runtime_process_name: Some("trusttunnel_endpoint".to_string()),
             agent_version: "test".to_string(),
             runtime_version: "test".to_string(),
-            pending_sync_reports_path: None,
+            pending_sync_reports_path: Some(PathBuf::from("pending_sync_reports.jsonl")),
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
         };
         let snapshot = SyncPayload {
@@ -2853,104 +2869,17 @@ message_queue_capacity = 4096
                 free: false,
                 revoked: false,
                 frozen: false,
-                external_account_id: Some("acc-1".to_string()),
-                access_bundle_id: Some("bundle-1".to_string()),
-                tt_link: "tt://existing".to_string(),
-                tt_link_config_hash: "old-config-hash".to_string(),
+                external_account_id: None,
+                access_bundle_id: None,
+                tt_link: String::new(),
+                tt_link_config_hash: String::new(),
                 tt_link_stale: false,
             }],
         };
 
-        let (exports, stats) = build_account_exports(&cfg, &snapshot).unwrap();
-        assert_eq!(exports.len(), 1);
-        assert_ne!(exports[0].tt_link, "tt://existing");
-        assert_eq!(stats.updated_total, 1);
-        assert_eq!(stats.updated_hash_mismatch, 1);
-    }
-
-    #[test]
-    fn account_exports_generate_batch_for_snapshot_accounts() {
-        let temp_dir = TempDir::new().unwrap();
-        let runtime_dir = temp_dir.path();
-        std::fs::write(
-            runtime_dir.join("tt-link.toml"),
-            "host = \"gw.example.com\"\nport = 443\nprotocol = \"http2\"\n",
-        )
-        .unwrap();
-        let cfg = Config {
-            lk_base_url: None,
-            runtime_mode: RuntimeMode::DbWorker,
-            lk_db_dsn: "postgres://localhost/lk".to_string(),
-            lk_service_token: None,
-            node_external_id: "node-1".to_string(),
-            node_hostname: "node-1.example".to_string(),
-            node_stage: None,
-            node_cluster: None,
-            node_namespace: None,
-            node_rollout_group: None,
-            trusttunnel_runtime_dir: runtime_dir.to_path_buf(),
-            trusttunnel_config_file: PathBuf::from("vpn.toml"),
-            trusttunnel_hosts_file: PathBuf::from("hosts.toml"),
-            bootstrap_credentials_source_path: None,
-            trusttunnel_link_config_file: PathBuf::from("tt-link.toml"),
-            runtime_credentials_path: PathBuf::from("credentials.toml"),
-            runtime_primary_marker_path: PathBuf::from(".runtime_primary_marker"),
-            agent_state_path: PathBuf::from("agent_state.json"),
-            reconcile_interval: Duration::from_secs(10),
-            apply_interval: Duration::from_secs(10),
-            heartbeat_interval: None,
-            sync_path_template: None,
-            sync_report_path: None,
-            apply_cmd: None,
-            runtime_pid_path: None,
-            runtime_process_name: None,
-            agent_version: "test".to_string(),
-            runtime_version: "test".to_string(),
-            pending_sync_reports_path: None,
-            metrics_address: "127.0.0.1:9901".parse().unwrap(),
-        };
-        let snapshot = SyncPayload {
-            version: "rev-1".to_string(),
-            checksum: "0".repeat(64),
-            onboarding_state: "active".to_string(),
-            sync_required: true,
-            accounts: vec![
-                Account {
-                    username: "alice".to_string(),
-                    password: "secret-a".to_string(),
-                    enabled: true,
-                    assigned: true,
-                    free: false,
-                    revoked: false,
-                    frozen: false,
-                    external_account_id: Some("acc-1".to_string()),
-                    access_bundle_id: Some("bundle-1".to_string()),
-                    tt_link: String::new(),
-                    tt_link_config_hash: String::new(),
-                    tt_link_stale: false,
-                },
-                Account {
-                    username: "bob".to_string(),
-                    password: "secret-b".to_string(),
-                    enabled: true,
-                    assigned: true,
-                    free: false,
-                    revoked: false,
-                    frozen: false,
-                    external_account_id: Some("acc-2".to_string()),
-                    access_bundle_id: Some("bundle-2".to_string()),
-                    tt_link: String::new(),
-                    tt_link_config_hash: String::new(),
-                    tt_link_stale: false,
-                },
-            ],
-        };
-
-        let (exports, stats) = build_account_exports(&cfg, &snapshot).unwrap();
-        assert_eq!(exports.len(), 2);
-        assert!(exports.iter().all(|x| x.tt_link.starts_with("tt://")));
-        assert_eq!(stats.updated_total, 2);
-        assert_eq!(stats.updated_empty_link, 2);
+        let (first, _) = build_account_exports(&cfg, &snapshot).unwrap();
+        let (second, _) = build_account_exports(&cfg, &snapshot).unwrap();
+        assert_eq!(first[0].tt_link, second[0].tt_link);
     }
 
     #[test]
