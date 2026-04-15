@@ -1,3 +1,4 @@
+use crate::credentials_format::parse_client_credentials;
 use crate::sha256_hex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -132,7 +133,7 @@ pub(crate) fn load_inventory_snapshot(
             credentials_path.display()
         )
     })?;
-    let credentials = parse_credentials_toml(&raw)?;
+    let credentials = parse_inventory_accounts(&raw)?;
     Ok(InventorySnapshot {
         generated_at_unix_sec,
         export_config_hash,
@@ -230,37 +231,15 @@ pub(crate) fn compute_delta(snapshot: &InventorySnapshot, previous: Option<&Inve
     delta
 }
 
-fn parse_credentials_toml(raw: &str) -> Result<Vec<InventoryAccount>, String> {
-    let parsed = raw
-        .parse::<toml_edit::Document>()
-        .map_err(|e| format!("failed to parse credentials inventory TOML: {e}"))?;
-    let clients = parsed
-        .get("client")
-        .and_then(toml_edit::Item::as_array_of_tables)
-        .ok_or_else(|| "credentials inventory TOML does not contain [[client]] section".to_string())?;
-
-    let mut entries = Vec::new();
-    for (index, client) in clients.iter().enumerate() {
-        let username = client
-            .get("username")
-            .and_then(|item| item.as_str())
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .ok_or_else(|| format!("credentials inventory: client #{} has empty username", index + 1))?;
-        let password = client
-            .get("password")
-            .and_then(|item| item.as_str())
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .ok_or_else(|| format!("credentials inventory: client #{} has empty password", index + 1))?;
-
-        entries.push(InventoryAccount {
-            username: username.to_string(),
-            password: password.to_string(),
-        });
-    }
-
-    Ok(entries)
+pub(crate) fn parse_inventory_accounts(raw: &str) -> Result<Vec<InventoryAccount>, String> {
+    let parsed = parse_client_credentials(raw, "credentials inventory")?;
+    Ok(parsed
+        .into_iter()
+        .map(|item| InventoryAccount {
+            username: item.username,
+            password: item.password,
+        })
+        .collect())
 }
 
 #[cfg(test)]
