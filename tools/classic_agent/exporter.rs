@@ -252,7 +252,87 @@ async fn run_export_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::process::Command as StdCommand;
+    use std::sync::OnceLock;
     use tempfile::TempDir;
+
+    fn set_executable(path: &Path) {
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    fn endpoint_binary_path() -> PathBuf {
+        static ENDPOINT_BINARY: OnceLock<PathBuf> = OnceLock::new();
+        ENDPOINT_BINARY
+            .get_or_init(|| {
+                if let Some(path) = std::env::var_os("TRUSTTUNNEL_TEST_ENDPOINT_BINARY") {
+                    return PathBuf::from(path);
+                }
+
+                let repo_root =
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+                let bin_path = repo_root.join("target/debug/trusttunnel_endpoint");
+                if !bin_path.exists() {
+                    let status = StdCommand::new("cargo")
+                        .current_dir(&repo_root)
+                        .args([
+                            "build",
+                            "--package",
+                            "trusttunnel_endpoint",
+                            "--bin",
+                            "trusttunnel_endpoint",
+                        ])
+                        .status()
+                        .expect("failed to invoke cargo build for trusttunnel_endpoint");
+                    assert!(
+                        status.success(),
+                        "failed to build trusttunnel_endpoint binary"
+                    );
+                }
+
+                bin_path
+            })
+            .clone()
+    }
+
+    fn write_endpoint_files(temp_dir: &TempDir, users: &[&str]) -> (PathBuf, PathBuf) {
+        let cert_path = temp_dir.path().join("cert.pem");
+        let key_path = temp_dir.path().join("key.pem");
+        let credentials_path = temp_dir.path().join("credentials.toml");
+        let settings_path = temp_dir.path().join("vpn.toml");
+        let hosts_path = temp_dir.path().join("hosts.toml");
+
+        let cert = rcgen::generate_simple_self_signed(vec!["vpn.example.com".to_string()]).unwrap();
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+        let credentials = users
+            .iter()
+            .map(|username| format!("[[client]]\nusername = \"{username}\"\npassword = \"pass\"\n"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&credentials_path, credentials).unwrap();
+        std::fs::write(
+            &settings_path,
+            format!(
+                "listen_address = \"127.0.0.1:443\"\ncredentials_file = \"{}\"\n\n[listen_protocols]\n\n[listen_protocols.http1]\nupload_buffer_size = 32768\n",
+                credentials_path.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &hosts_path,
+            format!(
+                "[[main_hosts]]\nhostname = \"vpn.example.com\"\ncert_chain_path = \"{}\"\nprivate_key_path = \"{}\"\nallowed_sni = [\"sni.example.com\"]\n",
+                cert_path.display(),
+                key_path.display()
+            ),
+        )
+        .unwrap();
+
+        (settings_path, hosts_path)
+    }
 
     #[tokio::test]
     async fn exporter_retries_on_failure_and_parses_tt_link() {
@@ -267,9 +347,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-        std::fs::set_permissions(&script_path, perms).unwrap();
+        set_executable(&script_path);
 
         let exporter = EndpointLinkExporter::new(
             script_path.display().to_string(),
@@ -305,9 +383,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-        std::fs::set_permissions(&script_path, perms).unwrap();
+        set_executable(&script_path);
 
         let exporter = EndpointLinkExporter::new(
             script_path.display().to_string(),
@@ -344,9 +420,7 @@ mod tests {
             "#!/bin/sh\nuser=\"\"\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"--client_config\" ]; then shift; user=\"$1\"; fi\n  shift\ndone\nif [ \"$user\" = \"broken\" ]; then echo fail >&2; exit 1; fi\necho \"tt://$user\"\n",
         )
         .unwrap();
-        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-        std::fs::set_permissions(&script_path, perms).unwrap();
+        set_executable(&script_path);
 
         let exporter = EndpointLinkExporter::new(
             script_path.display().to_string(),
@@ -367,5 +441,60 @@ mod tests {
             Some("tt://alice".to_string())
         );
         assert_eq!(summary.failures.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn exporter_with_real_endpoint_handles_cli_flags_and_outputs_deeplinks() {
+        let temp_dir = TempDir::new().unwrap();
+        let endpoint_binary = endpoint_binary_path();
+        let (settings_path, hosts_path) = write_endpoint_files(&temp_dir, &["alice"]);
+        let exporter = EndpointLinkExporter::new(
+            endpoint_binary.display().to_string(),
+            settings_path,
+            hosts_path,
+            EndpointExportOptions::new(
+                "89.110.100.165:443".to_string(),
+                Some("sni.example.com".to_string()),
+                Some("Primary".to_string()),
+                vec!["8.8.8.8".to_string()],
+            ),
+        );
+
+        let summary = exporter
+            .export_usernames(vec!["alice".to_string(), "missing".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(summary.exported(), 1);
+        assert_eq!(summary.failed, 1);
+        let alice_link = summary.links.get("alice").unwrap();
+        assert!(alice_link.starts_with("tt://"));
+        assert!(
+            summary
+                .failures
+                .iter()
+                .any(|failure| failure.contains("endpoint exited with status"))
+        );
+    }
+
+    #[tokio::test]
+    async fn exporter_timeout_is_reported() {
+        let temp_dir = TempDir::new().unwrap();
+        let script_path = temp_dir.path().join("slow_endpoint.sh");
+        std::fs::write(&script_path, "#!/bin/sh\nsleep 1\necho \"tt://late\"\n").unwrap();
+        set_executable(&script_path);
+
+        let err = run_export_command(
+            &script_path.display().to_string(),
+            &temp_dir.path().join("vpn.toml"),
+            &temp_dir.path().join("hosts.toml"),
+            &EndpointExportOptions::new("1.1.1.1:443".to_string(), None, None, vec![]),
+            "alice",
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.contains("timed out"));
     }
 }
