@@ -39,7 +39,9 @@ impl LinkGenerationConfig {
             Ok(cfg) => Ok(cfg),
             Err(file_err) => {
                 let Some(legacy) = Self::load_from_legacy_env(node_external_id)? else {
-                    return Err(file_err);
+                    return Err(format!(
+                        "{file_err}; expected TOML shape: node_external_id=\"...\", server_address=\"host:port\", cert_domain=\"...\", protocol=\"http2|http3\""
+                    ));
                 };
                 println!(
                     "link generation config file unavailable, using legacy TT link env variables"
@@ -311,5 +313,13 @@ dns_servers = ["8.8.8.8", "1.1.1.1"]
         std::env::remove_var("TRUSTTUNNEL_TT_LINK_PROTOCOL");
         std::env::remove_var("TRUSTTUNNEL_TT_LINK_CUSTOM_SNI");
         std::env::remove_var("TRUSTTUNNEL_TT_LINK_DNS_SERVERS");
+    }
+
+    #[test]
+    fn missing_file_error_describes_expected_shape() {
+        std::env::remove_var("TRUSTTUNNEL_TT_LINK_HOST");
+        let path = std::env::temp_dir().join("missing-link-config.toml");
+        let err = LinkGenerationConfig::load_from_file_or_legacy_env(&path, "node-a").unwrap_err();
+        assert!(err.contains("expected TOML shape"));
     }
 }
