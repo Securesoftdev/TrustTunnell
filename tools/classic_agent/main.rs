@@ -3,6 +3,7 @@ mod exporter;
 mod link_config;
 mod credentials_inventory;
 mod lk_bulk_writer;
+mod runtime_workspace;
 
 use legacy::lk_api::{
     Account, AccountExportPayload, HeartbeatPayload, HeartbeatStats, LkApiClient, NodeMetadata,
@@ -17,6 +18,7 @@ use credentials_inventory::{
 use exporter::{EndpointExportOptions, EndpointLinkExporter};
 use lk_bulk_writer::{LkArtifactRecord, LkBulkWriter};
 use link_config::LinkGenerationConfig;
+use runtime_workspace::{ArtifactKind, RuntimeWorkspace};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -25,7 +27,6 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::fs::{self, OpenOptions};
@@ -430,6 +431,7 @@ struct AgentState {
 
 struct Agent {
     cfg: Config,
+    workspace: RuntimeWorkspace,
     lk_api: LkApiClient,
     state: AgentState,
     node_metadata: NodeMetadata,
@@ -474,8 +476,13 @@ impl Agent {
 
         let metrics = Arc::new(AgentMetrics::new(&node_metadata.node_external_id)?);
 
+        let workspace = RuntimeWorkspace::new(
+            cfg.trusttunnel_runtime_dir.clone(),
+            cfg.debug_preserve_temp_files,
+        );
         Ok(Self {
             cfg,
+            workspace,
             lk_api,
             state,
             node_metadata,
@@ -726,10 +733,21 @@ impl Agent {
 
         let link_config_path =
             resolve_runtime_path(&self.cfg.trusttunnel_runtime_dir, &self.cfg.trusttunnel_link_config_file);
-        let link_cfg = LinkGenerationConfig::load_from_file_or_legacy_env(
+        let (link_cfg, link_diag) = LinkGenerationConfig::load_with_diagnostics(
             &link_config_path,
             &self.cfg.node_external_id,
         )?;
+        println!(
+            "phase=link_config_diagnostics node={} path={} exists={} parsed={} fallback_used={} hash={} protocol={} server_address={}",
+            self.cfg.node_external_id,
+            link_diag.path,
+            link_diag.file_exists,
+            link_diag.file_parsed,
+            link_diag.fallback_used,
+            link_diag.hash.as_deref().unwrap_or("none"),
+            link_diag.recognized_protocol.as_deref().unwrap_or("unknown"),
+            link_diag.recognized_server_address.as_deref().unwrap_or("unknown")
+        );
 
         let (address, port) = split_host_port(link_cfg.server_address())?;
         let export_config_hash = InventoryExportConfig {
@@ -747,10 +765,7 @@ impl Agent {
             export_config_hash,
             chrono::Utc::now().timestamp(),
         )?;
-        let state_path = self
-            .cfg
-            .trusttunnel_runtime_dir
-            .join("credentials_inventory_state.json");
+        let state_path = self.workspace.inventory_state_path();
         let previous = load_inventory_state(&state_path)?;
         let delta = compute_inventory_delta(&snapshot, previous.as_ref());
 
@@ -764,6 +779,8 @@ impl Agent {
         let removed_count = delta.removed.len();
 
         let mut generated_links = BTreeMap::new();
+        let mut export_failed = 0usize;
+        let mut export_failures = Vec::new();
         if !upsert_accounts.is_empty() {
             let settings_path =
                 resolve_runtime_path(&self.cfg.trusttunnel_runtime_dir, &self.cfg.trusttunnel_config_file);
@@ -784,13 +801,17 @@ impl Agent {
                 .iter()
                 .map(|account: &InventoryAccount| account.username.clone())
                 .collect::<Vec<_>>();
-            generated_links = exporter.export_usernames(usernames).await?;
+            let export_summary = exporter.export_usernames(usernames).await?;
+            generated_links = export_summary.links;
+            export_failed = export_summary.failed;
+            export_failures = export_summary.failures;
         }
 
         let writer =
             LkBulkWriter::from_contract(&self.cfg.lk_db_dsn, self.cfg.lk_service_token.clone())?;
         let mut records = upsert_accounts
             .iter()
+            .filter(|account| generated_links.contains_key(&account.username))
             .map(|account| LkArtifactRecord {
                 username: account.username.clone(),
                 external_node_id: self.cfg.node_external_id.clone(),
@@ -811,16 +832,25 @@ impl Agent {
             active: false,
         }));
         let mut write_result = writer.write_batch(records).await?;
+        if export_failed > 0 {
+            write_result.failed += export_failed;
+            write_result.failures.extend(export_failures.clone());
+        }
         write_result.unchanged += unchanged_count;
         write_result.deactivated += removed_count;
 
-        persist_inventory_state(&state_path, &snapshot)?;
+        if write_result.failed == 0 {
+            persist_inventory_state(&state_path, &snapshot)?;
+        }
         println!(
-            "inventory sidecar synced: credentials={} missing={} stale={} removed={} lk_created={} lk_updated={} lk_unchanged={} lk_deactivated={} lk_failed={}",
+            "phase=inventory_sync node={} inventory_counts={{credentials:{},missing:{},stale:{},removed:{}}} export_counts={{generated:{},failed:{}}} write_counts={{created:{},updated:{},unchanged:{},deactivated:{},failed:{}}}",
+            self.cfg.node_external_id,
             snapshot.credentials.len(),
             delta.missing.len(),
             delta.stale.len(),
             delta.removed.len(),
+            generated_links.len(),
+            export_failed,
             write_result.created,
             write_result.updated,
             write_result.unchanged,
@@ -1587,27 +1617,21 @@ impl Agent {
     }
 
     async fn write_runtime_credentials_tmp(&self, data: &[u8]) -> Result<PathBuf, String> {
-        let parent = &self.cfg.trusttunnel_runtime_dir;
+        let parent = self.workspace.root();
         fs::create_dir_all(parent).await.map_err(|e| {
             format!(
                 "failed to create runtime directory {}: {e}",
                 parent.display()
             )
         })?;
-
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|x| x.as_nanos())
-            .unwrap_or_default();
-        let tmp_path = parent.join(format!(
-            ".{}.candidate.{}.{nonce}.tmp",
+        let tmp_path = self.workspace.make_temp_path(
+            ArtifactKind::CandidateCredentials,
             self.cfg
                 .runtime_credentials_path
                 .file_name()
                 .and_then(|x| x.to_str())
                 .unwrap_or("credentials"),
-            std::process::id()
-        ));
+        );
         fs::write(&tmp_path, data)
             .await
             .map_err(|e| format!("failed to write candidate credentials {}: {e}", tmp_path.display()))?;
@@ -1635,25 +1659,20 @@ impl Agent {
         let candidate_path_str = path_to_string(candidate_path)?.to_string();
         settings_doc["credentials_file"] = value(candidate_path_str);
 
-        let parent = &self.cfg.trusttunnel_runtime_dir;
+        let parent = self.workspace.root();
         fs::create_dir_all(parent).await.map_err(|e| {
             format!(
                 "failed to create runtime directory {}: {e}",
                 parent.display()
             )
         })?;
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|x| x.as_nanos())
-            .unwrap_or_default();
-        let temp_config_path = parent.join(format!(
-            ".{}.candidate-config.{}.{nonce}.tmp",
+        let temp_config_path = self.workspace.make_temp_path(
+            ArtifactKind::CandidateConfig,
             settings_path
                 .file_name()
                 .and_then(|x| x.to_str())
                 .unwrap_or("vpn"),
-            std::process::id()
-        ));
+        );
         fs::write(&temp_config_path, settings_doc.to_string())
             .await
             .map_err(|e| {
@@ -1698,7 +1717,8 @@ impl Agent {
     ) -> Result<(), String> {
         if keep_files {
             println!(
-                "validation temp files preserved: candidate_credentials={} temp_config={}",
+                "phase=validation_debug_preserved node={} candidate_credentials={} temp_config={}",
+                self.cfg.node_external_id,
                 files.candidate_credentials_path.display(),
                 files.temp_config_path.display()
             );
@@ -1748,37 +1768,48 @@ impl Agent {
         candidate_path: PathBuf,
     ) -> Result<CandidateValidationFiles, String> {
         println!(
-            "reconcile validation phase=candidate_credentials_write path={}",
+            "phase=candidate_credentials_write node={} candidate_path={}",
+            self.cfg.node_external_id,
             candidate_path.display()
         );
         self.validate_candidate_credentials_syntax(&candidate_path)
-            .map_err(|e| format!("phase=candidate_toml_invalid path={}: {e}", candidate_path.display()))?;
+            .map_err(|e| format!("phase=candidate_toml_invalid node={} candidate_path={}: {e}", self.cfg.node_external_id, candidate_path.display()))?;
         println!(
-            "reconcile validation phase=candidate_toml_valid path={}",
+            "phase=candidate_toml_valid node={} candidate_path={}",
+            self.cfg.node_external_id,
             candidate_path.display()
         );
 
         let temp_config_path = self
             .write_temp_endpoint_config_for_candidate(&candidate_path)
             .await
-            .map_err(|e| format!("phase=temp_config_invalid candidate_path={}: {e}", candidate_path.display()))?;
+            .map_err(|e| format!("phase=temp_config_invalid node={} candidate_path={}: {e}", self.cfg.node_external_id, candidate_path.display()))?;
         println!(
-            "reconcile validation phase=temp_config_rendered path={} candidate_path={}",
+            "phase=temp_config_rendered node={} temp_config_path={} candidate_path={}",
+            self.cfg.node_external_id,
             temp_config_path.display(),
             candidate_path.display()
         );
 
         self.validate_temp_endpoint_config_with_parser(&temp_config_path).map_err(|e| {
             format!(
-                "phase=endpoint_validation_failed temp_config_path={} candidate_path={}: {e}",
+                "phase=endpoint_runtime_validation_failed node={} temp_config_path={} candidate_path={}: {e}",
+                self.cfg.node_external_id,
                 temp_config_path.display(),
                 candidate_path.display()
             )
         })?;
         println!(
-            "reconcile validation phase=endpoint_validation_ok temp_config_path={} candidate_path={}",
+            "phase=endpoint_runtime_validation_ok node={} temp_config_path={} candidate_path={}",
+            self.cfg.node_external_id,
             temp_config_path.display(),
             candidate_path.display()
+        );
+        println!(
+            "phase=export_readiness_ok node={} candidate_path={} temp_config_path={}",
+            self.cfg.node_external_id,
+            candidate_path.display(),
+            temp_config_path.display()
         );
 
         Ok(CandidateValidationFiles {
@@ -2581,6 +2612,7 @@ async fn build_account_exports(
         let must_regenerate = needs_tt_link_regeneration(account, &config_hash);
         let (tt_link, account_config_hash) = if must_regenerate {
             let tt_link = regenerated_links
+                .links
                 .get(account.username.as_str())
                 .ok_or_else(|| format!("missing generated TT link for account {}", account.username))?
                 .clone();
@@ -2805,18 +2837,47 @@ fn resolve_runtime_path(runtime_dir: &Path, path: &Path) -> PathBuf {
 
 fn split_host_port(raw: &str) -> Result<(String, u16), String> {
     let value = raw.trim();
-    let idx = value
-        .rfind(':')
-        .ok_or_else(|| format!("server address must contain host:port, got: {value}"))?;
-    let host = value[..idx].trim();
-    let port_raw = value[idx + 1..].trim();
-    if host.is_empty() {
-        return Err(format!("server address host is empty: {value}"));
+    if value.is_empty() {
+        return Err("server address is empty".to_string());
     }
-    let port = port_raw
-        .parse::<u16>()
-        .map_err(|e| format!("invalid server address port in {value}: {e}"))?;
-    Ok((host.to_string(), port))
+    if let Some(stripped) = value.strip_prefix('[') {
+        let Some(close_idx) = stripped.find(']') else {
+            return Err(format!("invalid bracketed IPv6 server address: {value}"));
+        };
+        let host = stripped[..close_idx].trim();
+        let rest = stripped[close_idx + 1..].trim();
+        if host.is_empty() {
+            return Err(format!("server address host is empty: {value}"));
+        }
+        let Some(port_raw) = rest.strip_prefix(':') else {
+            return Err(format!("server address must include :port, got: {value}"));
+        };
+        let port = port_raw
+            .trim()
+            .parse::<u16>()
+            .map_err(|e| format!("invalid server address port in {value}: {e}"))?;
+        return Ok((host.to_string(), port));
+    }
+
+    let colon_count = value.matches(':').count();
+    if colon_count == 1 {
+        let idx = value
+            .rfind(':')
+            .ok_or_else(|| format!("server address must contain host:port, got: {value}"))?;
+        let host = value[..idx].trim();
+        let port_raw = value[idx + 1..].trim();
+        if host.is_empty() {
+            return Err(format!("server address host is empty: {value}"));
+        }
+        let port = port_raw
+            .parse::<u16>()
+            .map_err(|e| format!("invalid server address port in {value}: {e}"))?;
+        return Ok((host.to_string(), port));
+    }
+
+    Err(format!(
+        "invalid server address {value}: use host:port or [ipv6]:port"
+    ))
 }
 
 fn should_import_bootstrap_credentials(
@@ -4561,5 +4622,20 @@ upload_buffer_size = 32768
         let loaded = load_state(&state_path).await.unwrap();
         assert_eq!(loaded.applied_revision.as_deref(), Some("rev-123"));
         assert_eq!(loaded.last_target_revision.as_deref(), Some("rev-124"));
+    }
+
+    #[test]
+    fn split_host_port_accepts_domain_and_bracketed_ipv6() {
+        let domain = split_host_port("edge.example.com:443").unwrap();
+        let ipv6 = split_host_port("[2001:db8::1]:8443").unwrap();
+
+        assert_eq!(domain, ("edge.example.com".to_string(), 443));
+        assert_eq!(ipv6, ("2001:db8::1".to_string(), 8443));
+    }
+
+    #[test]
+    fn split_host_port_rejects_unbracketed_ipv6() {
+        let err = split_host_port("2001:db8::1:443").unwrap_err();
+        assert!(err.contains("host:port or [ipv6]:port"));
     }
 }

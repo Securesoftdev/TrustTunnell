@@ -17,6 +17,17 @@ pub(crate) struct LinkGenerationConfig {
     dns_servers: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LinkConfigDiagnostics {
+    pub(crate) path: String,
+    pub(crate) file_exists: bool,
+    pub(crate) file_parsed: bool,
+    pub(crate) hash: Option<String>,
+    pub(crate) recognized_protocol: Option<String>,
+    pub(crate) recognized_server_address: Option<String>,
+    pub(crate) fallback_used: bool,
+}
+
 impl LinkGenerationConfig {
     pub(crate) fn load_from_file(path: &Path) -> Result<Self, String> {
         let raw = std::fs::read_to_string(path)
@@ -35,9 +46,36 @@ impl LinkGenerationConfig {
         path: &Path,
         node_external_id: &str,
     ) -> Result<Self, String> {
+        Self::load_with_diagnostics(path, node_external_id).map(|(cfg, _)| cfg)
+    }
+
+    pub(crate) fn load_with_diagnostics(
+        path: &Path,
+        node_external_id: &str,
+    ) -> Result<(Self, LinkConfigDiagnostics), String> {
+        let mut diagnostics = LinkConfigDiagnostics {
+            path: path.display().to_string(),
+            file_exists: path.exists(),
+            ..LinkConfigDiagnostics::default()
+        };
         match Self::load_from_file(path) {
-            Ok(cfg) => Ok(cfg),
+            Ok(cfg) => {
+                diagnostics.file_parsed = true;
+                diagnostics.hash = Some(cfg.config_hash());
+                diagnostics.recognized_protocol = Some(cfg.protocol().to_string());
+                diagnostics.recognized_server_address = Some(cfg.server_address().to_string());
+                Ok((cfg, diagnostics))
+            }
             Err(file_err) => {
+                let fallback_allowed = optional_env_nonempty("TRUSTTUNNEL_LINK_CONFIG_ALLOW_LEGACY_FALLBACK")
+                    .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+                    .unwrap_or(false);
+                if !fallback_allowed {
+                    return Err(format!(
+                        "{file_err}; file-based link config is required at {} (set TRUSTTUNNEL_LINK_CONFIG_ALLOW_LEGACY_FALLBACK=true to allow legacy env fallback)",
+                        path.display()
+                    ));
+                }
                 let Some(legacy) = Self::load_from_legacy_env(node_external_id)? else {
                     return Err(format!(
                         "{file_err}; expected TOML shape: node_external_id=\"...\", server_address=\"host:port\", cert_domain=\"...\", protocol=\"http2|http3\""
@@ -46,7 +84,11 @@ impl LinkGenerationConfig {
                 println!(
                     "link generation config file unavailable, using legacy TT link env variables"
                 );
-                Ok(legacy)
+                diagnostics.fallback_used = true;
+                diagnostics.hash = Some(legacy.config_hash());
+                diagnostics.recognized_protocol = Some(legacy.protocol().to_string());
+                diagnostics.recognized_server_address = Some(legacy.server_address().to_string());
+                Ok((legacy, diagnostics))
             }
         }
     }
@@ -317,9 +359,34 @@ dns_servers = ["8.8.8.8", "1.1.1.1"]
 
     #[test]
     fn missing_file_error_describes_expected_shape() {
+        std::env::remove_var("TRUSTTUNNEL_LINK_CONFIG_ALLOW_LEGACY_FALLBACK");
         std::env::remove_var("TRUSTTUNNEL_TT_LINK_HOST");
         let path = std::env::temp_dir().join("missing-link-config.toml");
         let err = LinkGenerationConfig::load_from_file_or_legacy_env(&path, "node-a").unwrap_err();
-        assert!(err.contains("expected TOML shape"));
+        assert!(err.contains("file-based link config is required"));
+    }
+
+    #[test]
+    fn load_with_diagnostics_reports_parsed_file_and_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tt-link.toml");
+        std::fs::write(
+            &path,
+            r#"
+node_external_id = "node-a"
+server_address = "edge.example.com:443"
+cert_domain = "edge.example.com"
+protocol = "http2"
+"#,
+        )
+        .unwrap();
+
+        let (cfg, diagnostics) =
+            LinkGenerationConfig::load_with_diagnostics(&path, "node-a").unwrap();
+        assert_eq!(cfg.server_address(), "edge.example.com:443");
+        assert!(diagnostics.file_exists);
+        assert!(diagnostics.file_parsed);
+        assert!(!diagnostics.fallback_used);
+        assert!(diagnostics.hash.is_some());
     }
 }

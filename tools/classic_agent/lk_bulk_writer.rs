@@ -218,9 +218,16 @@ async fn write_via_postgres(
              LIMIT 1",
             sql_quote(&record.dedupe_key())
         );
-        let existing_raw = exec_psql(dsn, &existing_status_query)
-            .await
-            .map_err(|e| format!("failed to query existing LK artifact for {}: {e}", record.username))?;
+        let existing_raw = match exec_psql(dsn, &existing_status_query).await {
+            Ok(raw) => raw,
+            Err(e) => {
+                summary.failed += 1;
+                summary
+                    .failures
+                    .push(format!("{}: failed to query existing artifact: {e}", record.username));
+                continue;
+            }
+        };
         let existing = parse_existing_row(&existing_raw);
 
         let changed = existing
@@ -256,9 +263,13 @@ async fn write_via_postgres(
             sql_nullable(&record.config_hash),
             if record.active { "TRUE" } else { "FALSE" },
         );
-        exec_psql(dsn, &upsert_query)
-            .await
-            .map_err(|e| format!("failed to upsert LK artifact for {}: {e}", record.username))?;
+        if let Err(e) = exec_psql(dsn, &upsert_query).await {
+            summary.failed += 1;
+            summary
+                .failures
+                .push(format!("{}: failed to upsert artifact: {e}", record.username));
+            continue;
+        }
 
         if existing.is_none() {
             if record.active {

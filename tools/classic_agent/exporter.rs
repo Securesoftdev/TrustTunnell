@@ -1,5 +1,6 @@
 use crate::legacy::lk_api::Account;
 use std::collections::BTreeMap;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,6 +36,20 @@ impl EndpointExportOptions {
     }
 }
 
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ExportSummary {
+    pub(crate) links: BTreeMap<String, String>,
+    pub(crate) failed: usize,
+    pub(crate) failures: Vec<String>,
+}
+
+impl ExportSummary {
+    pub(crate) fn exported(&self) -> usize {
+        self.links.len()
+    }
+}
+
 pub(crate) struct EndpointLinkExporter {
     endpoint_binary: String,
     settings_path: PathBuf,
@@ -66,7 +81,7 @@ impl EndpointLinkExporter {
     pub(crate) async fn export_links(
         &self,
         accounts: Vec<&Account>,
-    ) -> Result<BTreeMap<String, String>, String> {
+    ) -> Result<ExportSummary, String> {
         let usernames = accounts
             .into_iter()
             .map(|account| account.username.clone())
@@ -77,9 +92,9 @@ impl EndpointLinkExporter {
     pub(crate) async fn export_usernames(
         &self,
         usernames: Vec<String>,
-    ) -> Result<BTreeMap<String, String>, String> {
+    ) -> Result<ExportSummary, String> {
         if usernames.is_empty() {
-            return Ok(BTreeMap::new());
+            return Ok(ExportSummary::default());
         }
 
         let mut join_set = JoinSet::new();
@@ -112,14 +127,24 @@ impl EndpointLinkExporter {
             });
         }
 
-        let mut links = BTreeMap::new();
+        let mut summary = ExportSummary::default();
         while let Some(result) = join_set.join_next().await {
-            let (username, tt_link) = result
-                .map_err(|err| format!("TT link export task failed: {err}"))??;
-            links.insert(username, tt_link);
+            match result {
+                Ok(Ok((username, tt_link))) => {
+                    summary.links.insert(username, tt_link);
+                }
+                Ok(Err(err)) => {
+                    summary.failed += 1;
+                    summary.failures.push(err);
+                }
+                Err(err) => {
+                    summary.failed += 1;
+                    summary.failures.push(format!("TT link export task failed: {err}"));
+                }
+            }
         }
 
-        Ok(links)
+        Ok(summary)
     }
 }
 
@@ -301,12 +326,46 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(links.get("alice"), Some(&"tt://alice".to_string()));
+        assert_eq!(links.links.get("alice"), Some(&"tt://alice".to_string()));
         let args_log = std::fs::read_to_string(args_log_path).unwrap();
         assert!(args_log.contains("--format deeplink"));
         assert!(args_log.contains("--address 89.110.100.165:443"));
         assert!(args_log.contains("--custom-sni sni.example.com"));
         assert!(args_log.contains("--name Primary"));
         assert!(args_log.contains("--dns-upstream 8.8.8.8"));
+    }
+
+    #[tokio::test]
+    async fn exporter_collects_partial_failures() {
+        let temp_dir = TempDir::new().unwrap();
+        let script_path = temp_dir.path().join("fake_endpoint_partial.sh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\nuser=\"\"\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"--client_config\" ]; then shift; user=\"$1\"; fi\n  shift\ndone\nif [ \"$user\" = \"broken\" ]; then echo fail >&2; exit 1; fi\necho \"tt://$user\"\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+
+        let exporter = EndpointLinkExporter::new(
+            script_path.display().to_string(),
+            temp_dir.path().join("vpn.toml"),
+            temp_dir.path().join("hosts.toml"),
+            EndpointExportOptions::new("1.1.1.1:443".to_string(), None, None, vec![]),
+        );
+
+        let summary = exporter
+            .export_usernames(vec!["alice".to_string(), "broken".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(summary.exported(), 1);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(
+            summary.links.get("alice").cloned(),
+            Some("tt://alice".to_string())
+        );
+        assert_eq!(summary.failures.len(), 1);
     }
 }

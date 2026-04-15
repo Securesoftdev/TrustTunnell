@@ -12,6 +12,25 @@ inventory-driven sidecar synchronization.
 
 ## Sidecar modes
 
+## Classic sidecar pipeline phases
+
+`classic_agent` executes these stages in strict order for each sync cycle:
+
+1. `bootstrap_credentials_import` (startup-only, guarded by runtime primary marker)
+2. `reconcile_apply_runtime_state`
+3. `candidate_credentials_write`
+4. `candidate_credentials_syntax_validation`
+5. `temp_endpoint_config_render`
+6. `endpoint_runtime_validation`
+7. `export_readiness_check`
+8. `inventory_snapshot_load_and_state_load`
+9. `inventory_delta_missing_stale_removed`
+10. `tt_link_export`
+11. `lk_bulk_write`
+12. `post_write_state_persist`
+
+All candidate/debug/state artifacts are written under `TRUSTTUNNEL_RUNTIME_DIR` via runtime workspace helpers.
+
 ### 1) Startup bootstrap pass
 
 Executed once on startup:
