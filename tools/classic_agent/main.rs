@@ -1,4 +1,5 @@
 mod legacy;
+mod exporter;
 mod link_config;
 
 use legacy::lk_api::{
@@ -6,9 +7,9 @@ use legacy::lk_api::{
     OnboardingPayload, SyncPayload, SyncReportPayload, SyncResponse, DEFAULT_SYNC_PATH_TEMPLATE,
     DEFAULT_SYNC_REPORT_PATH, DEFAULT_HEARTBEAT_PATH, DEFAULT_REGISTER_PATH,
 };
+use exporter::{EndpointExportOptions, EndpointLinkExporter};
 use link_config::LinkGenerationConfig;
 use reqwest::StatusCode;
-use trusttunnel_deeplink::DeepLinkConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::read_dir;
@@ -176,6 +177,7 @@ struct Config {
     apply_cmd: Option<String>,
     runtime_pid_path: Option<PathBuf>,
     runtime_process_name: Option<String>,
+    endpoint_binary: String,
     agent_version: String,
     runtime_version: String,
     pending_sync_reports_path: Option<PathBuf>,
@@ -285,6 +287,8 @@ impl Config {
             .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
         let runtime_version =
             optional_env_nonempty("TRUSTTUNNEL_RUNTIME_VERSION").unwrap_or_else(|| "unknown".to_string());
+        let endpoint_binary = optional_env_nonempty("TRUSTTUNNEL_ENDPOINT_BINARY")
+            .unwrap_or_else(|| "trusttunnel_endpoint".to_string());
         let pending_sync_reports_path = if runtime_mode == RuntimeMode::LegacyHttp {
             Some(trusttunnel_runtime_dir.join(SYNC_REPORT_OUTBOX_FILE))
         } else {
@@ -322,6 +326,7 @@ impl Config {
             apply_cmd,
             runtime_pid_path,
             runtime_process_name,
+            endpoint_binary,
             agent_version,
             runtime_version,
             pending_sync_reports_path,
@@ -1072,7 +1077,7 @@ impl Agent {
         &self,
         snapshot: &SyncPayload,
     ) -> Result<(Vec<AccountExportOwned>, TtLinkReconcileStats), String> {
-        build_account_exports(&self.cfg, snapshot)
+        build_account_exports(&self.cfg, snapshot).await
     }
 
     async fn send_sync_report(
@@ -2192,7 +2197,7 @@ fn needs_tt_link_regeneration(account: &Account, current_config_hash: &str) -> b
         || account.tt_link_stale
 }
 
-fn build_account_exports(
+async fn build_account_exports(
     cfg: &Config,
     snapshot: &SyncPayload,
 ) -> Result<(Vec<AccountExportOwned>, TtLinkReconcileStats), String> {
@@ -2219,30 +2224,42 @@ fn build_account_exports(
 
     let mut stats = TtLinkReconcileStats::default();
     let mut exports = Vec::new();
+    let settings_path = resolve_runtime_path(&cfg.trusttunnel_runtime_dir, &cfg.trusttunnel_config_file);
+    let hosts_path = resolve_runtime_path(&cfg.trusttunnel_runtime_dir, &cfg.trusttunnel_hosts_file);
+    let exporter = EndpointLinkExporter::new(
+        cfg.endpoint_binary.clone(),
+        settings_path,
+        hosts_path,
+        EndpointExportOptions::new(
+            server_address.clone(),
+            custom_sni.clone(),
+            display_name.clone(),
+            dns_servers.clone(),
+        ),
+    );
 
+    let regenerate_accounts = snapshot
+        .accounts
+        .iter()
+        .filter(|account| account.enabled && needs_tt_link_regeneration(account, &config_hash))
+        .collect::<Vec<_>>();
     for account in &snapshot.accounts {
         if !account.enabled {
             stats.skipped_disabled += 1;
+        }
+    }
+    let regenerated_links = exporter.export_links(regenerate_accounts).await?;
+
+    for account in &snapshot.accounts {
+        if !account.enabled {
             continue;
         }
-
         let must_regenerate = needs_tt_link_regeneration(account, &config_hash);
         let (tt_link, account_config_hash) = if must_regenerate {
-            let mut deep_link_builder = DeepLinkConfig::builder()
-                .hostname(cert_domain.clone())
-                .addresses(vec![server_address.clone()])
-                .username(account.username.clone())
-                .password(account.password.clone())
-                .custom_sni(custom_sni.clone())
-                .upstream_protocol(link_cfg.protocol())
-                .dns_upstreams(dns_servers.clone());
-            deep_link_builder = deep_link_builder.name(display_name.clone());
-            let deep_link = deep_link_builder
-                .build()
-                .map_err(|e| format!("failed to build TT deep-link config for {}: {e}", account.username))?;
-            let tt_link = trusttunnel_deeplink::encode(&deep_link)
-                .map_err(|e| format!("failed to encode TT deep-link for {}: {e}", account.username))?;
-
+            let tt_link = regenerated_links
+                .get(account.username.as_str())
+                .ok_or_else(|| format!("missing generated TT link for account {}", account.username))?
+                .clone();
             stats.updated_total += 1;
             if account.tt_link.trim().is_empty() {
                 stats.updated_empty_link += 1;
@@ -2584,6 +2601,22 @@ mod tests {
     #[cfg(feature = "legacy-lk-http")]
     use tokio::sync::Mutex;
 
+    fn make_fake_endpoint_script(temp_dir: &TempDir, args_log_path: &Path) -> String {
+        let script_path = temp_dir.path().join("fake_endpoint.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nuser=\"\"\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"--client_config\" ]; then shift; user=\"$1\"; fi\n  shift\ndone\necho \"tt://$user\"\n",
+                args_log_path.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+        script_path.display().to_string()
+    }
+
     #[cfg(feature = "legacy-lk-http")]
     #[derive(Clone)]
     struct MockResponse {
@@ -2784,6 +2817,7 @@ message_queue_capacity = 4096
             apply_cmd: apply_cmd.map(ToString::to_string),
             runtime_pid_path: Some(runtime_dir.join("trusttunnel.pid")),
             runtime_process_name: Some("trusttunnel_endpoint".to_string()),
+            endpoint_binary: "trusttunnel_endpoint".to_string(),
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             runtime_version: "test".to_string(),
             pending_sync_reports_path: Some(runtime_dir.join(SYNC_REPORT_OUTBOX_FILE)),
@@ -2966,10 +3000,12 @@ message_queue_capacity = 4096
         assert_eq!(runtime_accounts[0].username, "active");
     }
 
-    #[test]
-    fn account_exports_generate_valid_tt_links() {
+    #[tokio::test]
+    async fn account_exports_generate_valid_tt_links() {
         let temp_dir = TempDir::new().unwrap();
         let runtime_dir = temp_dir.path();
+        let args_log_path = runtime_dir.join("args.log");
+        let endpoint_binary = make_fake_endpoint_script(&temp_dir, &args_log_path);
         std::fs::write(
             runtime_dir.join("tt-link.toml"),
             "node_external_id = \"node-1\"\nserver_address = \"89.110.100.165:443\"\ncert_domain = \"cdn.securesoft.dev\"\ncustom_sni = \"sni.example.com\"\nprotocol = \"http2\"\ndisplay_name = \"Primary\"\ndns_servers = [\"8.8.8.8\"]\n",
@@ -3022,27 +3058,26 @@ message_queue_capacity = 4096
             apply_cmd: None,
             runtime_pid_path: Some(PathBuf::from("trusttunnel.pid")),
             runtime_process_name: Some("trusttunnel_endpoint".to_string()),
+            endpoint_binary,
             agent_version: "test".to_string(),
             runtime_version: "test".to_string(),
             pending_sync_reports_path: Some(PathBuf::from("pending_sync_reports.jsonl")),
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
         };
 
-        let (exports, stats) = build_account_exports(&cfg, &snapshot).unwrap();
+        let (exports, stats) = build_account_exports(&cfg, &snapshot).await.unwrap();
         assert_eq!(exports.len(), 1);
         assert_eq!(stats.updated_total, 1);
-        assert!(exports[0].tt_link.starts_with("tt://"));
-        let decoded = trusttunnel_deeplink::decode(&exports[0].tt_link).unwrap();
-        assert_eq!(decoded.hostname, "cdn.securesoft.dev");
-        assert_eq!(decoded.addresses, vec!["89.110.100.165:443".to_string()]);
-        assert_eq!(decoded.username, "alice");
-        assert_eq!(decoded.password, "secret");
-        assert_eq!(decoded.custom_sni, Some("sni.example.com".to_string()));
-        assert_eq!(decoded.name, Some("Primary".to_string()));
-        assert_eq!(decoded.dns_upstreams, vec!["8.8.8.8".to_string()]);
+        assert_eq!(exports[0].tt_link, "tt://alice");
         assert_eq!(exports[0].server_address, "89.110.100.165:443");
         assert_eq!(exports[0].cert_domain, "cdn.securesoft.dev");
         assert_eq!(exports[0].config_hash.len(), 64);
+        let args_log = std::fs::read_to_string(args_log_path).unwrap();
+        assert!(args_log.contains("--format deeplink"));
+        assert!(args_log.contains("--address 89.110.100.165:443"));
+        assert!(args_log.contains("--custom-sni sni.example.com"));
+        assert!(args_log.contains("--name Primary"));
+        assert!(args_log.contains("--dns-upstream 8.8.8.8"));
     }
 
     #[test]
@@ -3079,8 +3114,8 @@ message_queue_capacity = 4096
         ));
     }
 
-    #[test]
-    fn account_exports_reuse_current_tt_link_when_up_to_date() {
+    #[tokio::test]
+    async fn account_exports_reuse_current_tt_link_when_up_to_date() {
         let temp_dir = TempDir::new().unwrap();
         let runtime_dir = temp_dir.path();
         std::fs::write(
@@ -3116,6 +3151,7 @@ message_queue_capacity = 4096
             apply_cmd: None,
             runtime_pid_path: Some(PathBuf::from("trusttunnel.pid")),
             runtime_process_name: Some("trusttunnel_endpoint".to_string()),
+            endpoint_binary: "trusttunnel_endpoint".to_string(),
             agent_version: "test".to_string(),
             runtime_version: "test".to_string(),
             pending_sync_reports_path: Some(PathBuf::from("pending_sync_reports.jsonl")),
@@ -3145,7 +3181,7 @@ message_queue_capacity = 4096
             }],
         };
 
-        let (exports, stats) = build_account_exports(&cfg, &snapshot).unwrap();
+        let (exports, stats) = build_account_exports(&cfg, &snapshot).await.unwrap();
         assert_eq!(exports.len(), 1);
         assert_eq!(exports[0].tt_link, "tt://existing");
         assert_eq!(exports[0].config_hash, config_hash);
@@ -3153,10 +3189,12 @@ message_queue_capacity = 4096
         assert_eq!(stats.skipped_up_to_date, 1);
     }
 
-    #[test]
-    fn tt_link_generation_is_stable_for_same_account_and_config() {
+    #[tokio::test]
+    async fn tt_link_generation_is_stable_for_same_account_and_config() {
         let temp_dir = TempDir::new().unwrap();
         let runtime_dir = temp_dir.path();
+        let args_log_path = runtime_dir.join("args.log");
+        let endpoint_binary = make_fake_endpoint_script(&temp_dir, &args_log_path);
         std::fs::write(
             runtime_dir.join("tt-link.toml"),
             "node_external_id = \"node-1\"\nserver_address = \"89.110.100.165:443\"\ncert_domain = \"cdn.securesoft.dev\"\ncustom_sni = \"cdn.securesoft.dev\"\nprotocol = \"http2\"\ndns_servers = [\"8.8.8.8\"]\n",
@@ -3190,6 +3228,7 @@ message_queue_capacity = 4096
             apply_cmd: None,
             runtime_pid_path: Some(PathBuf::from("trusttunnel.pid")),
             runtime_process_name: Some("trusttunnel_endpoint".to_string()),
+            endpoint_binary,
             agent_version: "test".to_string(),
             runtime_version: "test".to_string(),
             pending_sync_reports_path: Some(PathBuf::from("pending_sync_reports.jsonl")),
@@ -3216,8 +3255,8 @@ message_queue_capacity = 4096
             }],
         };
 
-        let (first, _) = build_account_exports(&cfg, &snapshot).unwrap();
-        let (second, _) = build_account_exports(&cfg, &snapshot).unwrap();
+        let (first, _) = build_account_exports(&cfg, &snapshot).await.unwrap();
+        let (second, _) = build_account_exports(&cfg, &snapshot).await.unwrap();
         assert_eq!(first[0].tt_link, second[0].tt_link);
     }
 
@@ -3352,6 +3391,7 @@ message_queue_capacity = 4096
             apply_cmd: None,
             runtime_pid_path: None,
             runtime_process_name: None,
+            endpoint_binary: "trusttunnel_endpoint".to_string(),
             agent_version: "test".to_string(),
             runtime_version: "test".to_string(),
             pending_sync_reports_path: None,
