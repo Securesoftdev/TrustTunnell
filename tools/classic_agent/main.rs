@@ -34,7 +34,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::{Instant, MissedTickBehavior, interval};
 use toml_edit::value;
-use trusttunnel::settings::Settings;
+use trusttunnel::settings::{Settings, TlsHostsSettings};
 use prometheus::{Encoder, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder};
 
 const SYNC_REPORT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -1694,19 +1694,67 @@ impl Agent {
         parse_access_artifacts(&raw).map(|_| ())
     }
 
-    fn validate_temp_endpoint_config_with_parser(&self, temp_config_path: &Path) -> Result<(), String> {
+    fn validate_endpoint_settings_parser(
+        &self,
+        temp_config_path: &Path,
+        candidate_path: &Path,
+    ) -> Result<Settings, String> {
         let settings_content = std::fs::read_to_string(temp_config_path).map_err(|e| {
             format!(
                 "failed to read temp endpoint settings {}: {e}",
                 temp_config_path.display()
             )
         })?;
-        toml::from_str::<Settings>(&settings_content).map(|_| ()).map_err(|e| {
+        let parsed_doc = settings_content.parse::<toml_edit::Document>().map_err(|e| {
             format!(
-                "failed to validate candidate credentials via endpoint parser using {}: {e}",
+                "failed to parse temp endpoint settings document {}: {e}",
+                temp_config_path.display()
+            )
+        })?;
+        let configured_credentials = parsed_doc
+            .get("credentials_file")
+            .and_then(toml_edit::Item::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "temp endpoint settings {} does not contain string field credentials_file",
+                    temp_config_path.display()
+                )
+            })?;
+        let candidate_path_str = path_to_string(candidate_path)?;
+        if configured_credentials != candidate_path_str {
+            return Err(format!(
+                "temp endpoint settings {} points credentials_file={} instead of candidate_path={}",
+                temp_config_path.display(),
+                configured_credentials,
+                candidate_path.display()
+            ));
+        }
+        toml::from_str::<Settings>(&settings_content).map_err(|e| {
+            format!(
+                "failed to validate endpoint settings parser using {}: {e}",
                 temp_config_path.display()
             )
         })
+    }
+
+    fn validate_endpoint_runtime_entrypoint(
+        &self,
+        temp_config_path: &Path,
+        candidate_path: &Path,
+    ) -> Result<(), String> {
+        let settings = self.validate_endpoint_settings_parser(temp_config_path, candidate_path)?;
+        let hosts_path =
+            resolve_runtime_path(&self.cfg.trusttunnel_runtime_dir, &self.cfg.trusttunnel_hosts_file);
+        let hosts_content = std::fs::read_to_string(&hosts_path)
+            .map_err(|e| format!("failed to read endpoint hosts settings {}: {e}", hosts_path.display()))?;
+        toml::from_str::<TlsHostsSettings>(&hosts_content).map_err(|e| {
+            format!(
+                "failed to parse endpoint hosts settings {}: {e}",
+                hosts_path.display()
+            )
+        })?;
+        let _ = settings;
+        Ok(())
     }
 
     async fn cleanup_validation_files(
@@ -1772,8 +1820,18 @@ impl Agent {
             self.cfg.node_external_id,
             candidate_path.display()
         );
+        println!(
+            "phase=credentials_validation_begin node={} parser=parse_access_artifacts stage=candidate_credentials_syntax file={}",
+            self.cfg.node_external_id,
+            candidate_path.display()
+        );
         self.validate_candidate_credentials_syntax(&candidate_path)
-            .map_err(|e| format!("phase=candidate_toml_invalid node={} candidate_path={}: {e}", self.cfg.node_external_id, candidate_path.display()))?;
+            .map_err(|e| format!("phase=credentials_validation_failed node={} parser=parse_access_artifacts stage=candidate_credentials_syntax file={}: {e}", self.cfg.node_external_id, candidate_path.display()))?;
+        println!(
+            "phase=credentials_validation_ok node={} parser=parse_access_artifacts stage=candidate_credentials_syntax file={}",
+            self.cfg.node_external_id,
+            candidate_path.display()
+        );
         println!(
             "phase=candidate_toml_valid node={} candidate_path={}",
             self.cfg.node_external_id,
@@ -1791,14 +1849,48 @@ impl Agent {
             candidate_path.display()
         );
 
-        self.validate_temp_endpoint_config_with_parser(&temp_config_path).map_err(|e| {
-            format!(
-                "phase=endpoint_runtime_validation_failed node={} temp_config_path={} candidate_path={}: {e}",
-                self.cfg.node_external_id,
-                temp_config_path.display(),
-                candidate_path.display()
-            )
-        })?;
+        println!(
+            "phase=settings_validation_begin node={} parser=trusttunnel::Settings stage=temp_config_settings_parse file={}",
+            self.cfg.node_external_id,
+            temp_config_path.display()
+        );
+        self.validate_endpoint_settings_parser(&temp_config_path, &candidate_path)
+            .map_err(|e| {
+                format!(
+                    "phase=settings_validation_failed node={} parser=trusttunnel::Settings stage=temp_config_settings_parse temp_config_path={} candidate_path={}: {e}",
+                    self.cfg.node_external_id,
+                    temp_config_path.display(),
+                    candidate_path.display()
+                )
+            })?;
+        println!(
+            "phase=settings_validation_ok node={} parser=trusttunnel::Settings stage=temp_config_settings_parse file={}",
+            self.cfg.node_external_id,
+            temp_config_path.display()
+        );
+
+        println!(
+            "phase=runtime_validation_begin node={} parser=endpoint_startup_entrypoint stage=endpoint_runtime_validation temp_config_path={} hosts_path={}",
+            self.cfg.node_external_id,
+            temp_config_path.display(),
+            resolve_runtime_path(&self.cfg.trusttunnel_runtime_dir, &self.cfg.trusttunnel_hosts_file).display()
+        );
+        self.validate_endpoint_runtime_entrypoint(&temp_config_path, &candidate_path)
+            .map_err(|e| {
+                format!(
+                    "phase=endpoint_runtime_validation_failed node={} parser=endpoint_startup_entrypoint stage=runtime_validation temp_config_path={} candidate_path={}: {e}",
+                    self.cfg.node_external_id,
+                    temp_config_path.display(),
+                    candidate_path.display()
+                )
+            })?;
+        println!(
+            "phase=runtime_validation_ok node={} parser=endpoint_startup_entrypoint stage=endpoint_runtime_validation temp_config_path={} candidate_path={}",
+            self.cfg.node_external_id,
+            temp_config_path.display(),
+            candidate_path.display()
+        );
+
         println!(
             "phase=endpoint_runtime_validation_ok node={} temp_config_path={} candidate_path={}",
             self.cfg.node_external_id,
@@ -3143,8 +3235,26 @@ mod tests {
         let credentials_file_abs = runtime_dir.join(&credentials_file_rel);
         let hosts_file = runtime_dir.join("hosts.toml");
         let rules_file = runtime_dir.join("rules.toml");
+        let cert_file = runtime_dir.join("cert.pem");
+        let key_file = runtime_dir.join("key.pem");
         fs::write(&credentials_file_abs, b"").await.unwrap();
-        fs::write(&hosts_file, b"").await.unwrap();
+        fs::write(&cert_file, b"placeholder").await.unwrap();
+        fs::write(&key_file, b"placeholder").await.unwrap();
+        fs::write(
+            &hosts_file,
+            format!(
+                r#"
+[[main_hosts]]
+hostname = "node-1.example"
+cert_chain_path = "{}"
+private_key_path = "{}"
+"#,
+                cert_file.display(),
+                key_file.display()
+            ),
+        )
+        .await
+        .unwrap();
         fs::write(&rules_file, b"").await.unwrap();
 
         let settings = format!(
@@ -3239,8 +3349,26 @@ message_queue_capacity = 4096
         let credentials_file = runtime_dir.join("credentials.toml");
         let hosts_file = runtime_dir.join("hosts.toml");
         let rules_file = runtime_dir.join("rules.toml");
+        let cert_file = runtime_dir.join("cert.pem");
+        let key_file = runtime_dir.join("key.pem");
         fs::write(&credentials_file, b"").await.unwrap();
-        fs::write(&hosts_file, b"").await.unwrap();
+        fs::write(&cert_file, b"placeholder").await.unwrap();
+        fs::write(&key_file, b"placeholder").await.unwrap();
+        fs::write(
+            &hosts_file,
+            format!(
+                r#"
+[[main_hosts]]
+hostname = "node-1.example"
+cert_chain_path = "{}"
+private_key_path = "{}"
+"#,
+                cert_file.display(),
+                key_file.display()
+            ),
+        )
+        .await
+        .unwrap();
         fs::write(&rules_file, b"").await.unwrap();
         fs::write(
             &config_file,
@@ -4015,6 +4143,29 @@ password = "secret
     }
 
     #[tokio::test]
+    async fn runtime_validation_uses_settings_entrypoint_for_temp_config() {
+        let tmp_dir = TempDir::new().unwrap();
+        let agent = make_db_worker_agent_for_validation_tests(&tmp_dir, false).await;
+        let candidate = agent
+            .write_runtime_credentials_tmp(b"[[client]]\nusername=\"alice\"\npassword=\"secret\"\n")
+            .await
+            .unwrap();
+        let temp_config_path = agent
+            .write_temp_endpoint_config_for_candidate(&candidate)
+            .await
+            .unwrap();
+
+        let syntax_err = agent
+            .validate_candidate_credentials_syntax(&temp_config_path)
+            .unwrap_err();
+        assert!(syntax_err.contains("credentials TOML does not contain [[client]] entries"));
+
+        agent
+            .validate_endpoint_runtime_entrypoint(&temp_config_path, &candidate)
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn candidate_validation_failure_keeps_debug_artifacts() {
         let tmp_dir = TempDir::new().unwrap();
         let agent = make_db_worker_agent_for_validation_tests(&tmp_dir, true).await;
@@ -4027,7 +4178,7 @@ password = "secret
             .validate_candidate_credentials_pipeline(candidate.clone())
             .await
             .unwrap_err();
-        assert!(err.contains("phase=candidate_toml_invalid"));
+        assert!(err.contains("phase=credentials_validation_failed"));
         assert!(candidate.exists());
     }
 
@@ -4043,10 +4194,28 @@ password = "secret
         let source_rules_file = source_dir.join("rules.toml");
         let source_config_file = source_dir.join("vpn.toml");
         let source_hosts_file = source_dir.join("hosts.toml");
+        let source_cert_file = source_dir.join("cert.pem");
+        let source_key_file = source_dir.join("key.pem");
         let runtime_credentials_file = runtime_dir.join("credentials.runtime.toml");
         fs::write(&source_credentials_file, b"").await.unwrap();
         fs::write(&source_rules_file, b"").await.unwrap();
-        fs::write(&source_hosts_file, b"").await.unwrap();
+        fs::write(&source_cert_file, b"placeholder").await.unwrap();
+        fs::write(&source_key_file, b"placeholder").await.unwrap();
+        fs::write(
+            &source_hosts_file,
+            format!(
+                r#"
+[[main_hosts]]
+hostname = "node-1.example"
+cert_chain_path = "{}"
+private_key_path = "{}"
+"#,
+                source_cert_file.display(),
+                source_key_file.display()
+            ),
+        )
+        .await
+        .unwrap();
         fs::write(&runtime_credentials_file, b"").await.unwrap();
         fs::write(
             &source_config_file,
