@@ -47,6 +47,8 @@ const HEARTBEAT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const HEARTBEAT_MAX_ATTEMPTS: usize = 3;
 const SYNC_REPORT_OUTBOX_FILE: &str = "pending_sync_reports.jsonl";
 const RUNTIME_PRIMARY_MARKER_FILE: &str = ".runtime_credentials_primary";
+const DEFAULT_RUNTIME_VALIDATION_MIN_USERS: usize = 1;
+const DEFAULT_RUNTIME_VALIDATION_MAX_USERS: usize = 100;
 
 mod sidecar_sync {
     use super::sha256_hex;
@@ -207,6 +209,8 @@ struct Config {
     metrics_address: SocketAddr,
     debug_preserve_temp_files: bool,
     validation_strict_mode: bool,
+    runtime_validation_min_users: usize,
+    runtime_validation_max_users: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -340,6 +344,45 @@ impl Config {
                 )
             })
             .unwrap_or(false);
+        let runtime_validation_min_users = optional_env_nonempty(
+            "TRUSTTUNNEL_RUNTIME_VALIDATION_MIN_USERS",
+        )
+        .map(|raw| {
+            raw.parse::<usize>().map_err(|e| {
+                format!(
+                    "TRUSTTUNNEL_RUNTIME_VALIDATION_MIN_USERS must be a positive integer: {e}"
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or(DEFAULT_RUNTIME_VALIDATION_MIN_USERS);
+        if runtime_validation_min_users == 0 {
+            return Err(
+                "TRUSTTUNNEL_RUNTIME_VALIDATION_MIN_USERS must be greater than zero".to_string(),
+            );
+        }
+        let runtime_validation_max_users = optional_env_nonempty(
+            "TRUSTTUNNEL_RUNTIME_VALIDATION_MAX_USERS",
+        )
+        .map(|raw| {
+            raw.parse::<usize>().map_err(|e| {
+                format!(
+                    "TRUSTTUNNEL_RUNTIME_VALIDATION_MAX_USERS must be a positive integer: {e}"
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or(DEFAULT_RUNTIME_VALIDATION_MAX_USERS);
+        if runtime_validation_max_users == 0 {
+            return Err(
+                "TRUSTTUNNEL_RUNTIME_VALIDATION_MAX_USERS must be greater than zero".to_string(),
+            );
+        }
+        if runtime_validation_min_users > runtime_validation_max_users {
+            return Err(format!(
+                "TRUSTTUNNEL_RUNTIME_VALIDATION_MIN_USERS ({runtime_validation_min_users}) must be <= TRUSTTUNNEL_RUNTIME_VALIDATION_MAX_USERS ({runtime_validation_max_users})"
+            ));
+        }
 
         let cfg = Self {
             lk_base_url,
@@ -375,6 +418,8 @@ impl Config {
             metrics_address,
             debug_preserve_temp_files,
             validation_strict_mode,
+            runtime_validation_min_users,
+            runtime_validation_max_users,
         };
         cfg.validate_paths()?;
         Ok(cfg)
@@ -1767,22 +1812,76 @@ impl Agent {
                 candidate_path.display()
             )
         })?;
-        let sample_username =
-            runtime_validation_sample_username_from_raw_toml(&raw_candidate).map_err(|e| {
-                format!(
-                    "validation_path=runtime_entrypoint failed to derive sample username from candidate {}: {e}",
-                    candidate_path.display()
-                )
-            })?;
+        let usernames = runtime_validation_usernames_from_raw_toml(&raw_candidate).map_err(|e| {
+            format!(
+                "validation_path=runtime_entrypoint failed to derive usernames from candidate {}: {e}",
+                candidate_path.display()
+            )
+        })?;
+        let selected_usernames = select_runtime_validation_usernames(
+            usernames,
+            self.cfg.runtime_validation_min_users,
+            self.cfg.runtime_validation_max_users,
+        )
+        .map_err(|e| {
+            format!(
+                "validation_path=runtime_entrypoint failed to choose validation usernames for candidate {}: {e}",
+                candidate_path.display()
+            )
+        })?;
         let hosts_path =
             resolve_runtime_path(&self.cfg.trusttunnel_runtime_dir, &self.cfg.trusttunnel_hosts_file);
+        if selected_usernames.limited {
+            println!(
+                "phase=runtime_validation_user_limit_applied node={} strategy=sorted_take_first total_usernames={} selected_usernames={} min_users={} max_users={} candidate_path={}",
+                self.cfg.node_external_id,
+                selected_usernames.total,
+                selected_usernames.selected.len(),
+                self.cfg.runtime_validation_min_users,
+                self.cfg.runtime_validation_max_users,
+                candidate_path.display()
+            );
+        }
 
+        let mut failures = Vec::new();
+        for username in &selected_usernames.selected {
+            if let Err(error) = self
+                .validate_endpoint_runtime_entrypoint_for_username(
+                    temp_config_path,
+                    candidate_path,
+                    &hosts_path,
+                    username,
+                )
+                .await
+            {
+                failures.push(format!("username={username}: {error}"));
+            }
+        }
+        if !failures.is_empty() {
+            return Err(format!(
+                "endpoint runtime validation failed for {}/{} selected usernames: {}",
+                failures.len(),
+                selected_usernames.selected.len(),
+                failures.join(" | ")
+            ));
+        }
+
+        Ok(())
+    }
+
+    async fn validate_endpoint_runtime_entrypoint_for_username(
+        &self,
+        temp_config_path: &Path,
+        candidate_path: &Path,
+        hosts_path: &Path,
+        username: &str,
+    ) -> Result<(), String> {
         let mut command = Command::new(&self.cfg.endpoint_binary);
         command
             .arg(temp_config_path)
-            .arg(&hosts_path)
+            .arg(hosts_path)
             .arg("--client_config")
-            .arg(&sample_username)
+            .arg(username)
             .arg("--format")
             .arg("deeplink")
             .arg("--address")
@@ -1792,18 +1891,20 @@ impl Agent {
             .await
             .map_err(|_| {
                 format!(
-                    "endpoint runtime validation timed out for binary={} settings={} hosts={} username={sample_username}",
+                    "endpoint runtime validation timed out for binary={} settings={} hosts={} username={}",
                     self.cfg.endpoint_binary,
                     temp_config_path.display(),
                     hosts_path.display(),
+                    username,
                 )
             })?
             .map_err(|e| {
                 format!(
-                    "failed to execute endpoint runtime validation binary={} settings={} hosts={}: {e}",
+                    "failed to execute endpoint runtime validation binary={} settings={} hosts={} username={}: {e}",
                     self.cfg.endpoint_binary,
                     temp_config_path.display(),
                     hosts_path.display(),
+                    username,
                 )
             })?;
         let stdout = String::from_utf8(output.stdout)
@@ -1812,25 +1913,23 @@ impl Agent {
             .map_err(|e| format!("endpoint runtime validation stderr is not valid UTF-8: {e}"))?;
         if !output.status.success() {
             return Err(format!(
-                "endpoint runtime validation failed: status={} settings={} hosts={} candidate={} username={} stdout={} stderr={}",
+                "status={} settings={} hosts={} candidate={} stdout={} stderr={}",
                 output.status,
                 temp_config_path.display(),
                 hosts_path.display(),
                 candidate_path.display(),
-                sample_username,
                 stdout.trim(),
                 stderr.trim()
             ));
         }
         if !stdout.trim().starts_with("tt://") {
             return Err(format!(
-                "endpoint runtime validation returned invalid client config output for username={}: stdout={} stderr={}",
-                sample_username,
+                "invalid client config output for candidate={}: stdout={} stderr={}",
+                candidate_path.display(),
                 stdout.trim(),
                 stderr.trim()
             ));
         }
-
         Ok(())
     }
 
@@ -2567,10 +2666,13 @@ fn parse_access_artifacts(raw: &str) -> Result<Vec<sidecar_sync::AccessArtifact>
 fn runtime_validation_sample_username(
     credentials: &[sidecar_sync::AccessArtifact],
 ) -> Option<&str> {
-    credentials.first().map(|item| item.username.as_str())
+    credentials
+        .iter()
+        .map(|item| item.username.as_str())
+        .min()
 }
 
-fn runtime_validation_sample_username_from_raw_toml(raw_credentials: &str) -> Result<String, String> {
+fn runtime_validation_usernames_from_raw_toml(raw_credentials: &str) -> Result<Vec<String>, String> {
     let parsed_doc = raw_credentials
         .parse::<toml_edit::Document>()
         .map_err(|e| format!("credentials TOML parse error: {e}"))?;
@@ -2578,17 +2680,80 @@ fn runtime_validation_sample_username_from_raw_toml(raw_credentials: &str) -> Re
         .get("client")
         .and_then(toml_edit::Item::as_array_of_tables)
         .ok_or_else(|| "credentials TOML does not contain [[client]] entries".to_string())?;
-    let first = clients
-        .iter()
-        .next()
-        .ok_or_else(|| "credentials TOML does not contain any [[client]] entries".to_string())?;
-    let username = first
-        .get("username")
-        .and_then(toml_edit::Item::as_str)
-        .ok_or_else(|| {
-            "credentials TOML [[client]] entry does not contain string username".to_string()
-        })?;
-    Ok(username.to_string())
+    if clients.is_empty() {
+        return Err("credentials TOML does not contain any [[client]] entries".to_string());
+    }
+
+    let mut usernames = Vec::with_capacity(clients.len());
+    for (index, client) in clients.iter().enumerate() {
+        let username = client
+            .get("username")
+            .and_then(toml_edit::Item::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "credentials TOML [[client]] entry #{} does not contain string username",
+                    index + 1
+                )
+            })?;
+        if username.is_empty() {
+            return Err(format!(
+                "credentials TOML [[client]] entry #{} has empty username",
+                index + 1
+            ));
+        }
+        usernames.push(username.to_string());
+    }
+    Ok(usernames)
+}
+
+#[derive(Debug)]
+struct RuntimeValidationSelection {
+    selected: Vec<String>,
+    total: usize,
+    limited: bool,
+}
+
+fn select_runtime_validation_usernames(
+    usernames: Vec<String>,
+    min_users: usize,
+    max_users: usize,
+) -> Result<RuntimeValidationSelection, String> {
+    if min_users == 0 {
+        return Err("min_users must be greater than zero".to_string());
+    }
+    if max_users == 0 {
+        return Err("max_users must be greater than zero".to_string());
+    }
+    if min_users > max_users {
+        return Err(format!(
+            "min_users ({min_users}) must be <= max_users ({max_users})"
+        ));
+    }
+    if usernames.is_empty() {
+        return Err("credentials TOML does not contain any usernames".to_string());
+    }
+    let mut sorted_unique = usernames;
+    sorted_unique.sort();
+    sorted_unique.dedup();
+    if sorted_unique.len() < min_users {
+        return Err(format!(
+            "credentials TOML contains {} unique usernames, below required minimum {}",
+            sorted_unique.len(),
+            min_users
+        ));
+    }
+    let total = sorted_unique.len();
+    let limited = total > max_users;
+    let selected = if limited {
+        sorted_unique.into_iter().take(max_users).collect()
+    } else {
+        sorted_unique
+    };
+    Ok(RuntimeValidationSelection {
+        selected,
+        total,
+        limited,
+    })
 }
 
 fn validate_checksum(snapshot: &SyncPayload, raw_body: &[u8]) -> bool {
@@ -3450,6 +3615,8 @@ message_queue_capacity = 4096
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files: false,
             validation_strict_mode: false,
+            runtime_validation_min_users: DEFAULT_RUNTIME_VALIDATION_MIN_USERS,
+            runtime_validation_max_users: DEFAULT_RUNTIME_VALIDATION_MAX_USERS,
         };
 
         Agent::new(cfg).await.unwrap()
@@ -3562,6 +3729,8 @@ upload_buffer_size = 32768
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files,
             validation_strict_mode,
+            runtime_validation_min_users: DEFAULT_RUNTIME_VALIDATION_MIN_USERS,
+            runtime_validation_max_users: DEFAULT_RUNTIME_VALIDATION_MAX_USERS,
         };
 
         Agent::new(cfg).await.unwrap()
@@ -3805,6 +3974,8 @@ upload_buffer_size = 32768
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files: false,
             validation_strict_mode: false,
+            runtime_validation_min_users: DEFAULT_RUNTIME_VALIDATION_MIN_USERS,
+            runtime_validation_max_users: DEFAULT_RUNTIME_VALIDATION_MAX_USERS,
         };
 
         let (exports, stats) = build_account_exports(&cfg, &snapshot).await.unwrap();
@@ -3900,6 +4071,8 @@ upload_buffer_size = 32768
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files: false,
             validation_strict_mode: false,
+            runtime_validation_min_users: DEFAULT_RUNTIME_VALIDATION_MIN_USERS,
+            runtime_validation_max_users: DEFAULT_RUNTIME_VALIDATION_MAX_USERS,
         };
         let config_hash = LinkGenerationConfig::load_from_file(&runtime_dir.join("tt-link.toml"))
             .unwrap()
@@ -3979,6 +4152,8 @@ upload_buffer_size = 32768
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files: false,
             validation_strict_mode: false,
+            runtime_validation_min_users: DEFAULT_RUNTIME_VALIDATION_MIN_USERS,
+            runtime_validation_max_users: DEFAULT_RUNTIME_VALIDATION_MAX_USERS,
         };
         let snapshot = SyncPayload {
             version: "rev-1".to_string(),
@@ -4144,6 +4319,8 @@ upload_buffer_size = 32768
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files: false,
             validation_strict_mode: false,
+            runtime_validation_min_users: DEFAULT_RUNTIME_VALIDATION_MIN_USERS,
+            runtime_validation_max_users: DEFAULT_RUNTIME_VALIDATION_MAX_USERS,
         };
 
         let agent = Agent::new(cfg).await.unwrap();
@@ -4290,6 +4467,30 @@ password = "second"
         assert_eq!(parsed[1].password, "second");
     }
 
+    #[test]
+    fn runtime_validation_selection_is_deterministic_and_limited() {
+        let selection = select_runtime_validation_usernames(
+            vec![
+                "carol".to_string(),
+                "alice".to_string(),
+                "bob".to_string(),
+                "alice".to_string(),
+            ],
+            1,
+            2,
+        )
+        .unwrap();
+        assert_eq!(selection.total, 3);
+        assert!(selection.limited);
+        assert_eq!(selection.selected, vec!["alice".to_string(), "bob".to_string()]);
+    }
+
+    #[test]
+    fn runtime_validation_selection_enforces_minimum_users() {
+        let err = select_runtime_validation_usernames(vec!["alice".to_string()], 2, 10).unwrap_err();
+        assert!(err.contains("below required minimum"));
+    }
+
     #[tokio::test]
     async fn candidate_validation_rewrites_temp_config_with_candidate_credentials_path() {
         let tmp_dir = TempDir::new().unwrap();
@@ -4345,6 +4546,40 @@ password = "second"
             .validate_endpoint_runtime_entrypoint(&temp_config_path, &candidate)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn runtime_validation_fails_when_non_first_username_is_invalid() {
+        let tmp_dir = TempDir::new().unwrap();
+        let agent = make_db_worker_agent_for_validation_tests(&tmp_dir, false).await;
+        let runtime_dir = agent.cfg.trusttunnel_runtime_dir.clone();
+        let failing_endpoint = runtime_dir.join("fake_endpoint_fail_for_bob.sh");
+        std::fs::write(
+            &failing_endpoint,
+            "#!/bin/sh\nuser=\"\"\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"--client_config\" ]; then shift; user=\"$1\"; fi\n  shift\ndone\nif [ \"$user\" = \"bob\" ]; then\n  echo \"broken user\" 1>&2\n  exit 1\nfi\necho \"tt://$user\"\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&failing_endpoint).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&failing_endpoint, perms).unwrap();
+
+        let mut validation_agent = agent;
+        validation_agent.cfg.endpoint_binary = failing_endpoint.display().to_string();
+        let candidate = validation_agent
+            .write_runtime_credentials_tmp(
+                b"[[client]]\nusername=\"alice\"\npassword=\"secret\"\n\n[[client]]\nusername=\"bob\"\npassword=\"secret2\"\n",
+            )
+            .await
+            .unwrap();
+
+        let err = validation_agent
+            .validate_candidate_credentials_pipeline(candidate)
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("phase=runtime_startup_validation_failed"));
+        assert!(err.contains("username=bob"));
+        assert!(err.contains("selected usernames"));
     }
 
     #[tokio::test]
@@ -4511,6 +4746,8 @@ upload_buffer_size = 32768
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files: false,
             validation_strict_mode: false,
+            runtime_validation_min_users: DEFAULT_RUNTIME_VALIDATION_MIN_USERS,
+            runtime_validation_max_users: DEFAULT_RUNTIME_VALIDATION_MAX_USERS,
         };
         let agent = Agent::new(cfg).await.unwrap();
 
