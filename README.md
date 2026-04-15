@@ -6,8 +6,7 @@
 </picture>
 </p>
 
-<p align="center"><a href="https://github.com/TrustTunnel/TrustTunnelClient">Console client</a>
-  · <a href="https://github.com/TrustTunnel/TrustTunnelFlutterClient">Flutter-based app</a>
+<p align="center"><a href="#clients">Clients</a>
   · <a href="https://agrd.io/ios_trusttunnel">App store</a>
   · <a href="https://agrd.io/android_trusttunnel">Play store</a>
 </p>
@@ -33,6 +32,7 @@
         - [Updating the client](#updating-the-client)
         - [Client configuration wizard](#client-configuration-wizard)
         - [Running client](#running-client)
+- [Clients](#clients)
 - [See also](#see-also)
 - [Roadmap](#roadmap)
 - [License](#license)
@@ -311,9 +311,9 @@ Congratulations! You've done setting up the endpoint!
 
 ### Client setup
 
-You have a choice to use a [CLI client][trusttunnel-client] or a
-[GUI client][trusttunnel-flutter-client] (available on [App Store][app-store]
-and [Play Store][play-store]).
+Multiple clients are available for connecting to the endpoint — see the
+[Clients](#clients) section for the full list. The instructions below cover
+the official **[CLI client][trusttunnel-client]** setup.
 
 #### Install the client
 
@@ -441,6 +441,32 @@ trusttunnel_client.exe -c trusttunnel_client.toml
 ```
 
 Administrator privileges are required to set up routes and the TUN interface.
+
+## Clients
+
+### Official
+
+#### CLI
+
+[TrustTunnel Client][trusttunnel-client] — Linux, macOS, Windows
+
+#### GUI
+
+[TrustTunnel Flutter Client][trusttunnel-flutter-client] —
+iOS, Android (macOS, Windows — coming soon).
+Available on [App Store][app-store] and [Play Store][play-store].
+
+### Community
+
+> [!NOTE]
+> Community clients are developed and maintained independently.
+> They are not officially supported by the TrustTunnel team.
+
+#### GUI
+
+[TrustTunnel-GUI-Client](https://github.com/blazuryk/TrustTunnel-GUI-Client) — Windows GUI client, implemented as a Python wrapper for [TrustTunnel Client][trusttunnel-client]
+
+[Surge](https://nssurge.com) — (Commercial) macOS and iOS network toolbox with experimental TrustTunnel support
 
 ## See Also
 

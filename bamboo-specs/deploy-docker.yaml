@@ -27,7 +27,11 @@ Build and Push Docker Image:
             #!/bin/bash
             set -x -e
 
-            VERSION=$(cat endpoint/Cargo.toml | grep "version = " | head -n 1 | sed -e 's/version = "\(.*\)"/\1/')
+            printf "%b\n" "${bamboo_sshSecretKey}" > ~/.ssh/id_rsa
+            chmod 600 ~/.ssh/id_rsa
+            git fetch --unshallow || true
+            git fetch --force --tags
+            VERSION=$(git describe --tags --abbrev=0 | sed 's/^v//')
             TAG=v${VERSION}
 
             DOCKER_IMAGE_REPO="trusttunnel/trusttunnel-endpoint"
@@ -45,8 +49,9 @@ Build and Push Docker Image:
 
             docker buildx create --name trusttunnel-builder --use --config buildkitd.toml || docker buildx use trusttunnel-builder
             docker buildx build \
-                --target trusttunnel-endpoint \
                 --platform linux/amd64,linux/arm64 \
+              -f Dockerfile.prebuilt \
+              --build-arg "TT_VERSION=${VERSION}" \
                 -t "${DOCKER_IMAGE_VERSION_TAG}" \
                 -t "${DOCKER_IMAGE_LATEST_TAG}" \
                 --push .
