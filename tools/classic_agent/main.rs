@@ -2,6 +2,7 @@ mod legacy;
 mod exporter;
 mod link_config;
 mod credentials_inventory;
+mod lk_bulk_writer;
 
 use legacy::lk_api::{
     Account, AccountExportPayload, HeartbeatPayload, HeartbeatStats, LkApiClient, NodeMetadata,
@@ -14,6 +15,7 @@ use credentials_inventory::{
     resolve_credentials_path_from_settings,
 };
 use exporter::{EndpointExportOptions, EndpointLinkExporter};
+use lk_bulk_writer::{LkArtifactRecord, LkBulkWriter};
 use link_config::LinkGenerationConfig;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -720,7 +722,13 @@ impl Agent {
         let mut upsert_accounts = Vec::new();
         upsert_accounts.extend(delta.missing.iter().cloned());
         upsert_accounts.extend(delta.stale.iter().cloned());
+        let unchanged_count = snapshot
+            .credentials
+            .len()
+            .saturating_sub(upsert_accounts.len());
+        let removed_count = delta.removed.len();
 
+        let mut generated_links = BTreeMap::new();
         if !upsert_accounts.is_empty() {
             let settings_path =
                 resolve_runtime_path(&self.cfg.trusttunnel_runtime_dir, &self.cfg.trusttunnel_config_file);
@@ -741,17 +749,55 @@ impl Agent {
                 .iter()
                 .map(|account: &InventoryAccount| account.username.clone())
                 .collect::<Vec<_>>();
-            let _generated_links = exporter.export_usernames(usernames).await?;
+            generated_links = exporter.export_usernames(usernames).await?;
         }
+
+        let writer =
+            LkBulkWriter::from_contract(&self.cfg.lk_db_dsn, self.cfg.lk_service_token.clone())?;
+        let mut records = upsert_accounts
+            .iter()
+            .map(|account| LkArtifactRecord {
+                username: account.username.clone(),
+                external_node_id: self.cfg.node_external_id.clone(),
+                external_account_id: None,
+                access_bundle_id: None,
+                tt_link: generated_links.get(&account.username).cloned(),
+                config_hash: Some(snapshot.export_config_hash.clone()),
+                active: true,
+            })
+            .collect::<Vec<_>>();
+        records.extend(delta.removed.iter().map(|username| LkArtifactRecord {
+            username: username.clone(),
+            external_node_id: self.cfg.node_external_id.clone(),
+            external_account_id: None,
+            access_bundle_id: None,
+            tt_link: None,
+            config_hash: Some(snapshot.export_config_hash.clone()),
+            active: false,
+        }));
+        let mut write_result = writer.write_batch(records).await?;
+        write_result.unchanged += unchanged_count;
+        write_result.deactivated += removed_count;
 
         persist_inventory_state(&state_path, &snapshot)?;
         println!(
-            "inventory sidecar synced: credentials={} missing={} stale={} removed={}",
+            "inventory sidecar synced: credentials={} missing={} stale={} removed={} lk_created={} lk_updated={} lk_unchanged={} lk_deactivated={} lk_failed={}",
             snapshot.credentials.len(),
             delta.missing.len(),
             delta.stale.len(),
-            delta.removed.len()
+            delta.removed.len(),
+            write_result.created,
+            write_result.updated,
+            write_result.unchanged,
+            write_result.deactivated,
+            write_result.failed
         );
+        if !write_result.failures.is_empty() {
+            eprintln!(
+                "inventory LK writer failures: {}",
+                write_result.failures.join(" | ")
+            );
+        }
 
         Ok(())
     }
