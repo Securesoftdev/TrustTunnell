@@ -266,4 +266,47 @@ mod tests {
         .unwrap();
         assert_eq!(link, "tt://alice");
     }
+
+    #[tokio::test]
+    async fn exporter_calls_endpoint_binary_and_returns_tt_links() {
+        let temp_dir = TempDir::new().unwrap();
+        let args_log_path = temp_dir.path().join("args.log");
+        let script_path = temp_dir.path().join("fake_endpoint.sh");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nuser=\"\"\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"--client_config\" ]; then shift; user=\"$1\"; fi\n  shift\ndone\necho \"tt://$user\"\n",
+                args_log_path.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+
+        let exporter = EndpointLinkExporter::new(
+            script_path.display().to_string(),
+            temp_dir.path().join("vpn.toml"),
+            temp_dir.path().join("hosts.toml"),
+            EndpointExportOptions::new(
+                "89.110.100.165:443".to_string(),
+                Some("sni.example.com".to_string()),
+                Some("Primary".to_string()),
+                vec!["8.8.8.8".to_string()],
+            ),
+        );
+
+        let links = exporter
+            .export_usernames(vec!["alice".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(links.get("alice"), Some(&"tt://alice".to_string()));
+        let args_log = std::fs::read_to_string(args_log_path).unwrap();
+        assert!(args_log.contains("--format deeplink"));
+        assert!(args_log.contains("--address 89.110.100.165:443"));
+        assert!(args_log.contains("--custom-sni sni.example.com"));
+        assert!(args_log.contains("--name Primary"));
+        assert!(args_log.contains("--dns-upstream 8.8.8.8"));
+    }
 }
