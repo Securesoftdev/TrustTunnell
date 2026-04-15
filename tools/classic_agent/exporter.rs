@@ -67,14 +67,25 @@ impl EndpointLinkExporter {
         &self,
         accounts: Vec<&Account>,
     ) -> Result<BTreeMap<String, String>, String> {
-        if accounts.is_empty() {
+        let usernames = accounts
+            .into_iter()
+            .map(|account| account.username.clone())
+            .collect::<Vec<_>>();
+        self.export_usernames(usernames).await
+    }
+
+    pub(crate) async fn export_usernames(
+        &self,
+        usernames: Vec<String>,
+    ) -> Result<BTreeMap<String, String>, String> {
+        if usernames.is_empty() {
             return Ok(BTreeMap::new());
         }
 
         let mut join_set = JoinSet::new();
         let semaphore = Arc::new(Semaphore::new(self.max_parallelism));
 
-        for account in accounts {
+        for username in usernames {
             let semaphore = Arc::clone(&semaphore);
             let endpoint_binary = self.endpoint_binary.clone();
             let settings_path = self.settings_path.clone();
@@ -82,7 +93,6 @@ impl EndpointLinkExporter {
             let options = self.options.clone();
             let attempts = self.attempts;
             let timeout = self.timeout;
-            let username = account.username.clone();
             join_set.spawn(async move {
                 let _permit = semaphore
                     .acquire_owned()

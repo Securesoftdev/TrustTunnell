@@ -1,11 +1,17 @@
 mod legacy;
 mod exporter;
 mod link_config;
+mod credentials_inventory;
 
 use legacy::lk_api::{
     Account, AccountExportPayload, HeartbeatPayload, HeartbeatStats, LkApiClient, NodeMetadata,
     OnboardingPayload, SyncPayload, SyncReportPayload, SyncResponse, DEFAULT_SYNC_PATH_TEMPLATE,
     DEFAULT_SYNC_REPORT_PATH, DEFAULT_HEARTBEAT_PATH, DEFAULT_REGISTER_PATH,
+};
+use credentials_inventory::{
+    ExportConfig as InventoryExportConfig, InventoryAccount, compute_delta as compute_inventory_delta,
+    load_inventory_snapshot, load_state as load_inventory_state, persist_state as persist_inventory_state,
+    resolve_credentials_path_from_settings,
 };
 use exporter::{EndpointExportOptions, EndpointLinkExporter};
 use link_config::LinkGenerationConfig;
@@ -578,7 +584,11 @@ impl Agent {
             self.state.credentials_sha256 = plan.rendered_sha256.clone();
             self.mark_runtime_as_primary().await?;
             persist_state(&self.cfg.agent_state_path, &self.state).await?;
-        } else {
+        }
+
+        self.sync_local_inventory_export_sidecar().await?;
+
+        if !plan.changed {
             plan.stats.skipped += plan.stats.missing_credentials;
         }
 
@@ -669,6 +679,83 @@ impl Agent {
             }
         }
     }
+
+    async fn sync_local_inventory_export_sidecar(&self) -> Result<(), String> {
+        let settings_path = resolve_runtime_path(&self.cfg.trusttunnel_runtime_dir, &self.cfg.trusttunnel_config_file);
+        let credentials_path = resolve_credentials_path_from_settings(
+            &self.cfg.trusttunnel_runtime_dir,
+            &settings_path,
+        )?;
+
+        let link_config_path =
+            resolve_runtime_path(&self.cfg.trusttunnel_runtime_dir, &self.cfg.trusttunnel_link_config_file);
+        let link_cfg = LinkGenerationConfig::load_from_file_or_legacy_env(
+            &link_config_path,
+            &self.cfg.node_external_id,
+        )?;
+
+        let (address, port) = split_host_port(link_cfg.server_address())?;
+        let export_config_hash = InventoryExportConfig {
+            address,
+            domain: link_cfg.cert_domain().to_string(),
+            port,
+            sni: link_cfg.custom_sni(),
+            dns: link_cfg.dns_servers(),
+            protocol: link_cfg.protocol().to_string(),
+        }
+        .config_hash();
+
+        let snapshot = load_inventory_snapshot(
+            &credentials_path,
+            export_config_hash,
+            chrono::Utc::now().timestamp(),
+        )?;
+        let state_path = self
+            .cfg
+            .trusttunnel_runtime_dir
+            .join("credentials_inventory_state.json");
+        let previous = load_inventory_state(&state_path)?;
+        let delta = compute_inventory_delta(&snapshot, previous.as_ref());
+
+        let mut upsert_accounts = Vec::new();
+        upsert_accounts.extend(delta.missing.iter().cloned());
+        upsert_accounts.extend(delta.stale.iter().cloned());
+
+        if !upsert_accounts.is_empty() {
+            let settings_path =
+                resolve_runtime_path(&self.cfg.trusttunnel_runtime_dir, &self.cfg.trusttunnel_config_file);
+            let hosts_path =
+                resolve_runtime_path(&self.cfg.trusttunnel_runtime_dir, &self.cfg.trusttunnel_hosts_file);
+            let exporter = EndpointLinkExporter::new(
+                self.cfg.endpoint_binary.clone(),
+                settings_path,
+                hosts_path,
+                EndpointExportOptions::new(
+                    link_cfg.server_address().to_string(),
+                    link_cfg.custom_sni(),
+                    link_cfg.display_name(),
+                    link_cfg.dns_servers(),
+                ),
+            );
+            let usernames = upsert_accounts
+                .iter()
+                .map(|account: &InventoryAccount| account.username.clone())
+                .collect::<Vec<_>>();
+            let _generated_links = exporter.export_usernames(usernames).await?;
+        }
+
+        persist_inventory_state(&state_path, &snapshot)?;
+        println!(
+            "inventory sidecar synced: credentials={} missing={} stale={} removed={}",
+            snapshot.credentials.len(),
+            delta.missing.len(),
+            delta.stale.len(),
+            delta.removed.len()
+        );
+
+        Ok(())
+    }
+
 
     async fn run_legacy_http_loop(&mut self) {
         self.bootstrap_register().await;
@@ -2477,6 +2564,22 @@ fn resolve_runtime_path(runtime_dir: &Path, path: &Path) -> PathBuf {
         return path.to_path_buf();
     }
     runtime_dir.join(path)
+}
+
+fn split_host_port(raw: &str) -> Result<(String, u16), String> {
+    let value = raw.trim();
+    let idx = value
+        .rfind(':')
+        .ok_or_else(|| format!("server address must contain host:port, got: {value}"))?;
+    let host = value[..idx].trim();
+    let port_raw = value[idx + 1..].trim();
+    if host.is_empty() {
+        return Err(format!("server address host is empty: {value}"));
+    }
+    let port = port_raw
+        .parse::<u16>()
+        .map_err(|e| format!("invalid server address port in {value}: {e}"))?;
+    Ok((host.to_string(), port))
 }
 
 fn should_import_bootstrap_credentials(
