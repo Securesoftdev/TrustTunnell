@@ -1,13 +1,44 @@
-# Classic Agent modes
+# Classic Agent modes and sidecar responsibilities
 
-`classic_agent` now treats LK HTTP orchestration as legacy behavior.
+`classic_agent` treats LK HTTP orchestration as legacy behavior and defaults to
+inventory-driven sidecar synchronization.
 
-## Default mode (`db_worker`)
+## Architecture rule
+
+- Endpoint (`trusttunnel_endpoint`) is the data plane.
+- Sidecar (`classic_agent`) is responsible for link inventory and sync.
+- `tt://` links are generated only via the endpoint export command
+  (`trusttunnel_endpoint ... --format deeplink`), never by sidecar-side URI construction.
+
+## Sidecar modes
+
+### 1) Startup bootstrap pass
+
+Executed once on startup:
+
+- imports bootstrap credentials from `TRUSTTUNNEL_BOOTSTRAP_CREDENTIALS_FILE` only when
+  runtime credentials do not exist and runtime has not been marked primary;
+- runs sidecar sync with pass label `bootstrap`;
+- validates/promotes credentials atomically, applies runtime, and marks runtime primary.
+
+### 2) Periodic reconcile pass
+
+Executed every `AGENT_RECONCILE_INTERVAL_SEC`:
+
+- compares desired and runtime credentials;
+- computes counters (`found/generated/updated/missing/skipped/errors` and
+  `new/stale/deleted`);
+- applies only the detected delta;
+- syncs inventory to LK via bulk upsert/deactivate.
+
+## Runtime modes
+
+### Default mode (`db_worker`)
 
 Default mode is selected when `CLASSIC_AGENT_MODE` is unset or set to `db_worker`.
-In this mode the agent does not run legacy LK orchestration loops and does not emit legacy runtime-health/sync-report outbox metrics.
+In this mode sidecar sync and LK bulk writer run without legacy LK HTTP orchestration loops.
 
-## Legacy mode (`legacy_http`)
+### Legacy mode (`legacy_http`)
 
 The following functionality is temporarily kept under `tools/classic_agent/legacy/`:
 
@@ -24,3 +55,79 @@ To enable it explicitly:
    - `CLASSIC_AGENT_MODE=legacy_http`
 
 Without `legacy-lk-http`, `CLASSIC_AGENT_MODE=legacy_http` is rejected at startup.
+
+## Environment variables (`Config::from_env()`)
+
+Required in all modes:
+
+- `LK_DB_DSN`
+- `NODE_EXTERNAL_ID`
+- `NODE_HOSTNAME`
+- `AGENT_RECONCILE_INTERVAL_SEC`
+- `AGENT_APPLY_INTERVAL_SEC`
+- `TRUSTTUNNEL_RUNTIME_DIR`
+- `TRUSTTUNNEL_RUNTIME_CREDENTIALS_FILE`
+- `TRUSTTUNNEL_LINK_CONFIG_FILE`
+- `TRUSTTUNNEL_CONFIG_FILE`
+- `TRUSTTUNNEL_HOSTS_FILE`
+
+Required only in `legacy_http`:
+
+- `LK_BASE_URL`
+- `LK_SERVICE_TOKEN`
+- `AGENT_HEARTBEAT_INTERVAL_SEC`
+
+Optional:
+
+- `CLASSIC_AGENT_MODE` (`db_worker` default)
+- `AGENT_STATE_PATH`
+- `AGENT_METRICS_ADDRESS`
+- `TRUSTTUNNEL_BOOTSTRAP_CREDENTIALS_FILE`
+- `TRUSTTUNNEL_APPLY_CMD`
+- `TRUSTTUNNEL_ENDPOINT_BINARY`
+- `TRUSTTUNNEL_AGENT_VERSION`
+- `TRUSTTUNNEL_RUNTIME_VERSION`
+- `LK_DB_TABLE` (Postgres sink table name, default `access_artifacts`)
+- Legacy-only metadata/paths: `NODE_STAGE`, `NODE_CLUSTER`, `NODE_NAMESPACE`,
+  `NODE_ROLLOUT_GROUP`, `LK_SYNC_PATH_TEMPLATE`, `LK_SYNC_REPORT_PATH`,
+  `TRUSTTUNNEL_RUNTIME_PID_FILE`, `TRUSTTUNNEL_RUNTIME_PROCESS_NAME`
+
+Legacy TT-link env fallback (used only when link config file cannot be loaded):
+
+- `TRUSTTUNNEL_TT_LINK_HOST`
+- `TRUSTTUNNEL_TT_LINK_PORT`
+- `TRUSTTUNNEL_TT_LINK_PROTOCOL`
+- `TRUSTTUNNEL_TT_LINK_CUSTOM_SNI`
+- `TRUSTTUNNEL_TT_LINK_DISPLAY_NAME`
+- `TRUSTTUNNEL_TT_LINK_CERT_DOMAIN`
+- `TRUSTTUNNEL_TT_LINK_DNS_SERVERS`
+
+## Observability
+
+- Structured logs are JSON and include: `ts`, `level`, `revision`, `node`,
+  `status`, `error_class` (and `message` for errors).
+- Sidecar sync summary lines expose counters:
+  `found/generated/updated/missing/skipped/errors` and `new/stale/deleted`.
+- Prometheus endpoint: `GET /metrics` on `AGENT_METRICS_ADDRESS`.
+- Metrics:
+  - `classic_agent_reconcile_total{node,revision,status,error_class}`
+  - `classic_agent_apply_total{node,revision,status,error_class}`
+  - `classic_agent_sidecar_sync_pass_total{node,pass,status}`
+  - `classic_agent_sidecar_sync_item_total{node,pass,outcome}`
+  - `classic_agent_tt_link_generation_total{node,revision,status,error_class}`
+  - `classic_agent_last_successful_reconcile_timestamp_seconds{node}`
+  - `classic_agent_last_failed_reconcile_timestamp_seconds{node}`
+  - `classic_agent_apply_duration_milliseconds{node}`
+  - `classic_agent_credentials_count{node}`
+
+## Bulk upsert idempotency and stale policy
+
+- Sidecar writes only delta: `missing + stale` as active upserts, `removed` as
+  deactivations.
+- Postgres writer uses conflict upsert by `dedupe_key`, making repeated equal
+  batches idempotent.
+- API writer relies on LK bulk endpoint contract for the same idempotent semantics.
+- Stale detection includes password hash changes and export config hash changes.
+- Export config hash includes `address`, `domain`, `port`, `sni`, `dns`, and
+  `protocol`; changing address/domain/port marks links stale and forces
+  regeneration/update.

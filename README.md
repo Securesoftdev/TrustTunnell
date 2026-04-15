@@ -506,77 +506,107 @@ docker build --target trusttunnel-endpoint -t trusttunnel-endpoint:local .
 docker build --target trusttunnel-classic-agent -t trusttunnel-classic-agent:local .
 ```
 
-Example classic agent run:
+Example classic agent run (default `db_worker` mode):
 
 ```sh
 docker run --rm \
-  -e LK_BASE_URL="https://lk.example.com" \
-  -e LK_SERVICE_TOKEN="<service-token>" \
+  -e CLASSIC_AGENT_MODE="db_worker" \
+  -e LK_DB_DSN="postgres://user:pass@db:5432/lk" \
   -e NODE_EXTERNAL_ID="node-1" \
   -e NODE_HOSTNAME="trusttunnel-node-1" \
-  -e NODE_STAGE="prod" \
-  -e NODE_CLUSTER="vpn" \
-  -e NODE_NAMESPACE="default" \
-  -e NODE_ROLLOUT_GROUP="stable" \
-  -e AGENT_POLL_INTERVAL_SEC="15" \
-  -e AGENT_HEARTBEAT_INTERVAL_SEC="30" \
+  -e AGENT_RECONCILE_INTERVAL_SEC="15" \
+  -e AGENT_APPLY_INTERVAL_SEC="15" \
   -e TRUSTTUNNEL_RUNTIME_DIR="/var/lib/trusttunnel" \
-  -e TRUSTTUNNEL_CREDENTIALS_FILE="credentials.toml" \
+  -e TRUSTTUNNEL_RUNTIME_CREDENTIALS_FILE="credentials.runtime.toml" \
+  -e TRUSTTUNNEL_LINK_CONFIG_FILE="links.toml" \
   -e TRUSTTUNNEL_CONFIG_FILE="vpn.toml" \
   -e TRUSTTUNNEL_HOSTS_FILE="hosts.toml" \
   -v "$(pwd)/runtime:/var/lib/trusttunnel" \
   trusttunnel-classic-agent:local
 ```
 
-Classic agent required environment variables:
+Classic agent environment variables from `Config::from_env()`:
 
-- `LK_BASE_URL`
-- `LK_SERVICE_TOKEN`
+Required in all modes:
+
+- `LK_DB_DSN` (HTTP(S) bulk endpoint or Postgres DSN for LK artifact writes)
 - `NODE_EXTERNAL_ID`
 - `NODE_HOSTNAME`
-- `NODE_STAGE`
-- `NODE_CLUSTER`
-- `NODE_NAMESPACE`
-- `NODE_ROLLOUT_GROUP`
-- `AGENT_POLL_INTERVAL_SEC`
-- `AGENT_HEARTBEAT_INTERVAL_SEC`
+- `AGENT_RECONCILE_INTERVAL_SEC`
+- `AGENT_APPLY_INTERVAL_SEC`
 - `TRUSTTUNNEL_RUNTIME_DIR`
-- `TRUSTTUNNEL_CREDENTIALS_FILE`
+- `TRUSTTUNNEL_RUNTIME_CREDENTIALS_FILE`
+- `TRUSTTUNNEL_LINK_CONFIG_FILE`
 - `TRUSTTUNNEL_CONFIG_FILE`
 - `TRUSTTUNNEL_HOSTS_FILE`
 
-Classic agent optional environment variables:
+Required only when `CLASSIC_AGENT_MODE=legacy_http`:
 
-- `NODE_PUBLIC_HOST`
-- `NODE_PUBLIC_PORT`
-- `NODE_DISPLAY_NAME`
+- `LK_BASE_URL`
+- `LK_SERVICE_TOKEN`
+- `AGENT_HEARTBEAT_INTERVAL_SEC`
+
+Optional:
+
+- `CLASSIC_AGENT_MODE` (`db_worker` by default; `legacy_http` requires build feature `legacy-lk-http`)
 - `AGENT_STATE_PATH` (default `agent_state.json`)
-- `TRUSTTUNNEL_APPLY_CMD` (command executed after runtime credentials update)
-- `TRUSTTUNNEL_BOOTSTRAP_CREDENTIALS_FILE` (read-only bootstrap credentials source to import once into `TRUSTTUNNEL_RUNTIME_DIR/<TRUSTTUNNEL_CREDENTIALS_FILE>`)
-- `LK_SNAPSHOT_PATH` (default `/internal/vpn/classic/accounts`)
-- `LK_SYNC_REPORT_PATH` (default `/internal/vpn/classic/sync-report`)
-- `LK_HEARTBEAT_PATH` (default `/internal/vpn/classic/heartbeat`)
 - `AGENT_METRICS_ADDRESS` (default `127.0.0.1:9901`, Prometheus endpoint exposed as `GET /metrics`)
+- `TRUSTTUNNEL_BOOTSTRAP_CREDENTIALS_FILE` (read-only bootstrap credentials source)
+- `TRUSTTUNNEL_APPLY_CMD` (command executed after runtime credentials update)
+- `TRUSTTUNNEL_ENDPOINT_BINARY` (default `trusttunnel_endpoint`)
+- `TRUSTTUNNEL_AGENT_VERSION` (default `classic_agent` package version)
+- `TRUSTTUNNEL_RUNTIME_VERSION` (default `unknown`)
+- `LK_DB_TABLE` (default `access_artifacts` for Postgres sink)
+- `LK_SYNC_PATH_TEMPLATE` (legacy mode only; default built-in template)
+- `LK_SYNC_REPORT_PATH` (legacy mode only; default built-in path)
+- `TRUSTTUNNEL_RUNTIME_PID_FILE` (legacy mode only; default `<TRUSTTUNNEL_RUNTIME_DIR>/trusttunnel.pid`)
+- `TRUSTTUNNEL_RUNTIME_PROCESS_NAME` (legacy mode only; default `trusttunnel_endpoint`)
+- `NODE_STAGE` / `NODE_CLUSTER` / `NODE_NAMESPACE` / `NODE_ROLLOUT_GROUP` (legacy mode metadata)
+
+TT-link legacy fallback env vars (used only when `TRUSTTUNNEL_LINK_CONFIG_FILE` cannot be loaded):
+
+- `TRUSTTUNNEL_TT_LINK_HOST`
+- `TRUSTTUNNEL_TT_LINK_PORT` (default `443`)
+- `TRUSTTUNNEL_TT_LINK_PROTOCOL` (`http2`/`http3`)
+- `TRUSTTUNNEL_TT_LINK_CUSTOM_SNI`
+- `TRUSTTUNNEL_TT_LINK_DISPLAY_NAME`
+- `TRUSTTUNNEL_TT_LINK_CERT_DOMAIN` (defaults to host)
+- `TRUSTTUNNEL_TT_LINK_DNS_SERVERS` (comma-separated)
 
 Classic agent runtime credentials migration and restart recovery:
 
-- On startup, if `TRUSTTUNNEL_BOOTSTRAP_CREDENTIALS_FILE` is set, runtime credentials file is absent, and runtime has not yet been marked as primary, the agent imports bootstrap credentials once into `TRUSTTUNNEL_RUNTIME_DIR`.
-- After the first successful `sync` + apply cycle, the agent creates a marker file `.runtime_credentials_primary` in `TRUSTTUNNEL_RUNTIME_DIR` and treats runtime credentials as the source of truth.
-- After this marker exists, restarts do not re-import credentials from the bootstrap source (for example, from a read-only ConfigMap mount), so runtime no longer depends on that source as the primary store.
-- If runtime credentials are lost after migration, restart does not restore them from bootstrap; the next successful LK sync recreates runtime credentials and reapplies runtime configuration.
+- Startup bootstrap pass: if `TRUSTTUNNEL_BOOTSTRAP_CREDENTIALS_FILE` is set, runtime credentials are absent, and runtime has not yet been marked as primary, the agent imports bootstrap credentials once.
+- Periodic reconcile pass: every `AGENT_RECONCILE_INTERVAL_SEC`, the sidecar compares desired credentials with runtime credentials and applies only deltas.
+- After the first successful apply, the agent creates `.runtime_credentials_primary` in `TRUSTTUNNEL_RUNTIME_DIR` and treats runtime credentials as the source of truth.
+- After this marker exists, restarts do not re-import credentials from bootstrap source.
+- If runtime credentials are lost after migration, bootstrap source is not reused; next successful reconcile reconstructs credentials from current desired state.
+
+Classic agent architecture boundaries:
+
+- `trusttunnel_endpoint` is the data plane (traffic handling and runtime parser/validation).
+- `classic_agent` sidecar owns control-plane inventory and synchronization (credentials inventory snapshot, delta detection, LK bulk upsert/deactivate).
+- `tt://` generation is delegated only to the endpoint export command (`trusttunnel_endpoint ... --format deeplink`); sidecar does not construct deep links itself.
 
 Classic agent sidecar observability:
 
-- Structured logs are emitted in JSON with normalized fields: `revision`, `node`, `status`, and `error_class`.
+- Structured JSON logs include `ts`, `level`, `revision`, `node`, `status`, and `error_class` (plus `message` for errors).
+- Sidecar sync pass summaries include stable counters: `found`, `generated`, `updated`, `missing`, `skipped`, `errors` (plus `new`, `stale`, `deleted`).
 - Internal Prometheus endpoint is exposed on `AGENT_METRICS_ADDRESS` via `GET /metrics`.
-- Sidecar metrics include:
-  - `classic_agent_last_successful_sync_timestamp_seconds`
-  - `classic_agent_last_failed_sync_timestamp_seconds`
-  - `classic_agent_apply_duration_milliseconds`
-  - `classic_agent_credentials_count`
-  - `classic_agent_heartbeat_status`
-  - `classic_agent_endpoint_process_status`
-  - Operation counters with labels `revision/node/status/error_class`:
-    - `classic_agent_sync_total`
-    - `classic_agent_apply_total`
-    - `classic_agent_heartbeat_total`
+- Metrics include:
+  - `classic_agent_reconcile_total{node,revision,status,error_class}`
+  - `classic_agent_apply_total{node,revision,status,error_class}`
+  - `classic_agent_sidecar_sync_pass_total{node,pass,status}`
+  - `classic_agent_sidecar_sync_item_total{node,pass,outcome}` with outcomes `found/generated/updated/skipped/errors/new/missing/stale/deleted`
+  - `classic_agent_tt_link_generation_total{node,revision,status,error_class}`
+  - `classic_agent_last_successful_reconcile_timestamp_seconds{node}`
+  - `classic_agent_last_failed_reconcile_timestamp_seconds{node}`
+  - `classic_agent_apply_duration_milliseconds{node}`
+  - `classic_agent_credentials_count{node}`
+
+Bulk upsert idempotency and stale detection policy:
+
+- Sidecar computes credentials inventory delta as `missing`, `stale`, and `removed` using username/password hash plus export configuration hash.
+- Bulk upsert input is deterministic: `missing + stale` are written as active records; `removed` are written as `active=false` (deactivation).
+- Postgres sink uses `INSERT ... ON CONFLICT (dedupe_key) DO UPDATE`, so repeated writes with the same content are idempotent.
+- API sink expects the same idempotent contract semantics from LK bulk endpoint.
+- Any change in export configuration hash marks credentials as stale and forces TT-link regeneration and LK update. The hash includes `address`, `domain`, `port`, `sni`, `dns`, and `protocol`; therefore address/domain/port changes trigger full stale reconciliation.
