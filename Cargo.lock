@@ -3610,7 +3610,6 @@ dependencies = [
  "nix 0.28.0",
  "rustls",
  "sentry",
- "serde_json",
  "tokio",
  "toml",
  "toml_edit 0.19.15",

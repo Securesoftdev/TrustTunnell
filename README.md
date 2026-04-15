@@ -274,8 +274,6 @@ You can also provide additional options:
 - `--dns-upstream <dns_upstream>`: Specify a DNS upstream for the client. Can be an IP address
   or a secure DNS URI (e.g., `tls://1.1.1.1`, `https://dns.google/dns-query`).
   This flag can be used multiple times to provide a list of DNS upstreams.
-- `--output json`: Return machine-readable JSON payload (without QR hints
-  or extra text). By default, the endpoint uses human-friendly output.
 
 Example with custom name and DNS upstreams:
 
@@ -306,45 +304,6 @@ This outputs a TOML configuration file suitable for the CLI client.
 
 Both formats contain all necessary information to connect to the endpoint. See the
 [TrustTunnel Flutter Client documentation][trusttunnel-flutter-configuration] for setup instructions.
-
-##### JSON export schema (`--output json`)
-
-Use `--output json` together with `-c/--client_config` to get a stable payload.
-
-```shell
-./trusttunnel_endpoint vpn.toml hosts.toml -c <client_name> -a <address> \
-    --format deeplink --output json
-```
-
-JSON schema:
-
-- `client_name` (`string`)
-- `artifact_format` (`"deeplink"` | `"toml"`)
-- `deeplink` (`string | null`) - present for `artifact_format = "deeplink"`
-- `toml` (`string | null`) - present for `artifact_format = "toml"`
-- `addresses` (`string[]`)
-- `hostname` (`string`)
-- `custom_sni` (`string | null`)
-- `dns_upstreams` (`string[]`)
-- `config_fingerprint` (`string`) - SHA-256 hash of generated TOML payload
-- `generated_at` (`string`) - RFC3339 UTC timestamp
-
-Example payload:
-
-```json
-{
-  "client_name": "alice",
-  "artifact_format": "deeplink",
-  "deeplink": "tt://?...",
-  "toml": null,
-  "addresses": ["vpn.example.com:443"],
-  "hostname": "vpn.example.com",
-  "custom_sni": null,
-  "dns_upstreams": ["1.1.1.1", "tls://8.8.8.8"],
-  "config_fingerprint": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "generated_at": "2026-04-15T10:30:00+00:00"
-}
-```
 
 Congratulations! You've done setting up the endpoint!
 
