@@ -190,6 +190,7 @@ struct Config {
     runtime_version: String,
     pending_sync_reports_path: Option<PathBuf>,
     metrics_address: SocketAddr,
+    debug_preserve_temp_files: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -232,8 +233,9 @@ impl Config {
         let trusttunnel_runtime_dir: PathBuf = required_env("TRUSTTUNNEL_RUNTIME_DIR")?.into();
         let trusttunnel_runtime_credentials_file: PathBuf =
             required_env("TRUSTTUNNEL_RUNTIME_CREDENTIALS_FILE")?.into();
-        let trusttunnel_link_config_file: PathBuf =
-            required_env("TRUSTTUNNEL_LINK_CONFIG_FILE")?.into();
+        let trusttunnel_link_config_file: PathBuf = optional_env_nonempty("TRUSTTUNNEL_LINK_CONFIG_FILE")
+            .unwrap_or_else(|| "tt-link.toml".to_string())
+            .into();
         let trusttunnel_config_file: PathBuf = required_env("TRUSTTUNNEL_CONFIG_FILE")?.into();
         let trusttunnel_hosts_file: PathBuf = required_env("TRUSTTUNNEL_HOSTS_FILE")?.into();
         let bootstrap_credentials_source_path =
@@ -306,6 +308,14 @@ impl Config {
             .unwrap_or_else(|_| "127.0.0.1:9901".to_string())
             .parse::<SocketAddr>()
             .map_err(|e| format!("AGENT_METRICS_ADDRESS must be socket address host:port: {e}"))?;
+        let debug_preserve_temp_files = optional_env_nonempty("TRUSTTUNNEL_DEBUG_KEEP_TEMP_FILES")
+            .map(|raw| {
+                matches!(
+                    raw.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
 
         let cfg = Self {
             lk_base_url,
@@ -339,6 +349,7 @@ impl Config {
             runtime_version,
             pending_sync_reports_path,
             metrics_address,
+            debug_preserve_temp_files,
         };
         cfg.validate_paths()?;
         Ok(cfg)
@@ -426,6 +437,12 @@ struct Agent {
     metrics: Arc<AgentMetrics>,
     sync_report_backoff: Duration,
     sync_report_next_retry_at: Instant,
+}
+
+#[derive(Debug)]
+struct CandidateValidationFiles {
+    candidate_credentials_path: PathBuf,
+    temp_config_path: PathBuf,
 }
 
 impl Agent {
@@ -560,13 +577,31 @@ impl Agent {
             let tmp_credentials_path = self
                 .write_runtime_credentials_tmp(plan.rendered_credentials.as_bytes())
                 .await?;
-            if let Err(err) = self.validate_credentials_with_endpoint_parser(&tmp_credentials_path) {
-                let _ = fs::remove_file(&tmp_credentials_path).await;
+            let validation_files = match self
+                .validate_candidate_credentials_pipeline(tmp_credentials_path)
+                .await
+            {
+                Ok(files) => files,
+                Err(err) => {
+                    plan.stats.errors += 1;
+                    self.update_sidecar_sync_metrics(pass, &plan.stats);
+                    return Err(err);
+                }
+            };
+            if let Err(err) = self
+                .cleanup_validation_files(
+                    &validation_files,
+                    self.cfg.debug_preserve_temp_files,
+                    false,
+                )
+                .await
+            {
                 plan.stats.errors += 1;
                 self.update_sidecar_sync_metrics(pass, &plan.stats);
                 return Err(err);
             }
-            self.promote_runtime_credentials(&tmp_credentials_path).await?;
+            self.promote_runtime_credentials(&validation_files.candidate_credentials_path)
+                .await?;
             let apply_result = self.apply_runtime().await;
             let apply_result = match apply_result {
                 Ok(()) => self.verify_runtime_post_apply(&plan.rendered_sha256).await,
@@ -995,11 +1030,21 @@ impl Agent {
         let tmp_credentials_path = self
             .write_runtime_credentials_tmp(rendered.as_bytes())
             .await?;
-        if let Err(err) = self.validate_credentials_with_endpoint_parser(&tmp_credentials_path) {
-            let _ = fs::remove_file(&tmp_credentials_path).await;
+        let validation_files = match self
+            .validate_candidate_credentials_pipeline(tmp_credentials_path)
+            .await
+        {
+            Ok(files) => files,
+            Err(err) => return Err(err),
+        };
+        if let Err(err) = self
+            .cleanup_validation_files(&validation_files, self.cfg.debug_preserve_temp_files, false)
+            .await
+        {
             return Err(err);
         }
-        self.promote_runtime_credentials(&tmp_credentials_path).await?;
+        self.promote_runtime_credentials(&validation_files.candidate_credentials_path)
+            .await?;
         println!(
             "credentials updated atomically at {}",
             self.cfg.runtime_credentials_path.display()
@@ -1154,11 +1199,13 @@ impl Agent {
         let tmp_credentials_path = self
             .write_runtime_credentials_tmp(&bootstrap_credentials)
             .await?;
-        if let Err(err) = self.validate_credentials_with_endpoint_parser(&tmp_credentials_path) {
-            let _ = fs::remove_file(&tmp_credentials_path).await;
-            return Err(err);
-        }
-        self.promote_runtime_credentials(&tmp_credentials_path).await?;
+        let validation_files = self
+            .validate_candidate_credentials_pipeline(tmp_credentials_path)
+            .await?;
+        self.cleanup_validation_files(&validation_files, self.cfg.debug_preserve_temp_files, false)
+            .await?;
+        self.promote_runtime_credentials(&validation_files.candidate_credentials_path)
+            .await?;
         self.apply_runtime().await?;
         println!(
             "bootstrap credentials imported: {} -> {}",
@@ -1574,7 +1621,10 @@ impl Agent {
         Ok(tmp_path)
     }
 
-    fn validate_credentials_with_endpoint_parser(&self, candidate_path: &Path) -> Result<(), String> {
+    async fn write_temp_endpoint_config_for_candidate(
+        &self,
+        candidate_path: &Path,
+    ) -> Result<PathBuf, String> {
         let settings_path = self.resolve_runtime_path(&self.cfg.trusttunnel_config_file);
         let settings_content = std::fs::read_to_string(&settings_path).map_err(|e| {
             format!(
@@ -1591,9 +1641,155 @@ impl Agent {
         let candidate_path_str = path_to_string(candidate_path)?.to_string();
         settings_doc["credentials_file"] = value(candidate_path_str);
 
-        toml::from_str::<Settings>(&settings_doc.to_string())
-            .map(|_| ())
-            .map_err(|e| format!("failed to validate candidate credentials via endpoint parser: {e}"))
+        let parent = settings_path.parent().ok_or_else(|| {
+            format!(
+                "endpoint settings path has no parent: {}",
+                settings_path.display()
+            )
+        })?;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|x| x.as_nanos())
+            .unwrap_or_default();
+        let temp_config_path = parent.join(format!(
+            ".{}.candidate-config.{}.{nonce}.tmp",
+            settings_path
+                .file_name()
+                .and_then(|x| x.to_str())
+                .unwrap_or("vpn"),
+            std::process::id()
+        ));
+        fs::write(&temp_config_path, settings_doc.to_string())
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to write temp endpoint settings {}: {e}",
+                    temp_config_path.display()
+                )
+            })?;
+        Ok(temp_config_path)
+    }
+
+    fn validate_candidate_credentials_syntax(&self, candidate_path: &Path) -> Result<(), String> {
+        let raw = std::fs::read_to_string(candidate_path).map_err(|e| {
+            format!(
+                "failed to read candidate credentials {}: {e}",
+                candidate_path.display()
+            )
+        })?;
+        parse_access_artifacts(&raw).map(|_| ())
+    }
+
+    fn validate_temp_endpoint_config_with_parser(&self, temp_config_path: &Path) -> Result<(), String> {
+        let settings_content = std::fs::read_to_string(temp_config_path).map_err(|e| {
+            format!(
+                "failed to read temp endpoint settings {}: {e}",
+                temp_config_path.display()
+            )
+        })?;
+        toml::from_str::<Settings>(&settings_content).map(|_| ()).map_err(|e| {
+            format!(
+                "failed to validate candidate credentials via endpoint parser using {}: {e}",
+                temp_config_path.display()
+            )
+        })
+    }
+
+    async fn cleanup_validation_files(
+        &self,
+        files: &CandidateValidationFiles,
+        keep_files: bool,
+        remove_candidate: bool,
+    ) -> Result<(), String> {
+        if keep_files {
+            println!(
+                "validation temp files preserved: candidate_credentials={} temp_config={}",
+                files.candidate_credentials_path.display(),
+                files.temp_config_path.display()
+            );
+            return Ok(());
+        }
+        if fs::try_exists(&files.temp_config_path)
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to check temp endpoint settings {}: {e}",
+                    files.temp_config_path.display()
+                )
+            })?
+        {
+            fs::remove_file(&files.temp_config_path).await.map_err(|e| {
+                format!(
+                    "failed to remove temp endpoint settings {}: {e}",
+                    files.temp_config_path.display()
+                )
+            })?;
+        }
+        if remove_candidate {
+            if fs::try_exists(&files.candidate_credentials_path)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "failed to check candidate credentials {}: {e}",
+                        files.candidate_credentials_path.display()
+                    )
+                })?
+            {
+                fs::remove_file(&files.candidate_credentials_path)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "failed to remove candidate credentials {}: {e}",
+                            files.candidate_credentials_path.display()
+                        )
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn validate_candidate_credentials_pipeline(
+        &self,
+        candidate_path: PathBuf,
+    ) -> Result<CandidateValidationFiles, String> {
+        println!(
+            "reconcile validation phase=candidate_credentials_write path={}",
+            candidate_path.display()
+        );
+        self.validate_candidate_credentials_syntax(&candidate_path)
+            .map_err(|e| format!("phase=candidate_toml_invalid path={}: {e}", candidate_path.display()))?;
+        println!(
+            "reconcile validation phase=candidate_toml_valid path={}",
+            candidate_path.display()
+        );
+
+        let temp_config_path = self
+            .write_temp_endpoint_config_for_candidate(&candidate_path)
+            .await
+            .map_err(|e| format!("phase=temp_config_invalid candidate_path={}: {e}", candidate_path.display()))?;
+        println!(
+            "reconcile validation phase=temp_config_rendered path={} candidate_path={}",
+            temp_config_path.display(),
+            candidate_path.display()
+        );
+
+        self.validate_temp_endpoint_config_with_parser(&temp_config_path).map_err(|e| {
+            format!(
+                "phase=endpoint_validation_failed temp_config_path={} candidate_path={}: {e}",
+                temp_config_path.display(),
+                candidate_path.display()
+            )
+        })?;
+        println!(
+            "reconcile validation phase=endpoint_validation_ok temp_config_path={} candidate_path={}",
+            temp_config_path.display(),
+            candidate_path.display()
+        );
+
+        Ok(CandidateValidationFiles {
+            candidate_credentials_path: candidate_path,
+            temp_config_path,
+        })
     }
 
     async fn promote_runtime_credentials(&self, candidate_path: &Path) -> Result<(), String> {
@@ -2971,6 +3167,84 @@ message_queue_capacity = 4096
             runtime_version: "test".to_string(),
             pending_sync_reports_path: Some(runtime_dir.join(SYNC_REPORT_OUTBOX_FILE)),
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
+            debug_preserve_temp_files: false,
+        };
+
+        Agent::new(cfg).await.unwrap()
+    }
+
+    async fn make_db_worker_agent_for_validation_tests(
+        temp_dir: &TempDir,
+        debug_preserve_temp_files: bool,
+    ) -> Agent {
+        let runtime_dir = temp_dir.path().join("runtime");
+        fs::create_dir_all(&runtime_dir).await.unwrap();
+        let config_file = runtime_dir.join("vpn.toml");
+        let credentials_file = runtime_dir.join("credentials.toml");
+        let hosts_file = runtime_dir.join("hosts.toml");
+        let rules_file = runtime_dir.join("rules.toml");
+        fs::write(&credentials_file, b"").await.unwrap();
+        fs::write(&hosts_file, b"").await.unwrap();
+        fs::write(&rules_file, b"").await.unwrap();
+        fs::write(
+            &config_file,
+            format!(
+                r#"
+listen_address = "127.0.0.1:443"
+credentials_file = "{}"
+rules_file = "{}"
+
+[listen_protocols]
+
+[listen_protocols.http1]
+upload_buffer_size = 32768
+"#,
+                credentials_file.display(),
+                rules_file.display()
+            ),
+        )
+        .await
+        .unwrap();
+        fs::write(
+            runtime_dir.join("tt-link.toml"),
+            "node_external_id = \"node-1\"\nserver_address = \"node-1.example:8443\"\ncert_domain = \"node-1.example\"\nprotocol = \"http2\"\n",
+        )
+        .await
+        .unwrap();
+
+        let cfg = Config {
+            lk_base_url: None,
+            runtime_mode: RuntimeMode::DbWorker,
+            lk_db_dsn: "postgres://localhost/lk".to_string(),
+            lk_service_token: None,
+            node_external_id: "node-1".to_string(),
+            node_hostname: "node-1.example".to_string(),
+            node_stage: None,
+            node_cluster: None,
+            node_namespace: None,
+            node_rollout_group: None,
+            trusttunnel_runtime_dir: runtime_dir.clone(),
+            trusttunnel_config_file: config_file,
+            trusttunnel_hosts_file: hosts_file,
+            bootstrap_credentials_source_path: None,
+            trusttunnel_link_config_file: runtime_dir.join("tt-link.toml"),
+            runtime_credentials_path: credentials_file,
+            runtime_primary_marker_path: runtime_dir.join(RUNTIME_PRIMARY_MARKER_FILE),
+            agent_state_path: runtime_dir.join("agent_state.json"),
+            reconcile_interval: Duration::from_secs(10),
+            apply_interval: Duration::from_secs(10),
+            heartbeat_interval: None,
+            sync_path_template: None,
+            sync_report_path: None,
+            apply_cmd: None,
+            runtime_pid_path: None,
+            runtime_process_name: None,
+            endpoint_binary: "trusttunnel_endpoint".to_string(),
+            agent_version: "test".to_string(),
+            runtime_version: "test".to_string(),
+            pending_sync_reports_path: None,
+            metrics_address: "127.0.0.1:9901".parse().unwrap(),
+            debug_preserve_temp_files,
         };
 
         Agent::new(cfg).await.unwrap()
@@ -3212,6 +3486,7 @@ message_queue_capacity = 4096
             runtime_version: "test".to_string(),
             pending_sync_reports_path: Some(PathBuf::from("pending_sync_reports.jsonl")),
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
+            debug_preserve_temp_files: false,
         };
 
         let (exports, stats) = build_account_exports(&cfg, &snapshot).await.unwrap();
@@ -3305,6 +3580,7 @@ message_queue_capacity = 4096
             runtime_version: "test".to_string(),
             pending_sync_reports_path: Some(PathBuf::from("pending_sync_reports.jsonl")),
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
+            debug_preserve_temp_files: false,
         };
         let config_hash = LinkGenerationConfig::load_from_file(&runtime_dir.join("tt-link.toml"))
             .unwrap()
@@ -3382,6 +3658,7 @@ message_queue_capacity = 4096
             runtime_version: "test".to_string(),
             pending_sync_reports_path: Some(PathBuf::from("pending_sync_reports.jsonl")),
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
+            debug_preserve_temp_files: false,
         };
         let snapshot = SyncPayload {
             version: "rev-1".to_string(),
@@ -3545,6 +3822,7 @@ message_queue_capacity = 4096
             runtime_version: "test".to_string(),
             pending_sync_reports_path: None,
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
+            debug_preserve_temp_files: false,
         };
 
         let agent = Agent::new(cfg).await.unwrap();
@@ -3634,6 +3912,64 @@ password = "secret-2"
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].username, "alice");
         assert_eq!(parsed[1].username, "bob");
+    }
+
+    #[test]
+    fn parse_access_artifacts_rejects_invalid_toml() {
+        let raw = r#"
+[[client]]
+username = "alice"
+password = "secret
+"#;
+        let err = parse_access_artifacts(raw).unwrap_err();
+        assert!(err.contains("failed to parse credentials TOML"));
+    }
+
+    #[tokio::test]
+    async fn candidate_validation_rewrites_temp_config_with_candidate_credentials_path() {
+        let tmp_dir = TempDir::new().unwrap();
+        let agent = make_db_worker_agent_for_validation_tests(&tmp_dir, false).await;
+        let candidate = agent
+            .write_runtime_credentials_tmp(b"[[client]]\nusername=\"alice\"\npassword=\"secret\"\n")
+            .await
+            .unwrap();
+
+        let files = agent
+            .validate_candidate_credentials_pipeline(candidate.clone())
+            .await
+            .unwrap();
+
+        let temp_config = std::fs::read_to_string(&files.temp_config_path).unwrap();
+        let parsed = temp_config.parse::<toml_edit::Document>().unwrap();
+        assert_eq!(
+            parsed
+                .get("credentials_file")
+                .and_then(|item| item.as_str())
+                .unwrap(),
+            candidate.display().to_string()
+        );
+        assert!(!temp_config.contains("[[client]]"));
+        agent
+            .cleanup_validation_files(&files, false, false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn candidate_validation_failure_keeps_debug_artifacts() {
+        let tmp_dir = TempDir::new().unwrap();
+        let agent = make_db_worker_agent_for_validation_tests(&tmp_dir, true).await;
+        let candidate = agent
+            .write_runtime_credentials_tmp(b"credentials_file = \"not-credentials\"")
+            .await
+            .unwrap();
+
+        let err = agent
+            .validate_candidate_credentials_pipeline(candidate.clone())
+            .await
+            .unwrap_err();
+        assert!(err.contains("phase=candidate_toml_invalid"));
+        assert!(candidate.exists());
     }
 
     #[test]
