@@ -340,4 +340,110 @@ mod tests {
 
         assert_eq!(first.config_hash(), second.config_hash());
     }
+
+    #[test]
+    fn loads_existing_credentials_into_inventory_snapshot() {
+        let temp_dir = TempDir::new().unwrap();
+        let credentials_path = temp_dir.path().join("credentials.toml");
+        std::fs::write(
+            &credentials_path,
+            "[[client]]\nusername = \"alice\"\npassword = \"one\"\n\n[[client]]\nusername = \"bob\"\npassword = \"two\"\n",
+        )
+        .unwrap();
+
+        let snapshot =
+            load_inventory_snapshot(&credentials_path, "cfg-hash".to_string(), 10).unwrap();
+
+        assert_eq!(snapshot.export_config_hash, "cfg-hash");
+        assert_eq!(snapshot.credentials.len(), 2);
+        assert_eq!(snapshot.credentials[0].username, "alice");
+        assert_eq!(snapshot.credentials[1].username, "bob");
+    }
+
+    #[test]
+    fn startup_bootstrap_with_empty_state_loads_all_credentials_as_missing() {
+        let snapshot = InventorySnapshot {
+            generated_at_unix_sec: 1,
+            export_config_hash: "hash-v1".to_string(),
+            credentials: vec![
+                InventoryAccount {
+                    username: "alice".to_string(),
+                    password: "one".to_string(),
+                },
+                InventoryAccount {
+                    username: "bob".to_string(),
+                    password: "two".to_string(),
+                },
+            ],
+        };
+
+        let delta = compute_delta(&snapshot, None);
+
+        assert_eq!(delta.missing.len(), 2);
+        assert_eq!(delta.stale.len(), 0);
+        assert_eq!(delta.removed.len(), 0);
+    }
+
+    #[test]
+    fn periodic_reconcile_detects_added_changed_and_removed_credentials() {
+        let snapshot = InventorySnapshot {
+            generated_at_unix_sec: 2,
+            export_config_hash: "hash-v2".to_string(),
+            credentials: vec![
+                InventoryAccount {
+                    username: "alice".to_string(),
+                    password: "one".to_string(),
+                },
+                InventoryAccount {
+                    username: "carol".to_string(),
+                    password: "three".to_string(),
+                },
+            ],
+        };
+        let previous = InventoryState {
+            schema_version: INVENTORY_STATE_SCHEMA_VERSION,
+            generated_at_unix_sec: 1,
+            export_config_hash: "hash-v1".to_string(),
+            credentials: vec![
+                InventoryStateCredential {
+                    username: "alice".to_string(),
+                    password_sha256: sha256_hex("one".as_bytes()),
+                },
+                InventoryStateCredential {
+                    username: "bob".to_string(),
+                    password_sha256: sha256_hex("two".as_bytes()),
+                },
+            ],
+        };
+
+        let delta = compute_delta(&snapshot, Some(&previous));
+
+        assert_eq!(delta.missing.len(), 1);
+        assert_eq!(delta.missing[0].username, "carol");
+        assert_eq!(delta.stale.len(), 1);
+        assert_eq!(delta.stale[0].username, "alice");
+        assert_eq!(delta.removed, vec!["bob".to_string()]);
+    }
+
+    #[test]
+    fn idempotent_second_run_reports_no_changes() {
+        let temp_dir = TempDir::new().unwrap();
+        let state_path = temp_dir.path().join("credentials_inventory_state.json");
+        let snapshot = InventorySnapshot {
+            generated_at_unix_sec: 5,
+            export_config_hash: "hash-v1".to_string(),
+            credentials: vec![InventoryAccount {
+                username: "alice".to_string(),
+                password: "one".to_string(),
+            }],
+        };
+
+        persist_state(&state_path, &snapshot).unwrap();
+        let previous = load_state(&state_path).unwrap().unwrap();
+        let second_delta = compute_delta(&snapshot, Some(&previous));
+
+        assert!(second_delta.missing.is_empty());
+        assert!(second_delta.stale.is_empty());
+        assert!(second_delta.removed.is_empty());
+    }
 }

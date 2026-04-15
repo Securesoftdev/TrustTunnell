@@ -403,4 +403,27 @@ mod tests {
 
         assert!(matches!(writer.sink, LkBulkSink::Postgres { .. }));
     }
+
+    #[test]
+    fn bulk_upsert_tracks_created_updated_unchanged_deactivated_and_partial_errors() {
+        let payload: LkBulkApiResponse = serde_json::from_str(
+            r#"{"created":1,"updated":2,"unchanged":3,"deactivated":4,"failed":1,"failures":["alice: timeout"]}"#,
+        )
+        .unwrap();
+        let result = LkBatchWriteResult {
+            created: payload.created,
+            updated: payload.updated,
+            unchanged: payload.unchanged,
+            deactivated: payload.deactivated,
+            failed: payload.failed,
+            failures: payload.failures,
+        };
+
+        assert_eq!(result.created, 1);
+        assert_eq!(result.updated, 2);
+        assert_eq!(result.unchanged, 3);
+        assert_eq!(result.deactivated, 4);
+        assert_eq!(result.failed, 1);
+        assert_eq!(result.failures, vec!["alice: timeout".to_string()]);
+    }
 }
