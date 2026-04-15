@@ -32,13 +32,14 @@ impl LkArtifactRecord {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct LkBatchWriteResult {
     pub(crate) created: usize,
     pub(crate) updated: usize,
     pub(crate) unchanged: usize,
     pub(crate) deactivated: usize,
     pub(crate) failed: usize,
+    #[serde(default)]
     pub(crate) failures: Vec<String>,
 }
 
@@ -52,7 +53,11 @@ enum LkBulkSink {
         endpoint: String,
         service_token: Option<String>,
     },
-    Postgres {
+    PostgresFunction {
+        dsn: String,
+        function_name: String,
+    },
+    LegacyPostgresTable {
         dsn: String,
         table_name: String,
     },
@@ -96,15 +101,34 @@ impl LkBulkWriter {
         }
 
         if dsn.starts_with("postgres://") || dsn.starts_with("postgresql://") {
-            let table_name = std::env::var("LK_DB_TABLE")
+            if std::env::var("LK_DB_LEGACY_RAW_TABLE")
+                .ok()
+                .as_deref()
+                .map(str::trim)
+                == Some("1")
+            {
+                let table_name = std::env::var("LK_DB_TABLE")
+                    .ok()
+                    .map(|item| item.trim().to_string())
+                    .filter(|item| !item.is_empty())
+                    .unwrap_or_else(|| "access_artifacts".to_string());
+                return Ok(Self {
+                    sink: LkBulkSink::LegacyPostgresTable {
+                        dsn: dsn.to_string(),
+                        table_name,
+                    },
+                });
+            }
+
+            let function_name = std::env::var("LK_DB_WRITE_FUNCTION")
                 .ok()
                 .map(|item| item.trim().to_string())
                 .filter(|item| !item.is_empty())
-                .unwrap_or_else(|| "access_artifacts".to_string());
+                .unwrap_or_else(|| "trusttunnel_apply_access_artifacts".to_string());
             return Ok(Self {
-                sink: LkBulkSink::Postgres {
+                sink: LkBulkSink::PostgresFunction {
                     dsn: dsn.to_string(),
-                    table_name,
+                    function_name,
                 },
             });
         }
@@ -128,8 +152,11 @@ impl LkBulkWriter {
                 endpoint,
                 service_token,
             } => write_via_api(client, endpoint, service_token.as_deref(), records).await,
-            LkBulkSink::Postgres { dsn, table_name } => {
-                write_via_postgres(dsn, table_name, records).await
+            LkBulkSink::PostgresFunction { dsn, function_name } => {
+                write_via_postgres_function(dsn, function_name, records).await
+            }
+            LkBulkSink::LegacyPostgresTable { dsn, table_name } => {
+                write_via_legacy_postgres_table(dsn, table_name, records).await
             }
         }
     }
@@ -161,9 +188,7 @@ async fn write_via_api(
     service_token: Option<&str>,
     records: Vec<LkArtifactRecord>,
 ) -> Result<LkBatchWriteResult, String> {
-    let mut request = client
-        .post(endpoint)
-        .json(&LkBulkApiRequest { records });
+    let mut request = client.post(endpoint).json(&LkBulkApiRequest { records });
     if let Some(token) = service_token.map(str::trim).filter(|item| !item.is_empty()) {
         request = request.bearer_auth(token);
     }
@@ -203,7 +228,36 @@ async fn write_via_api(
     })
 }
 
-async fn write_via_postgres(
+async fn write_via_postgres_function(
+    dsn: &str,
+    function_name: &str,
+    records: Vec<LkArtifactRecord>,
+) -> Result<LkBatchWriteResult, String> {
+    let payload = serde_json::to_string(&records)
+        .map_err(|e| format!("failed to serialize LK artifact payload: {e}"))?;
+    let query = format!(
+        "SELECT {function_name}($${payload}$$::jsonb)::text"
+    );
+    let raw = exec_psql(dsn, &query).await.map_err(|e| {
+        format!(
+            "failed to execute LK write function {function_name}: {e}. \
+If your LK still uses legacy raw table writes, set LK_DB_LEGACY_RAW_TABLE=1"
+        )
+    })?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "LK write function {function_name} returned empty response"
+        ));
+    }
+    serde_json::from_str::<LkBatchWriteResult>(trimmed).map_err(|e| {
+        format!(
+            "failed to parse LK write function {function_name} response as JSON: {e}; raw={trimmed}"
+        )
+    })
+}
+
+async fn write_via_legacy_postgres_table(
     dsn: &str,
     table_name: &str,
     records: Vec<LkArtifactRecord>,
@@ -252,8 +306,7 @@ async fn write_via_postgres(
                 tt_link = EXCLUDED.tt_link, \
                 config_hash = EXCLUDED.config_hash, \
                 active = EXCLUDED.active, \
-                updated_at = NOW()"
-            ,
+                updated_at = NOW()",
             sql_quote(&record.dedupe_key()),
             sql_quote(&record.external_node_id),
             sql_quote(&record.username),
@@ -408,14 +461,6 @@ mod tests {
     }
 
     #[test]
-    fn writer_selects_postgres_sink_for_postgres_dsn() {
-        let writer =
-            LkBulkWriter::from_contract("postgres://localhost/lk", None).expect("writer");
-
-        assert!(matches!(writer.sink, LkBulkSink::Postgres { .. }));
-    }
-
-    #[test]
     fn bulk_upsert_tracks_created_updated_unchanged_deactivated_and_partial_errors() {
         let payload: LkBulkApiResponse = serde_json::from_str(
             r#"{"created":1,"updated":2,"unchanged":3,"deactivated":4,"failed":1,"failures":["alice: timeout"]}"#,
@@ -436,5 +481,17 @@ mod tests {
         assert_eq!(result.deactivated, 4);
         assert_eq!(result.failed, 1);
         assert_eq!(result.failures, vec!["alice: timeout".to_string()]);
+    }
+
+    #[test]
+    fn postgres_function_response_is_parsed_from_json() {
+        let parsed: LkBatchWriteResult = serde_json::from_str(
+            r#"{"created":1,"updated":0,"unchanged":2,"deactivated":0,"failed":0,"failures":[]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.created, 1);
+        assert_eq!(parsed.unchanged, 2);
+        assert_eq!(parsed.failed, 0);
     }
 }

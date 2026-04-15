@@ -34,7 +34,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::{Instant, MissedTickBehavior, interval};
 use toml_edit::value;
-use trusttunnel::settings::{Settings, TlsHostsSettings};
 use prometheus::{Encoder, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder};
 
 const SYNC_REPORT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -1694,11 +1693,11 @@ impl Agent {
         parse_access_artifacts(&raw).map(|_| ())
     }
 
-    fn validate_endpoint_settings_parser(
+    fn validate_endpoint_settings_reference(
         &self,
         temp_config_path: &Path,
         candidate_path: &Path,
-    ) -> Result<Settings, String> {
+    ) -> Result<(), String> {
         let settings_content = std::fs::read_to_string(temp_config_path).map_err(|e| {
             format!(
                 "failed to read temp endpoint settings {}: {e}",
@@ -1729,31 +1728,87 @@ impl Agent {
                 candidate_path.display()
             ));
         }
-        toml::from_str::<Settings>(&settings_content).map_err(|e| {
-            format!(
-                "failed to validate endpoint settings parser using {}: {e}",
-                temp_config_path.display()
-            )
-        })
+        Ok(())
     }
 
-    fn validate_endpoint_runtime_entrypoint(
+    async fn validate_endpoint_runtime_entrypoint(
         &self,
         temp_config_path: &Path,
         candidate_path: &Path,
     ) -> Result<(), String> {
-        let settings = self.validate_endpoint_settings_parser(temp_config_path, candidate_path)?;
-        let hosts_path =
-            resolve_runtime_path(&self.cfg.trusttunnel_runtime_dir, &self.cfg.trusttunnel_hosts_file);
-        let hosts_content = std::fs::read_to_string(&hosts_path)
-            .map_err(|e| format!("failed to read endpoint hosts settings {}: {e}", hosts_path.display()))?;
-        toml::from_str::<TlsHostsSettings>(&hosts_content).map_err(|e| {
+        let raw_candidate = std::fs::read_to_string(candidate_path).map_err(|e| {
             format!(
-                "failed to parse endpoint hosts settings {}: {e}",
-                hosts_path.display()
+                "failed to read candidate credentials {}: {e}",
+                candidate_path.display()
             )
         })?;
-        let _ = settings;
+        let credentials = parse_access_artifacts(&raw_candidate)?;
+        let sample_username = credentials
+            .first()
+            .map(|item| item.username.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "candidate credentials file {} does not contain any [[client]] entries",
+                    candidate_path.display()
+                )
+            })?;
+        let hosts_path =
+            resolve_runtime_path(&self.cfg.trusttunnel_runtime_dir, &self.cfg.trusttunnel_hosts_file);
+
+        let mut command = Command::new(&self.cfg.endpoint_binary);
+        command
+            .arg(temp_config_path)
+            .arg(&hosts_path)
+            .arg("--client_config")
+            .arg(sample_username)
+            .arg("--format")
+            .arg("deeplink")
+            .arg("--address")
+            .arg("127.0.0.1:443");
+
+        let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+            .await
+            .map_err(|_| {
+                format!(
+                    "endpoint runtime validation timed out for binary={} settings={} hosts={} username={sample_username}",
+                    self.cfg.endpoint_binary,
+                    temp_config_path.display(),
+                    hosts_path.display(),
+                )
+            })?
+            .map_err(|e| {
+                format!(
+                    "failed to execute endpoint runtime validation binary={} settings={} hosts={}: {e}",
+                    self.cfg.endpoint_binary,
+                    temp_config_path.display(),
+                    hosts_path.display(),
+                )
+            })?;
+        let stdout = String::from_utf8(output.stdout)
+            .map_err(|e| format!("endpoint runtime validation stdout is not valid UTF-8: {e}"))?;
+        let stderr = String::from_utf8(output.stderr)
+            .map_err(|e| format!("endpoint runtime validation stderr is not valid UTF-8: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "endpoint runtime validation failed: status={} settings={} hosts={} candidate={} username={} stdout={} stderr={}",
+                output.status,
+                temp_config_path.display(),
+                hosts_path.display(),
+                candidate_path.display(),
+                sample_username,
+                stdout.trim(),
+                stderr.trim()
+            ));
+        }
+        if !stdout.trim().starts_with("tt://") {
+            return Err(format!(
+                "endpoint runtime validation returned invalid client config output for username={}: stdout={} stderr={}",
+                sample_username,
+                stdout.trim(),
+                stderr.trim()
+            ));
+        }
+
         Ok(())
     }
 
@@ -1850,42 +1905,42 @@ impl Agent {
         );
 
         println!(
-            "phase=settings_validation_begin node={} parser=trusttunnel::Settings stage=temp_config_settings_parse file={}",
+            "phase=settings_reference_check_begin node={} parser=toml_edit::Document stage=settings_reference_check file={}",
             self.cfg.node_external_id,
             temp_config_path.display()
         );
-        self.validate_endpoint_settings_parser(&temp_config_path, &candidate_path)
+        self.validate_endpoint_settings_reference(&temp_config_path, &candidate_path)
             .map_err(|e| {
                 format!(
-                    "phase=settings_validation_failed node={} parser=trusttunnel::Settings stage=temp_config_settings_parse temp_config_path={} candidate_path={}: {e}",
+                    "phase=settings_reference_check_failed node={} parser=toml_edit::Document stage=settings_reference_check temp_config_path={} candidate_path={}: {e}",
                     self.cfg.node_external_id,
                     temp_config_path.display(),
                     candidate_path.display()
                 )
             })?;
         println!(
-            "phase=settings_validation_ok node={} parser=trusttunnel::Settings stage=temp_config_settings_parse file={}",
+            "phase=settings_reference_check_ok node={} parser=toml_edit::Document stage=settings_reference_check file={}",
             self.cfg.node_external_id,
             temp_config_path.display()
         );
 
         println!(
-            "phase=runtime_validation_begin node={} parser=endpoint_startup_entrypoint stage=endpoint_runtime_validation temp_config_path={} hosts_path={}",
+            "phase=runtime_startup_validation_begin node={} parser=trusttunnel_endpoint --client_config stage=runtime_startup_validation temp_config_path={} hosts_path={}",
             self.cfg.node_external_id,
             temp_config_path.display(),
             resolve_runtime_path(&self.cfg.trusttunnel_runtime_dir, &self.cfg.trusttunnel_hosts_file).display()
         );
-        self.validate_endpoint_runtime_entrypoint(&temp_config_path, &candidate_path)
+        self.validate_endpoint_runtime_entrypoint(&temp_config_path, &candidate_path).await
             .map_err(|e| {
                 format!(
-                    "phase=endpoint_runtime_validation_failed node={} parser=endpoint_startup_entrypoint stage=runtime_validation temp_config_path={} candidate_path={}: {e}",
+                    "phase=runtime_startup_validation_failed node={} parser=trusttunnel_endpoint --client_config stage=runtime_startup_validation temp_config_path={} candidate_path={}: {e}",
                     self.cfg.node_external_id,
                     temp_config_path.display(),
                     candidate_path.display()
                 )
             })?;
         println!(
-            "phase=runtime_validation_ok node={} parser=endpoint_startup_entrypoint stage=endpoint_runtime_validation temp_config_path={} candidate_path={}",
+            "phase=runtime_startup_validation_ok node={} parser=trusttunnel_endpoint --client_config stage=runtime_startup_validation temp_config_path={} candidate_path={}",
             self.cfg.node_external_id,
             temp_config_path.display(),
             candidate_path.display()
@@ -3328,7 +3383,7 @@ message_queue_capacity = 4096
             apply_cmd: apply_cmd.map(ToString::to_string),
             runtime_pid_path: Some(runtime_dir.join("trusttunnel.pid")),
             runtime_process_name: Some("trusttunnel_endpoint".to_string()),
-            endpoint_binary: "trusttunnel_endpoint".to_string(),
+            endpoint_binary,
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             runtime_version: "test".to_string(),
             pending_sync_reports_path: Some(runtime_dir.join(SYNC_REPORT_OUTBOX_FILE)),
@@ -3396,6 +3451,9 @@ upload_buffer_size = 32768
         .await
         .unwrap();
 
+        let endpoint_args_log_path = runtime_dir.join("validation-endpoint-args.log");
+        let endpoint_binary = make_fake_endpoint_script(temp_dir, &endpoint_args_log_path);
+
         let cfg = Config {
             lk_base_url: None,
             runtime_mode: RuntimeMode::DbWorker,
@@ -3423,7 +3481,7 @@ upload_buffer_size = 32768
             apply_cmd: None,
             runtime_pid_path: None,
             runtime_process_name: None,
-            endpoint_binary: "trusttunnel_endpoint".to_string(),
+            endpoint_binary,
             agent_version: "test".to_string(),
             runtime_version: "test".to_string(),
             pending_sync_reports_path: None,
@@ -4162,6 +4220,7 @@ password = "secret
 
         agent
             .validate_endpoint_runtime_entrypoint(&temp_config_path, &candidate)
+            .await
             .unwrap();
     }
 
@@ -4242,6 +4301,8 @@ upload_buffer_size = 32768
         )
         .await
         .unwrap();
+        let endpoint_args_log_path = runtime_dir.join("validation-endpoint-args.log");
+        let endpoint_binary = make_fake_endpoint_script(&tmp_dir, &endpoint_args_log_path);
 
         let cfg = Config {
             lk_base_url: None,
@@ -4270,7 +4331,7 @@ upload_buffer_size = 32768
             apply_cmd: None,
             runtime_pid_path: None,
             runtime_process_name: None,
-            endpoint_binary: "trusttunnel_endpoint".to_string(),
+            endpoint_binary,
             agent_version: "test".to_string(),
             runtime_version: "test".to_string(),
             pending_sync_reports_path: None,
