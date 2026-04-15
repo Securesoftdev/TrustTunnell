@@ -10,6 +10,7 @@ use link_config::LinkGenerationConfig;
 use reqwest::StatusCode;
 use trusttunnel_deeplink::DeepLinkConfig;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs::read_dir;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,117 @@ const HEARTBEAT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const HEARTBEAT_MAX_ATTEMPTS: usize = 3;
 const SYNC_REPORT_OUTBOX_FILE: &str = "pending_sync_reports.jsonl";
 const RUNTIME_PRIMARY_MARKER_FILE: &str = ".runtime_credentials_primary";
+
+mod sidecar_sync {
+    use super::sha256_hex;
+    use std::collections::BTreeMap;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct AccessArtifact {
+        pub(crate) username: String,
+        pub(crate) password: String,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum PassKind {
+        Bootstrap,
+        Reconcile,
+    }
+
+    impl PassKind {
+        pub(crate) fn as_str(self) -> &'static str {
+            match self {
+                Self::Bootstrap => "bootstrap",
+                Self::Reconcile => "reconcile",
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct PassStats {
+        pub(crate) found: usize,
+        pub(crate) generated: usize,
+        pub(crate) updated: usize,
+        pub(crate) skipped: usize,
+        pub(crate) errors: usize,
+        pub(crate) new_credentials: usize,
+        pub(crate) missing_credentials: usize,
+        pub(crate) stale_credentials: usize,
+        pub(crate) deleted_credentials: usize,
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct ReconcilePlan {
+        pub(crate) stats: PassStats,
+        pub(crate) rendered_credentials: String,
+        pub(crate) rendered_sha256: String,
+        pub(crate) changed: bool,
+    }
+
+    pub(crate) fn reconcile_plan(
+        desired_artifacts: &[AccessArtifact],
+        runtime_credentials: &[AccessArtifact],
+    ) -> ReconcilePlan {
+        let mut desired = desired_artifacts
+            .iter()
+            .map(|item| (item.username.clone(), item.password.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let runtime = runtime_credentials
+            .iter()
+            .map(|item| (item.username.clone(), item.password.clone()))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut stats = PassStats {
+            found: desired.len(),
+            ..PassStats::default()
+        };
+
+        for (username, password) in &desired {
+            match runtime.get(username) {
+                None => {
+                    stats.generated += 1;
+                    stats.new_credentials += 1;
+                }
+                Some(existing_password) if existing_password == password => {
+                    stats.skipped += 1;
+                }
+                Some(_) => {
+                    stats.updated += 1;
+                    stats.stale_credentials += 1;
+                }
+            }
+        }
+
+        for username in runtime.keys() {
+            if !desired.contains_key(username) {
+                stats.missing_credentials += 1;
+                stats.deleted_credentials += 1;
+            }
+        }
+
+        let rendered_credentials = render_credentials_from_map(&desired);
+        let rendered_sha256 = sha256_hex(rendered_credentials.as_bytes());
+        let changed = stats.generated > 0 || stats.updated > 0 || stats.deleted_credentials > 0;
+        desired.clear();
+
+        ReconcilePlan {
+            stats,
+            rendered_credentials,
+            rendered_sha256,
+            changed,
+        }
+    }
+
+    fn render_credentials_from_map(accounts: &BTreeMap<String, String>) -> String {
+        let mut out = String::new();
+        for (username, password) in accounts {
+            out.push_str("[[client]]\n");
+            out.push_str(&format!("username = {:?}\n", username));
+            out.push_str(&format!("password = {:?}\n\n", password));
+        }
+        out
+    }
+}
 
 #[derive(Clone)]
 struct Config {
@@ -383,17 +495,173 @@ impl Agent {
             self.cfg.lk_db_dsn.len(),
             self.cfg.apply_interval.as_secs()
         );
+        if let Err(err) = self
+            .run_sidecar_sync_pass(sidecar_sync::PassKind::Bootstrap)
+            .await
+        {
+            log_error(
+                "unknown",
+                &self.cfg.node_external_id,
+                "sidecar_sync_bootstrap_failed",
+                "failed",
+                &err,
+            );
+        }
         let mut poll_tick = interval(self.cfg.reconcile_interval);
         poll_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut backoff = Duration::from_secs(1);
         loop {
             poll_tick.tick().await;
-            log_event(
-                "info",
-                self.state.applied_revision.as_deref().unwrap_or("none"),
-                &self.cfg.node_external_id,
-                "db_worker_idle",
-                "legacy_orchestration_disabled",
-            );
+            match self
+                .run_sidecar_sync_pass(sidecar_sync::PassKind::Reconcile)
+                .await
+            {
+                Ok(_) => backoff = Duration::from_secs(1),
+                Err(err) => {
+                    log_error(
+                        self.state.applied_revision.as_deref().unwrap_or("none"),
+                        &self.cfg.node_external_id,
+                        "sidecar_sync_reconcile_failed",
+                        "failed",
+                        &err,
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff.saturating_mul(2), Duration::from_secs(300));
+                }
+            }
+        }
+    }
+
+    async fn run_sidecar_sync_pass(
+        &mut self,
+        pass_kind: sidecar_sync::PassKind,
+    ) -> Result<sidecar_sync::PassStats, String> {
+        let desired_artifacts = self.load_desired_access_artifacts().await?;
+        let runtime_credentials = self.load_runtime_credentials_artifacts().await?;
+        let mut plan = sidecar_sync::reconcile_plan(&desired_artifacts, &runtime_credentials);
+        let node = self.cfg.node_external_id.clone();
+        let pass = pass_kind.as_str();
+
+        if plan.changed {
+            let previous_runtime_credentials = fs::read(&self.cfg.runtime_credentials_path).await.ok();
+            let tmp_credentials_path = self
+                .write_runtime_credentials_tmp(plan.rendered_credentials.as_bytes())
+                .await?;
+            if let Err(err) = self.validate_credentials_with_endpoint_parser(&tmp_credentials_path) {
+                let _ = fs::remove_file(&tmp_credentials_path).await;
+                plan.stats.errors += 1;
+                self.update_sidecar_sync_metrics(pass, &plan.stats);
+                return Err(err);
+            }
+            self.promote_runtime_credentials(&tmp_credentials_path).await?;
+            let apply_result = self.apply_runtime().await;
+            let apply_result = match apply_result {
+                Ok(()) => self.verify_runtime_post_apply(&plan.rendered_sha256).await,
+                Err(err) => Err(err),
+            };
+            if let Err(apply_err) = apply_result {
+                let rollback_result = self.rollback_runtime(previous_runtime_credentials).await;
+                plan.stats.errors += 1;
+                self.update_sidecar_sync_metrics(pass, &plan.stats);
+                return match rollback_result {
+                    Ok(()) => Err(format!("sidecar sync apply failed and rollback completed: {apply_err}")),
+                    Err(rollback_err) => Err(format!(
+                        "sidecar sync apply failed: {apply_err}; rollback failed: {rollback_err}"
+                    )),
+                };
+            }
+            self.state.credentials_sha256 = plan.rendered_sha256.clone();
+            self.mark_runtime_as_primary().await?;
+            persist_state(&self.cfg.agent_state_path, &self.state).await?;
+        } else {
+            plan.stats.skipped += plan.stats.missing_credentials;
+        }
+
+        self.update_sidecar_sync_metrics(pass, &plan.stats);
+        println!(
+            "sidecar sync pass={} found={} generated={} updated={} skipped={} errors={} new={} missing={} stale={} deleted={}",
+            pass,
+            plan.stats.found,
+            plan.stats.generated,
+            plan.stats.updated,
+            plan.stats.skipped,
+            plan.stats.errors,
+            plan.stats.new_credentials,
+            plan.stats.missing_credentials,
+            plan.stats.stale_credentials,
+            plan.stats.deleted_credentials
+        );
+        log_event(
+            if plan.stats.errors == 0 { "info" } else { "error" },
+            self.state.applied_revision.as_deref().unwrap_or("none"),
+            &node,
+            "sidecar_sync_pass",
+            pass,
+        );
+        Ok(plan.stats)
+    }
+
+    async fn load_desired_access_artifacts(&self) -> Result<Vec<sidecar_sync::AccessArtifact>, String> {
+        let Some(source_path) = self.cfg.bootstrap_credentials_source_path.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let raw = fs::read_to_string(source_path).await.map_err(|e| {
+            format!(
+                "failed to read desired access artifacts {}: {e}",
+                source_path.display()
+            )
+        })?;
+        parse_access_artifacts(&raw)
+    }
+
+    async fn load_runtime_credentials_artifacts(
+        &self,
+    ) -> Result<Vec<sidecar_sync::AccessArtifact>, String> {
+        if !fs::try_exists(&self.cfg.runtime_credentials_path)
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to check runtime credentials {}: {e}",
+                    self.cfg.runtime_credentials_path.display()
+                )
+            })?
+        {
+            return Ok(Vec::new());
+        }
+        let raw = fs::read_to_string(&self.cfg.runtime_credentials_path)
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to read runtime credentials {}: {e}",
+                    self.cfg.runtime_credentials_path.display()
+                )
+            })?;
+        parse_access_artifacts(&raw)
+    }
+
+    fn update_sidecar_sync_metrics(&self, pass: &str, stats: &sidecar_sync::PassStats) {
+        let node = self.cfg.node_external_id.as_str();
+        self.metrics
+            .sidecar_sync_pass_total
+            .with_label_values(&[node, pass, if stats.errors == 0 { "ok" } else { "error" }])
+            .inc();
+        for (outcome, value) in [
+            ("found", stats.found),
+            ("generated", stats.generated),
+            ("updated", stats.updated),
+            ("skipped", stats.skipped),
+            ("errors", stats.errors),
+            ("new", stats.new_credentials),
+            ("missing", stats.missing_credentials),
+            ("stale", stats.stale_credentials),
+            ("deleted", stats.deleted_credentials),
+        ] {
+            if value > 0 {
+                self.metrics
+                    .sidecar_sync_item_total
+                    .with_label_values(&[node, pass, outcome])
+                    .inc_by(value as u64);
+            }
         }
     }
 
@@ -1291,6 +1559,8 @@ struct RuntimeStatus {
 struct AgentMetrics {
     registry: Registry,
     reconcile_total: IntCounterVec,
+    sidecar_sync_pass_total: IntCounterVec,
+    sidecar_sync_item_total: IntCounterVec,
     tt_link_generation_total: IntCounterVec,
     runtime_health_total: Option<IntCounterVec>,
     apply_total: IntCounterVec,
@@ -1310,6 +1580,22 @@ impl AgentMetrics {
             &["node", "revision", "status", "error_class"],
         )
         .map_err(|e| format!("failed to create reconcile_total metric: {e}"))?;
+        let sidecar_sync_pass_total = IntCounterVec::new(
+            Opts::new(
+                "classic_agent_sidecar_sync_pass_total",
+                "Total sidecar sync passes by status",
+            ),
+            &["node", "pass", "status"],
+        )
+        .map_err(|e| format!("failed to create sidecar_sync_pass_total metric: {e}"))?;
+        let sidecar_sync_item_total = IntCounterVec::new(
+            Opts::new(
+                "classic_agent_sidecar_sync_item_total",
+                "Total sidecar sync item outcomes",
+            ),
+            &["node", "pass", "outcome"],
+        )
+        .map_err(|e| format!("failed to create sidecar_sync_item_total metric: {e}"))?;
         let runtime_health_total = None;
         let tt_link_generation_total = IntCounterVec::new(
             Opts::new(
@@ -1363,6 +1649,12 @@ impl AgentMetrics {
             .register(Box::new(reconcile_total.clone()))
             .map_err(|e| format!("failed to register reconcile_total metric: {e}"))?;
         registry
+            .register(Box::new(sidecar_sync_pass_total.clone()))
+            .map_err(|e| format!("failed to register sidecar_sync_pass_total metric: {e}"))?;
+        registry
+            .register(Box::new(sidecar_sync_item_total.clone()))
+            .map_err(|e| format!("failed to register sidecar_sync_item_total metric: {e}"))?;
+        registry
             .register(Box::new(tt_link_generation_total.clone()))
             .map_err(|e| format!("failed to register tt_link_generation_total metric: {e}"))?;
         registry
@@ -1386,10 +1678,20 @@ impl AgentMetrics {
         last_failed_reconcile.with_label_values(labels).set(0);
         apply_duration_ms.with_label_values(labels).set(0);
         credentials_count.with_label_values(labels).set(0);
+        for pass in ["bootstrap", "reconcile"] {
+            sidecar_sync_pass_total
+                .with_label_values(&[node, pass, "ok"])
+                .inc_by(0);
+            sidecar_sync_item_total
+                .with_label_values(&[node, pass, "found"])
+                .inc_by(0);
+        }
 
         Ok(Self {
             registry,
             reconcile_total,
+            sidecar_sync_pass_total,
+            sidecar_sync_item_total,
             tt_link_generation_total,
             runtime_health_total,
             apply_total,
@@ -1683,6 +1985,43 @@ fn render_credentials(accounts: &[&Account]) -> String {
         out.push_str(&format!("password = {:?}\n\n", a.password));
     }
     out
+}
+
+fn parse_access_artifacts(raw: &str) -> Result<Vec<sidecar_sync::AccessArtifact>, String> {
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let parsed = raw
+        .parse::<toml::Value>()
+        .map_err(|e| format!("failed to parse credentials TOML: {e}"))?;
+    let clients = parsed
+        .get("client")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| "credentials TOML does not contain [[client]] entries".to_string())?;
+
+    let mut unique = BTreeMap::<String, String>::new();
+    for item in clients {
+        let username = item
+            .get("username")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| "client entry has no username".to_string())?
+            .trim()
+            .to_string();
+        let password = item
+            .get("password")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| "client entry has no password".to_string())?
+            .to_string();
+        if username.is_empty() {
+            return Err("client entry has empty username".to_string());
+        }
+        unique.insert(username, password);
+    }
+
+    Ok(unique
+        .into_iter()
+        .map(|(username, password)| sidecar_sync::AccessArtifact { username, password })
+        .collect())
 }
 
 fn validate_checksum(snapshot: &SyncPayload, raw_body: &[u8]) -> bool {
@@ -3079,6 +3418,67 @@ message_queue_capacity = 4096
         ));
         assert!(names.contains(&"classic_agent_apply_duration_milliseconds".to_string()));
         assert!(names.contains(&"classic_agent_credentials_count".to_string()));
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("classic_agent_sidecar_sync_pass"))
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("classic_agent_sidecar_sync_item"))
+        );
+    }
+
+    #[test]
+    fn parse_access_artifacts_reads_clients() {
+        let raw = r#"
+[[client]]
+username = "alice"
+password = "secret-1"
+
+[[client]]
+username = "bob"
+password = "secret-2"
+"#;
+        let parsed = parse_access_artifacts(raw).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].username, "alice");
+        assert_eq!(parsed[1].username, "bob");
+    }
+
+    #[test]
+    fn sidecar_sync_reconcile_plan_detects_new_missing_and_stale() {
+        let desired = vec![
+            sidecar_sync::AccessArtifact {
+                username: "alice".to_string(),
+                password: "new".to_string(),
+            },
+            sidecar_sync::AccessArtifact {
+                username: "charlie".to_string(),
+                password: "fresh".to_string(),
+            },
+        ];
+        let runtime = vec![
+            sidecar_sync::AccessArtifact {
+                username: "alice".to_string(),
+                password: "old".to_string(),
+            },
+            sidecar_sync::AccessArtifact {
+                username: "bob".to_string(),
+                password: "legacy".to_string(),
+            },
+        ];
+
+        let plan = sidecar_sync::reconcile_plan(&desired, &runtime);
+        assert_eq!(plan.stats.found, 2);
+        assert_eq!(plan.stats.generated, 1);
+        assert_eq!(plan.stats.updated, 1);
+        assert_eq!(plan.stats.new_credentials, 1);
+        assert_eq!(plan.stats.stale_credentials, 1);
+        assert_eq!(plan.stats.missing_credentials, 1);
+        assert_eq!(plan.stats.deleted_credentials, 1);
+        assert!(plan.changed);
     }
 
     #[cfg(feature = "legacy-lk-http")]
