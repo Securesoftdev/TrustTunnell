@@ -1,6 +1,7 @@
 mod legacy;
 mod exporter;
 mod link_config;
+mod credentials_format;
 mod credentials_inventory;
 mod lk_bulk_writer;
 mod runtime_workspace;
@@ -15,6 +16,7 @@ use credentials_inventory::{
     load_inventory_snapshot, load_state as load_inventory_state, persist_state as persist_inventory_state,
     resolve_credentials_path_from_settings,
 };
+use credentials_format::parse_client_credentials;
 use exporter::{EndpointExportOptions, EndpointLinkExporter};
 use lk_bulk_writer::{LkArtifactRecord, LkBulkWriter};
 use link_config::LinkGenerationConfig;
@@ -96,14 +98,8 @@ mod sidecar_sync {
         desired_artifacts: &[AccessArtifact],
         runtime_credentials: &[AccessArtifact],
     ) -> ReconcilePlan {
-        let mut desired = desired_artifacts
-            .iter()
-            .map(|item| (item.username.clone(), item.password.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let runtime = runtime_credentials
-            .iter()
-            .map(|item| (item.username.clone(), item.password.clone()))
-            .collect::<BTreeMap<_, _>>();
+        let mut desired = reconcile_unique_artifacts(desired_artifacts, "desired");
+        let runtime = reconcile_unique_artifacts(runtime_credentials, "runtime");
 
         let mut stats = PassStats {
             found: desired.len(),
@@ -154,6 +150,25 @@ mod sidecar_sync {
             out.push_str(&format!("password = {:?}\n\n", password));
         }
         out
+    }
+
+    fn reconcile_unique_artifacts(
+        artifacts: &[AccessArtifact],
+        source: &str,
+    ) -> BTreeMap<String, String> {
+        let mut unique = BTreeMap::<String, String>::new();
+        for item in artifacts {
+            if let Some(previous_password) = unique.get(&item.username) {
+                if previous_password != &item.password {
+                    println!(
+                        "phase=credentials_reconcile_conflict source={} username={} resolution=last_wins",
+                        source, item.username
+                    );
+                }
+            }
+            unique.insert(item.username.clone(), item.password.clone());
+        }
+        unique
     }
 }
 
@@ -1743,15 +1758,12 @@ impl Agent {
             )
         })?;
         let credentials = parse_access_artifacts(&raw_candidate)?;
-        let sample_username = credentials
-            .first()
-            .map(|item| item.username.as_str())
-            .ok_or_else(|| {
-                format!(
-                    "candidate credentials file {} does not contain any [[client]] entries",
-                    candidate_path.display()
-                )
-            })?;
+        let sample_username = runtime_validation_sample_username(&credentials).ok_or_else(|| {
+            format!(
+                "candidate credentials file {} does not contain any [[client]] entries",
+                candidate_path.display()
+            )
+        })?;
         let hosts_path =
             resolve_runtime_path(&self.cfg.trusttunnel_runtime_dir, &self.cfg.trusttunnel_hosts_file);
 
@@ -2495,40 +2507,20 @@ fn render_credentials(accounts: &[&Account]) -> String {
 }
 
 fn parse_access_artifacts(raw: &str) -> Result<Vec<sidecar_sync::AccessArtifact>, String> {
-    if raw.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    let parsed = raw
-        .parse::<toml::Value>()
-        .map_err(|e| format!("failed to parse credentials TOML: {e}"))?;
-    let clients = parsed
-        .get("client")
-        .and_then(toml::Value::as_array)
-        .ok_or_else(|| "credentials TOML does not contain [[client]] entries".to_string())?;
-
-    let mut unique = BTreeMap::<String, String>::new();
-    for item in clients {
-        let username = item
-            .get("username")
-            .and_then(toml::Value::as_str)
-            .ok_or_else(|| "client entry has no username".to_string())?
-            .trim()
-            .to_string();
-        let password = item
-            .get("password")
-            .and_then(toml::Value::as_str)
-            .ok_or_else(|| "client entry has no password".to_string())?
-            .to_string();
-        if username.is_empty() {
-            return Err("client entry has empty username".to_string());
-        }
-        unique.insert(username, password);
-    }
-
-    Ok(unique
+    let parsed = parse_client_credentials(raw, "credentials")?;
+    Ok(parsed
         .into_iter()
-        .map(|(username, password)| sidecar_sync::AccessArtifact { username, password })
+        .map(|item| sidecar_sync::AccessArtifact {
+            username: item.username,
+            password: item.password,
+        })
         .collect())
+}
+
+fn runtime_validation_sample_username(
+    credentials: &[sidecar_sync::AccessArtifact],
+) -> Option<&str> {
+    credentials.first().map(|item| item.username.as_str())
 }
 
 fn validate_checksum(snapshot: &SyncPayload, raw_body: &[u8]) -> bool {
@@ -4165,6 +4157,50 @@ password = "secret
 "#;
         let err = parse_access_artifacts(raw).unwrap_err();
         assert!(err.contains("failed to parse credentials TOML"));
+    }
+
+    #[test]
+    fn unified_parser_is_equivalent_for_candidate_inventory_and_runtime_precheck() {
+        let raw = r#"
+[[client]]
+username = "alice"
+password = "secret-1"
+max_http2_conns = 100
+
+[[client]]
+username = "bob"
+password = "secret-2"
+max_http3_conns = 3
+"#;
+
+        let candidate = parse_access_artifacts(raw).unwrap();
+        let inventory = crate::credentials_inventory::parse_inventory_accounts(raw).unwrap();
+        let runtime_sample = runtime_validation_sample_username(&candidate);
+
+        assert_eq!(candidate.len(), inventory.len());
+        for (candidate_item, inventory_item) in candidate.iter().zip(inventory.iter()) {
+            assert_eq!(candidate_item.username, inventory_item.username);
+            assert_eq!(candidate_item.password, inventory_item.password);
+        }
+        assert_eq!(runtime_sample, Some("alice"));
+    }
+
+    #[test]
+    fn parser_keeps_duplicate_usernames_until_reconcile_step() {
+        let raw = r#"
+[[client]]
+username = "alice"
+password = "first"
+
+[[client]]
+username = "alice"
+password = "second"
+"#;
+
+        let parsed = parse_access_artifacts(raw).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].password, "first");
+        assert_eq!(parsed[1].password, "second");
     }
 
     #[tokio::test]
