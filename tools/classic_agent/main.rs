@@ -206,6 +206,7 @@ struct Config {
     pending_sync_reports_path: Option<PathBuf>,
     metrics_address: SocketAddr,
     debug_preserve_temp_files: bool,
+    validation_strict_mode: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -331,6 +332,14 @@ impl Config {
                 )
             })
             .unwrap_or(false);
+        let validation_strict_mode = optional_env_nonempty("TRUSTTUNNEL_VALIDATION_STRICT")
+            .map(|raw| {
+                matches!(
+                    raw.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
 
         let cfg = Self {
             lk_base_url,
@@ -365,6 +374,7 @@ impl Config {
             pending_sync_reports_path,
             metrics_address,
             debug_preserve_temp_files,
+            validation_strict_mode,
         };
         cfg.validate_paths()?;
         Ok(cfg)
@@ -1757,13 +1767,13 @@ impl Agent {
                 candidate_path.display()
             )
         })?;
-        let credentials = parse_access_artifacts(&raw_candidate)?;
-        let sample_username = runtime_validation_sample_username(&credentials).ok_or_else(|| {
-            format!(
-                "candidate credentials file {} does not contain any [[client]] entries",
-                candidate_path.display()
-            )
-        })?;
+        let sample_username =
+            runtime_validation_sample_username_from_raw_toml(&raw_candidate).map_err(|e| {
+                format!(
+                    "validation_path=runtime_entrypoint failed to derive sample username from candidate {}: {e}",
+                    candidate_path.display()
+                )
+            })?;
         let hosts_path =
             resolve_runtime_path(&self.cfg.trusttunnel_runtime_dir, &self.cfg.trusttunnel_hosts_file);
 
@@ -1772,7 +1782,7 @@ impl Agent {
             .arg(temp_config_path)
             .arg(&hosts_path)
             .arg("--client_config")
-            .arg(sample_username)
+            .arg(&sample_username)
             .arg("--format")
             .arg("deeplink")
             .arg("--address")
@@ -1892,18 +1902,26 @@ impl Agent {
             self.cfg.node_external_id,
             candidate_path.display()
         );
-        self.validate_candidate_credentials_syntax(&candidate_path)
-            .map_err(|e| format!("phase=credentials_validation_failed node={} parser=parse_access_artifacts stage=candidate_credentials_syntax file={}: {e}", self.cfg.node_external_id, candidate_path.display()))?;
-        println!(
-            "phase=credentials_validation_ok node={} parser=parse_access_artifacts stage=candidate_credentials_syntax file={}",
-            self.cfg.node_external_id,
-            candidate_path.display()
-        );
-        println!(
-            "phase=candidate_toml_valid node={} candidate_path={}",
-            self.cfg.node_external_id,
-            candidate_path.display()
-        );
+        let syntax_precheck_result = self.validate_candidate_credentials_syntax(&candidate_path);
+        if let Err(err) = &syntax_precheck_result {
+            println!(
+                "phase=credentials_validation_failed node={} parser=parse_access_artifacts stage=candidate_credentials_syntax validation_path=syntax_precheck file={} diagnostic_only=true error={}",
+                self.cfg.node_external_id,
+                candidate_path.display(),
+                err
+            );
+        } else {
+            println!(
+                "phase=credentials_validation_ok node={} parser=parse_access_artifacts stage=candidate_credentials_syntax validation_path=syntax_precheck file={}",
+                self.cfg.node_external_id,
+                candidate_path.display()
+            );
+            println!(
+                "phase=candidate_toml_valid node={} candidate_path={} validation_path=syntax_precheck",
+                self.cfg.node_external_id,
+                candidate_path.display()
+            );
+        }
 
         let temp_config_path = self
             .write_temp_endpoint_config_for_candidate(&candidate_path)
@@ -1942,15 +1960,44 @@ impl Agent {
             temp_config_path.display(),
             resolve_runtime_path(&self.cfg.trusttunnel_runtime_dir, &self.cfg.trusttunnel_hosts_file).display()
         );
-        self.validate_endpoint_runtime_entrypoint(&temp_config_path, &candidate_path).await
-            .map_err(|e| {
-                format!(
-                    "phase=runtime_startup_validation_failed node={} parser=trusttunnel_endpoint --client_config stage=runtime_startup_validation temp_config_path={} candidate_path={}: {e}",
-                    self.cfg.node_external_id,
-                    temp_config_path.display(),
-                    candidate_path.display()
-                )
-            })?;
+        let runtime_result = self
+            .validate_endpoint_runtime_entrypoint(&temp_config_path, &candidate_path)
+            .await;
+        if self.cfg.validation_strict_mode {
+            let parser_ok = syntax_precheck_result.is_ok();
+            let runtime_ok = runtime_result.is_ok();
+            if parser_ok != runtime_ok {
+                let parser_outcome = syntax_precheck_result
+                    .as_ref()
+                    .map(|_| "ok".to_string())
+                    .unwrap_or_else(|e| format!("failed: {e}"));
+                let runtime_outcome = runtime_result
+                    .as_ref()
+                    .map(|_| "ok".to_string())
+                    .unwrap_or_else(|e| format!("failed: {e}"));
+                log_error(
+                    self.state.applied_revision.as_deref().unwrap_or("none"),
+                    &self.cfg.node_external_id,
+                    "credentials_validation_mismatch",
+                    "parser_runtime_mismatch_strict",
+                    &format!(
+                        "strict mode mismatch detected: syntax_precheck={} runtime_entrypoint={} candidate_path={} temp_config_path={}",
+                        parser_outcome,
+                        runtime_outcome,
+                        candidate_path.display(),
+                        temp_config_path.display()
+                    ),
+                );
+            }
+        }
+        runtime_result.map_err(|e| {
+            format!(
+                "phase=runtime_startup_validation_failed node={} parser=trusttunnel_endpoint --client_config stage=runtime_startup_validation validation_path=runtime_entrypoint temp_config_path={} candidate_path={}: {e}",
+                self.cfg.node_external_id,
+                temp_config_path.display(),
+                candidate_path.display()
+            )
+        })?;
         println!(
             "phase=runtime_startup_validation_ok node={} parser=trusttunnel_endpoint --client_config stage=runtime_startup_validation temp_config_path={} candidate_path={}",
             self.cfg.node_external_id,
@@ -2521,6 +2568,27 @@ fn runtime_validation_sample_username(
     credentials: &[sidecar_sync::AccessArtifact],
 ) -> Option<&str> {
     credentials.first().map(|item| item.username.as_str())
+}
+
+fn runtime_validation_sample_username_from_raw_toml(raw_credentials: &str) -> Result<String, String> {
+    let parsed_doc = raw_credentials
+        .parse::<toml_edit::Document>()
+        .map_err(|e| format!("credentials TOML parse error: {e}"))?;
+    let clients = parsed_doc
+        .get("client")
+        .and_then(toml_edit::Item::as_array_of_tables)
+        .ok_or_else(|| "credentials TOML does not contain [[client]] entries".to_string())?;
+    let first = clients
+        .iter()
+        .next()
+        .ok_or_else(|| "credentials TOML does not contain any [[client]] entries".to_string())?;
+    let username = first
+        .get("username")
+        .and_then(toml_edit::Item::as_str)
+        .ok_or_else(|| {
+            "credentials TOML [[client]] entry does not contain string username".to_string()
+        })?;
+    Ok(username.to_string())
 }
 
 fn validate_checksum(snapshot: &SyncPayload, raw_body: &[u8]) -> bool {
@@ -3381,6 +3449,7 @@ message_queue_capacity = 4096
             pending_sync_reports_path: Some(runtime_dir.join(SYNC_REPORT_OUTBOX_FILE)),
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files: false,
+            validation_strict_mode: false,
         };
 
         Agent::new(cfg).await.unwrap()
@@ -3389,6 +3458,19 @@ message_queue_capacity = 4096
     async fn make_db_worker_agent_for_validation_tests(
         temp_dir: &TempDir,
         debug_preserve_temp_files: bool,
+    ) -> Agent {
+        make_db_worker_agent_for_validation_tests_with_strict(
+            temp_dir,
+            debug_preserve_temp_files,
+            false,
+        )
+        .await
+    }
+
+    async fn make_db_worker_agent_for_validation_tests_with_strict(
+        temp_dir: &TempDir,
+        debug_preserve_temp_files: bool,
+        validation_strict_mode: bool,
     ) -> Agent {
         let runtime_dir = temp_dir.path().join("runtime");
         fs::create_dir_all(&runtime_dir).await.unwrap();
@@ -3479,6 +3561,7 @@ upload_buffer_size = 32768
             pending_sync_reports_path: None,
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files,
+            validation_strict_mode,
         };
 
         Agent::new(cfg).await.unwrap()
@@ -3721,6 +3804,7 @@ upload_buffer_size = 32768
             pending_sync_reports_path: Some(PathBuf::from("pending_sync_reports.jsonl")),
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files: false,
+            validation_strict_mode: false,
         };
 
         let (exports, stats) = build_account_exports(&cfg, &snapshot).await.unwrap();
@@ -3815,6 +3899,7 @@ upload_buffer_size = 32768
             pending_sync_reports_path: Some(PathBuf::from("pending_sync_reports.jsonl")),
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files: false,
+            validation_strict_mode: false,
         };
         let config_hash = LinkGenerationConfig::load_from_file(&runtime_dir.join("tt-link.toml"))
             .unwrap()
@@ -3893,6 +3978,7 @@ upload_buffer_size = 32768
             pending_sync_reports_path: Some(PathBuf::from("pending_sync_reports.jsonl")),
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files: false,
+            validation_strict_mode: false,
         };
         let snapshot = SyncPayload {
             version: "rev-1".to_string(),
@@ -4057,6 +4143,7 @@ upload_buffer_size = 32768
             pending_sync_reports_path: None,
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files: false,
+            validation_strict_mode: false,
         };
 
         let agent = Agent::new(cfg).await.unwrap();
@@ -4273,8 +4360,58 @@ password = "second"
             .validate_candidate_credentials_pipeline(candidate.clone())
             .await
             .unwrap_err();
-        assert!(err.contains("phase=credentials_validation_failed"));
+        assert!(err.contains("phase=runtime_startup_validation_failed"));
+        assert!(err.contains("validation_path=runtime_entrypoint"));
         assert!(candidate.exists());
+    }
+
+    #[tokio::test]
+    async fn candidate_validation_treats_syntax_precheck_as_diagnostic_only() {
+        let tmp_dir = TempDir::new().unwrap();
+        let agent = make_db_worker_agent_for_validation_tests(&tmp_dir, false).await;
+        let candidate = agent
+            .write_runtime_credentials_tmp(b"[[client]]\nusername=\"alice\"\npassword=123\n")
+            .await
+            .unwrap();
+
+        let files = agent
+            .validate_candidate_credentials_pipeline(candidate.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(files.candidate_credentials_path, candidate);
+        agent
+            .cleanup_validation_files(&files, false, false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn candidate_validation_runtime_failure_marks_runtime_entrypoint_path_in_strict_mode() {
+        let tmp_dir = TempDir::new().unwrap();
+        let agent =
+            make_db_worker_agent_for_validation_tests_with_strict(&tmp_dir, false, true).await;
+        let runtime_dir = agent.cfg.trusttunnel_runtime_dir.clone();
+        let failing_endpoint = runtime_dir.join("fake_endpoint_fail.sh");
+        std::fs::write(&failing_endpoint, "#!/bin/sh\necho \"runtime failed\" 1>&2\nexit 1\n").unwrap();
+        let mut perms = std::fs::metadata(&failing_endpoint).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&failing_endpoint, perms).unwrap();
+
+        let mut strict_agent = agent;
+        strict_agent.cfg.endpoint_binary = failing_endpoint.display().to_string();
+        let candidate = strict_agent
+            .write_runtime_credentials_tmp(b"[[client]]\nusername=\"alice\"\npassword=\"secret\"\n")
+            .await
+            .unwrap();
+
+        let err = strict_agent
+            .validate_candidate_credentials_pipeline(candidate)
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("phase=runtime_startup_validation_failed"));
+        assert!(err.contains("validation_path=runtime_entrypoint"));
     }
 
     #[tokio::test]
@@ -4373,6 +4510,7 @@ upload_buffer_size = 32768
             pending_sync_reports_path: None,
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files: false,
+            validation_strict_mode: false,
         };
         let agent = Agent::new(cfg).await.unwrap();
 

@@ -31,6 +31,14 @@ inventory-driven sidecar synchronization.
 
 All candidate/debug/state artifacts are written under `TRUSTTUNNEL_RUNTIME_DIR` via runtime workspace helpers.
 
+Validation policy for candidate credentials:
+
+- `candidate_credentials_syntax_validation` is a diagnostic precheck (`syntax_precheck`) and
+  does not decide accept/reject on its own.
+- Canonical validation route is `endpoint_runtime_validation`, which executes the
+  endpoint-compatible startup path (`trusttunnel_endpoint ... --client_config ...`).
+- Candidate acceptance is determined by successful `runtime_entrypoint` validation.
+
 ### 1) Startup bootstrap pass
 
 Executed once on startup:
@@ -106,6 +114,9 @@ Optional:
 - `TRUSTTUNNEL_ENDPOINT_BINARY`
 - `TRUSTTUNNEL_AGENT_VERSION`
 - `TRUSTTUNNEL_RUNTIME_VERSION`
+- `TRUSTTUNNEL_VALIDATION_STRICT` (default `false`; logs
+  `error_class=parser_runtime_mismatch_strict` when `syntax_precheck` and
+  `runtime_entrypoint` results diverge)
 - `LK_DB_TABLE` (Postgres sink table name, default `access_artifacts`)
 - Legacy-only metadata/paths: `NODE_STAGE`, `NODE_CLUSTER`, `NODE_NAMESPACE`,
   `NODE_ROLLOUT_GROUP`, `LK_SYNC_PATH_TEMPLATE`, `LK_SYNC_REPORT_PATH`,
