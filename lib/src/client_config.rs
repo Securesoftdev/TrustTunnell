@@ -2,9 +2,12 @@ use crate::{
     authentication::registry_based, cert_verification::CertificateVerifier,
     settings::TlsHostsSettings, utils::ToTomlComment,
 };
+use chrono::Utc;
 #[cfg(feature = "rt_doc")]
 use macros::{Getter, RuntimeDoc};
 use once_cell::sync::Lazy;
+use ring::digest::{digest, SHA256};
+use serde::Serialize;
 use toml_edit::{value, Document};
 
 #[allow(clippy::too_many_arguments)]
@@ -91,6 +94,27 @@ pub struct ClientConfig {
     dns_upstreams: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ArtifactFormat {
+    Deeplink,
+    Toml,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ClientArtifactExport {
+    pub client_name: String,
+    pub artifact_format: ArtifactFormat,
+    pub deeplink: Option<String>,
+    pub toml: Option<String>,
+    pub addresses: Vec<String>,
+    pub hostname: String,
+    pub custom_sni: Option<String>,
+    pub dns_upstreams: Vec<String>,
+    pub config_fingerprint: String,
+    pub generated_at: String,
+}
+
 impl ClientConfig {
     pub fn compose_toml(&self) -> String {
         let mut doc: Document = TEMPLATE.parse().unwrap();
@@ -171,6 +195,29 @@ impl ClientConfig {
 
         trusttunnel_deeplink::encode(&config)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
+    pub fn export(
+        &self,
+        client_name: &str,
+        artifact_format: ArtifactFormat,
+    ) -> std::io::Result<ClientArtifactExport> {
+        let toml = self.compose_toml();
+        let deeplink = self.compose_deeplink()?;
+        let config_fingerprint = hex::encode(digest(&SHA256, toml.as_bytes()).as_ref());
+
+        Ok(ClientArtifactExport {
+            client_name: client_name.to_string(),
+            artifact_format,
+            deeplink: (artifact_format == ArtifactFormat::Deeplink).then_some(deeplink),
+            toml: (artifact_format == ArtifactFormat::Toml).then_some(toml),
+            addresses: self.addresses.clone(),
+            hostname: self.hostname.clone(),
+            custom_sni: (!self.custom_sni.is_empty()).then_some(self.custom_sni.clone()),
+            dns_upstreams: self.dns_upstreams.clone(),
+            config_fingerprint,
+            generated_at: Utc::now().to_rfc3339(),
+        })
     }
 }
 
@@ -359,5 +406,31 @@ omxU7kknZApM\n\
             decoded.certificate.is_none(),
             "Deep-link should not contain certificate when cert is system-verifiable"
         );
+    }
+
+    #[test]
+    fn test_export_dto_for_deeplink() {
+        let config = ClientConfig::test_config(TWO_CERT_PEM_CHAIN.to_string(), false);
+        let export = config.export("alice", ArtifactFormat::Deeplink).unwrap();
+
+        assert_eq!(export.client_name, "alice");
+        assert_eq!(export.artifact_format, ArtifactFormat::Deeplink);
+        assert!(export.deeplink.is_some());
+        assert!(export.toml.is_none());
+        assert_eq!(export.hostname, "vpn.example.com");
+        assert_eq!(export.addresses, vec!["1.2.3.4:443"]);
+        assert!(export.custom_sni.is_none());
+        assert_eq!(export.config_fingerprint.len(), 64);
+        assert!(chrono::DateTime::parse_from_rfc3339(&export.generated_at).is_ok());
+    }
+
+    #[test]
+    fn test_export_dto_for_toml() {
+        let config = ClientConfig::test_config(TWO_CERT_PEM_CHAIN.to_string(), false);
+        let export = config.export("alice", ArtifactFormat::Toml).unwrap();
+
+        assert_eq!(export.artifact_format, ArtifactFormat::Toml);
+        assert!(export.deeplink.is_none());
+        assert!(export.toml.is_some());
     }
 }

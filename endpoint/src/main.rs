@@ -7,7 +7,7 @@ use tokio::signal;
 use toml_edit::{Document, Item, Table};
 use trusttunnel::authentication::registry_based::RegistryBasedAuthenticator;
 use trusttunnel::authentication::Authenticator;
-use trusttunnel::client_config;
+use trusttunnel::client_config::{self, ArtifactFormat};
 use trusttunnel::client_random_prefix::{self, GeneratorParams};
 use trusttunnel::core::Core;
 use trusttunnel::settings::Settings;
@@ -29,6 +29,7 @@ const PREFIX_LENGTH_PARAM_NAME: &str = "prefix_length";
 const PREFIX_PERCENT_PARAM_NAME: &str = "prefix_percent";
 const PREFIX_MASK_PARAM_NAME: &str = "prefix_mask";
 const FORMAT_PARAM_NAME: &str = "format";
+const OUTPUT_PARAM_NAME: &str = "output";
 const NAME_PARAM_NAME: &str = "name";
 const DNS_UPSTREAM_PARAM_NAME: &str = "dns_upstream";
 const SENTRY_DSN_PARAM_NAME: &str = "sentry_dsn";
@@ -172,6 +173,13 @@ fn main() {
                 .value_parser(["toml", "deeplink"])
                 .default_value("deeplink")
                 .help("Output format for client configuration: 'deeplink' produces tt://? URI, 'toml' produces traditional config file"),
+            clap::Arg::new(OUTPUT_PARAM_NAME)
+                .action(clap::ArgAction::Set)
+                .requires(CLIENT_CONFIG_PARAM_NAME)
+                .long("output")
+                .value_parser(["human", "json"])
+                .default_value("human")
+                .help("Output mode for client configuration export: 'human' (default) or machine-readable 'json'"),
             clap::Arg::new(NAME_PARAM_NAME)
                 .action(clap::ArgAction::Set)
                 .requires(CLIENT_CONFIG_PARAM_NAME)
@@ -453,28 +461,58 @@ fn main() {
             .get_one::<String>(FORMAT_PARAM_NAME)
             .map(String::as_str)
             .unwrap_or("deeplink");
-
-        match format {
-            "toml" => {
-                println!("{}", client_config.compose_toml());
+        let output_mode = args
+            .get_one::<String>(OUTPUT_PARAM_NAME)
+            .map(String::as_str)
+            .unwrap_or("human");
+        let artifact_format = match format {
+            "toml" => ArtifactFormat::Toml,
+            "deeplink" => ArtifactFormat::Deeplink,
+            _ => {
+                eprintln!(
+                    "Error: unsupported format '{}'. Use 'toml' or 'deeplink'.",
+                    format
+                );
+                std::process::exit(1);
             }
-            "deeplink" => match client_config.compose_deeplink() {
-                Ok(deep_link) => {
-                    println!("{deep_link}");
-                    println!(
-                        "\nTo connect on mobile, you can scan QR code on the page: {TRUSTTUNNEL_QR_URL}#tt={}",
-                        deep_link.strip_prefix("tt://?").unwrap()
-                    );
+        };
+
+        match output_mode {
+            "human" => match artifact_format {
+                ArtifactFormat::Toml => {
+                    println!("{}", client_config.compose_toml());
                 }
-                Err(e) => {
-                    eprintln!("Error generating deep-link: {}", e);
+                ArtifactFormat::Deeplink => match client_config.compose_deeplink() {
+                    Ok(deep_link) => {
+                        println!("{deep_link}");
+                        println!(
+                            "\nTo connect on mobile, you can scan QR code on the page: {TRUSTTUNNEL_QR_URL}#tt={}",
+                            deep_link.strip_prefix("tt://?").unwrap()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("Error generating deep-link: {}", e);
+                        std::process::exit(1);
+                    }
+                },
+            },
+            "json" => match client_config.export(username, artifact_format) {
+                Ok(export) => match serde_json::to_string_pretty(&export) {
+                    Ok(payload) => println!("{payload}"),
+                    Err(err) => {
+                        eprintln!("Error serializing export payload to JSON: {}", err);
+                        std::process::exit(1);
+                    }
+                },
+                Err(err) => {
+                    eprintln!("Error generating export payload: {}", err);
                     std::process::exit(1);
                 }
             },
             _ => {
                 eprintln!(
-                    "Error: unsupported format '{}'. Use 'toml' or 'deeplink'.",
-                    format
+                    "Error: unsupported output mode '{}'. Use 'human' or 'json'.",
+                    output_mode
                 );
                 std::process::exit(1);
             }
