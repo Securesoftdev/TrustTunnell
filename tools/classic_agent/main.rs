@@ -1587,19 +1587,13 @@ impl Agent {
     }
 
     async fn write_runtime_credentials_tmp(&self, data: &[u8]) -> Result<PathBuf, String> {
-        let parent = self
-            .cfg
-            .runtime_credentials_path
-            .parent()
-            .ok_or_else(|| {
-                format!(
-                    "runtime credentials path has no parent: {}",
-                    self.cfg.runtime_credentials_path.display()
-                )
-            })?;
-        fs::create_dir_all(parent)
-            .await
-            .map_err(|e| format!("failed to create runtime directory {}: {e}", parent.display()))?;
+        let parent = &self.cfg.trusttunnel_runtime_dir;
+        fs::create_dir_all(parent).await.map_err(|e| {
+            format!(
+                "failed to create runtime directory {}: {e}",
+                parent.display()
+            )
+        })?;
 
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1641,10 +1635,11 @@ impl Agent {
         let candidate_path_str = path_to_string(candidate_path)?.to_string();
         settings_doc["credentials_file"] = value(candidate_path_str);
 
-        let parent = settings_path.parent().ok_or_else(|| {
+        let parent = &self.cfg.trusttunnel_runtime_dir;
+        fs::create_dir_all(parent).await.map_err(|e| {
             format!(
-                "endpoint settings path has no parent: {}",
-                settings_path.display()
+                "failed to create runtime directory {}: {e}",
+                parent.display()
             )
         })?;
         let nonce = SystemTime::now()
@@ -3929,6 +3924,7 @@ password = "secret
     async fn candidate_validation_rewrites_temp_config_with_candidate_credentials_path() {
         let tmp_dir = TempDir::new().unwrap();
         let agent = make_db_worker_agent_for_validation_tests(&tmp_dir, false).await;
+        let runtime_dir = agent.cfg.trusttunnel_runtime_dir.clone();
         let candidate = agent
             .write_runtime_credentials_tmp(b"[[client]]\nusername=\"alice\"\npassword=\"secret\"\n")
             .await
@@ -3948,6 +3944,8 @@ password = "secret
                 .unwrap(),
             candidate.display().to_string()
         );
+        assert_eq!(candidate.parent().unwrap(), runtime_dir.as_path());
+        assert_eq!(files.temp_config_path.parent().unwrap(), runtime_dir.as_path());
         assert!(!temp_config.contains("[[client]]"));
         agent
             .cleanup_validation_files(&files, false, false)
@@ -3970,6 +3968,102 @@ password = "secret
             .unwrap_err();
         assert!(err.contains("phase=candidate_toml_invalid"));
         assert!(candidate.exists());
+    }
+
+    #[tokio::test]
+    async fn candidate_validation_writes_temp_files_to_runtime_dir_for_absolute_source_config() {
+        let tmp_dir = TempDir::new().unwrap();
+        let runtime_dir = tmp_dir.path().join("runtime");
+        let source_dir = tmp_dir.path().join("source");
+        fs::create_dir_all(&runtime_dir).await.unwrap();
+        fs::create_dir_all(&source_dir).await.unwrap();
+
+        let source_credentials_file = source_dir.join("credentials.toml");
+        let source_rules_file = source_dir.join("rules.toml");
+        let source_config_file = source_dir.join("vpn.toml");
+        let source_hosts_file = source_dir.join("hosts.toml");
+        let runtime_credentials_file = runtime_dir.join("credentials.runtime.toml");
+        fs::write(&source_credentials_file, b"").await.unwrap();
+        fs::write(&source_rules_file, b"").await.unwrap();
+        fs::write(&source_hosts_file, b"").await.unwrap();
+        fs::write(&runtime_credentials_file, b"").await.unwrap();
+        fs::write(
+            &source_config_file,
+            format!(
+                r#"
+listen_address = "127.0.0.1:443"
+credentials_file = "{}"
+rules_file = "{}"
+
+[listen_protocols]
+
+[listen_protocols.http1]
+upload_buffer_size = 32768
+"#,
+                source_credentials_file.display(),
+                source_rules_file.display()
+            ),
+        )
+        .await
+        .unwrap();
+        fs::write(
+            runtime_dir.join("tt-link.toml"),
+            "node_external_id = \"node-1\"\nserver_address = \"node-1.example:8443\"\ncert_domain = \"node-1.example\"\nprotocol = \"http2\"\n",
+        )
+        .await
+        .unwrap();
+
+        let cfg = Config {
+            lk_base_url: None,
+            runtime_mode: RuntimeMode::DbWorker,
+            lk_db_dsn: "postgres://localhost/lk".to_string(),
+            lk_service_token: None,
+            node_external_id: "node-1".to_string(),
+            node_hostname: "node-1.example".to_string(),
+            node_stage: None,
+            node_cluster: None,
+            node_namespace: None,
+            node_rollout_group: None,
+            trusttunnel_runtime_dir: runtime_dir.clone(),
+            trusttunnel_config_file: source_config_file,
+            trusttunnel_hosts_file: source_hosts_file,
+            bootstrap_credentials_source_path: None,
+            trusttunnel_link_config_file: runtime_dir.join("tt-link.toml"),
+            runtime_credentials_path: runtime_credentials_file,
+            runtime_primary_marker_path: runtime_dir.join(RUNTIME_PRIMARY_MARKER_FILE),
+            agent_state_path: runtime_dir.join("agent_state.json"),
+            reconcile_interval: Duration::from_secs(10),
+            apply_interval: Duration::from_secs(10),
+            heartbeat_interval: None,
+            sync_path_template: None,
+            sync_report_path: None,
+            apply_cmd: None,
+            runtime_pid_path: None,
+            runtime_process_name: None,
+            endpoint_binary: "trusttunnel_endpoint".to_string(),
+            agent_version: "test".to_string(),
+            runtime_version: "test".to_string(),
+            pending_sync_reports_path: None,
+            metrics_address: "127.0.0.1:9901".parse().unwrap(),
+            debug_preserve_temp_files: false,
+        };
+        let agent = Agent::new(cfg).await.unwrap();
+
+        let candidate = agent
+            .write_runtime_credentials_tmp(b"[[client]]\nusername=\"alice\"\npassword=\"secret\"\n")
+            .await
+            .unwrap();
+        let files = agent
+            .validate_candidate_credentials_pipeline(candidate.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(candidate.parent().unwrap(), runtime_dir.as_path());
+        assert_eq!(files.temp_config_path.parent().unwrap(), runtime_dir.as_path());
+        agent
+            .cleanup_validation_files(&files, false, false)
+            .await
+            .unwrap();
     }
 
     #[test]
