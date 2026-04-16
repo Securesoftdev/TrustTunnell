@@ -511,7 +511,9 @@ Example classic agent run (default `db_worker` mode):
 ```sh
 docker run --rm \
   -e CLASSIC_AGENT_MODE="db_worker" \
-  -e LK_DB_DSN="postgres://user:pass@db:5432/lk" \
+  -e LK_WRITE_CONTRACT="api" \
+  -e LK_DB_DSN="https://lk.example/internal/trusttunnel/v1/nodes/{externalNodeId}/artifacts" \
+  -e LK_SERVICE_TOKEN="service-token" \
   -e NODE_EXTERNAL_ID="node-1" \
   -e NODE_HOSTNAME="trusttunnel-node-1" \
   -e AGENT_RECONCILE_INTERVAL_SEC="15" \
@@ -530,6 +532,7 @@ Classic agent environment variables from `Config::from_env()`:
 Required in all modes:
 
 - `LK_DB_DSN` (HTTP(S) bulk endpoint or Postgres DSN for LK artifact writes)
+- `LK_WRITE_CONTRACT` (`api`, `pg_function`, or `legacy_table`; primary deployment mode is `api`)
 - `NODE_EXTERNAL_ID`
 - `NODE_HOSTNAME`
 - `AGENT_RECONCILE_INTERVAL_SEC`
@@ -557,6 +560,7 @@ Optional:
 - `TRUSTTUNNEL_AGENT_VERSION` (default `classic_agent` package version)
 - `TRUSTTUNNEL_RUNTIME_VERSION` (default `unknown`)
 - `LK_DB_TABLE` (default `access_artifacts` for Postgres sink)
+- `LK_DB_WRITE_FUNCTION` (default `trusttunnel_apply_access_artifacts` for Postgres function sink)
 - `LK_SYNC_PATH_TEMPLATE` (legacy mode only; default built-in template)
 - `LK_SYNC_REPORT_PATH` (legacy mode only; default built-in path)
 - `TRUSTTUNNEL_RUNTIME_PID_FILE` (legacy mode only; default `<TRUSTTUNNEL_RUNTIME_DIR>/trusttunnel.pid`)

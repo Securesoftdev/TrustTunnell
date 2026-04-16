@@ -167,6 +167,13 @@ Legacy TT-link env fallback (used only when link config file cannot be loaded):
 
 ## Bulk upsert idempotency and stale policy
 
+- Primary deployment contract is `LK_WRITE_CONTRACT=api`.
+- Recommended API settings for current sidecar-to-LK architecture:
+  - `LK_WRITE_CONTRACT=api`
+  - `LK_DB_DSN=https://<lk-host>/internal/trusttunnel/v1/nodes/{externalNodeId}/artifacts`
+  - `LK_SERVICE_TOKEN=<service token>`
+- `pg_function` and `legacy_table` are still supported for compatibility/migration only.
+
 - Sidecar writes only delta: `missing + stale` as active upserts, `removed` as
   deactivations.
 - Postgres writer uses conflict upsert by `dedupe_key`, making repeated equal
@@ -176,3 +183,16 @@ Legacy TT-link env fallback (used only when link config file cannot be loaded):
 - Export config hash includes `address`, `domain`, `port`, `sni`, `dns`, and
   `protocol`; changing address/domain/port marks links stale and forces
   regeneration/update.
+
+Canonical LK API write contract (`LK_WRITE_CONTRACT=api`):
+
+- Request payload:
+  - top-level: `external_node_id`, `artifacts[]`
+  - artifact item: `username` and/or `credential_external_id`, `link`,
+    `link_revision`, `is_current`, `generated_at`, `source`, `display_name`,
+    optional `source_key`, optional `link_hash`
+- Response payload:
+  - accepted canonical shape: `summary` object with counters
+    (`created`, `updated`, `unchanged`, `deactivated`, `failed`)
+  - plus `errors`/`failures` arrays for per-item diagnostics
+  - sidecar also accepts legacy flat counter responses for backward compatibility
