@@ -18,7 +18,7 @@ use credentials_inventory::{
 };
 use credentials_format::parse_client_credentials;
 use exporter::{EndpointExportOptions, EndpointLinkExporter};
-use lk_bulk_writer::{LkArtifactRecord, LkBulkWriter};
+use lk_bulk_writer::{LkArtifactRecord, LkBulkWriter, LkWriteContract};
 use link_config::LinkGenerationConfig;
 use runtime_workspace::{ArtifactKind, RuntimeWorkspace};
 use reqwest::StatusCode;
@@ -177,6 +177,7 @@ mod sidecar_sync {
 #[derive(Clone)]
 struct Config {
     runtime_mode: RuntimeMode,
+    lk_write_contract: LkWriteContract,
     lk_db_dsn: String,
     lk_base_url: Option<String>,
     lk_service_token: Option<String>,
@@ -247,6 +248,12 @@ impl RuntimeMode {
 impl Config {
     fn from_env() -> Result<Self, String> {
         let runtime_mode = RuntimeMode::from_env()?;
+        let lk_write_contract = optional_env_nonempty("LK_WRITE_CONTRACT")
+            .ok_or_else(|| {
+                "LK_WRITE_CONTRACT is required and must be one of: api, pg_function, legacy_table"
+                    .to_string()
+            })
+            .and_then(|raw| LkWriteContract::from_env(&raw))?;
         let lk_db_dsn = required_env("LK_DB_DSN")?;
         let node_external_id = required_env("NODE_EXTERNAL_ID")?;
         let node_hostname = required_env("NODE_HOSTNAME")?;
@@ -387,6 +394,7 @@ impl Config {
         let cfg = Self {
             lk_base_url,
             runtime_mode,
+            lk_write_contract,
             lk_db_dsn,
             lk_service_token,
             node_external_id,
@@ -876,8 +884,11 @@ impl Agent {
             export_failures = export_summary.failures;
         }
 
-        let writer =
-            LkBulkWriter::from_contract(&self.cfg.lk_db_dsn, self.cfg.lk_service_token.clone())?;
+        let writer = LkBulkWriter::from_contract(
+            self.cfg.lk_write_contract,
+            &self.cfg.lk_db_dsn,
+            self.cfg.lk_service_token.clone(),
+        )?;
         let mut records = upsert_accounts
             .iter()
             .filter(|account| generated_links.contains_key(&account.username))
@@ -3584,6 +3595,7 @@ message_queue_capacity = 4096
         let cfg = Config {
             lk_base_url: Some(base_url.to_string()),
             runtime_mode: RuntimeMode::DbWorker,
+            lk_write_contract: LkWriteContract::PgFunction,
             lk_db_dsn: "postgres://localhost/lk".to_string(),
             lk_service_token: Some("token".to_string()),
             node_external_id: "node-1".to_string(),
@@ -3698,6 +3710,7 @@ upload_buffer_size = 32768
         let cfg = Config {
             lk_base_url: None,
             runtime_mode: RuntimeMode::DbWorker,
+            lk_write_contract: LkWriteContract::PgFunction,
             lk_db_dsn: "postgres://localhost/lk".to_string(),
             lk_service_token: None,
             node_external_id: "node-1".to_string(),
@@ -3943,6 +3956,7 @@ upload_buffer_size = 32768
         let cfg = Config {
             lk_base_url: Some("http://localhost".to_string()),
             runtime_mode: RuntimeMode::DbWorker,
+            lk_write_contract: LkWriteContract::PgFunction,
             lk_db_dsn: "postgres://localhost/lk".to_string(),
             lk_service_token: Some("token".to_string()),
             node_external_id: "node-1".to_string(),
@@ -4040,6 +4054,7 @@ upload_buffer_size = 32768
         let cfg = Config {
             lk_base_url: Some("http://localhost".to_string()),
             runtime_mode: RuntimeMode::DbWorker,
+            lk_write_contract: LkWriteContract::PgFunction,
             lk_db_dsn: "postgres://localhost/lk".to_string(),
             lk_service_token: Some("token".to_string()),
             node_external_id: "node-1".to_string(),
@@ -4121,6 +4136,7 @@ upload_buffer_size = 32768
         let cfg = Config {
             lk_base_url: Some("http://localhost".to_string()),
             runtime_mode: RuntimeMode::DbWorker,
+            lk_write_contract: LkWriteContract::PgFunction,
             lk_db_dsn: "postgres://localhost/lk".to_string(),
             lk_service_token: Some("token".to_string()),
             node_external_id: "node-1".to_string(),
@@ -4288,6 +4304,7 @@ upload_buffer_size = 32768
         let cfg = Config {
             lk_base_url: None,
             runtime_mode: RuntimeMode::DbWorker,
+            lk_write_contract: LkWriteContract::PgFunction,
             lk_db_dsn: "postgres://localhost/lk".to_string(),
             lk_service_token: None,
             node_external_id: "node-1".to_string(),
@@ -4715,6 +4732,7 @@ upload_buffer_size = 32768
         let cfg = Config {
             lk_base_url: None,
             runtime_mode: RuntimeMode::DbWorker,
+            lk_write_contract: LkWriteContract::PgFunction,
             lk_db_dsn: "postgres://localhost/lk".to_string(),
             lk_service_token: None,
             node_external_id: "node-1".to_string(),

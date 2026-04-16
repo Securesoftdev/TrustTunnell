@@ -88,6 +88,7 @@ Without `legacy-lk-http`, `CLASSIC_AGENT_MODE=legacy_http` is rejected at startu
 Required in all modes:
 
 - `LK_DB_DSN`
+- `LK_WRITE_CONTRACT` (`api`, `pg_function`, or `legacy_table`)
 - `NODE_EXTERNAL_ID`
 - `NODE_HOSTNAME`
 - `AGENT_RECONCILE_INTERVAL_SEC`
@@ -118,6 +119,11 @@ Optional:
   `error_class=parser_runtime_mismatch_strict` when `syntax_precheck` and
   `runtime_entrypoint` results diverge)
 - `LK_DB_TABLE` (Postgres sink table name, default `access_artifacts`)
+- `LK_DB_WRITE_FUNCTION` (Postgres function contract, default `trusttunnel_apply_access_artifacts`)
+- `LK_DB_WRITE_FUNCTION_VERSION_FUNCTION` (Postgres function contract metadata/version function, default `<LK_DB_WRITE_FUNCTION>_contract_version`)
+- `LK_DB_WRITE_CONTRACT_VERSION` (expected Postgres function contract version, default `v1`)
+- `LK_DB_LEGACY_RAW_TABLE` (must be `1` when `LK_WRITE_CONTRACT=legacy_table`)
+- `LK_ALLOW_DEPRECATED_LEGACY_TABLE` (must be `1` to allow deprecated `legacy_table` contract)
 - Legacy-only metadata/paths: `NODE_STAGE`, `NODE_CLUSTER`, `NODE_NAMESPACE`,
   `NODE_ROLLOUT_GROUP`, `LK_SYNC_PATH_TEMPLATE`, `LK_SYNC_REPORT_PATH`,
   `TRUSTTUNNEL_RUNTIME_PID_FILE`, `TRUSTTUNNEL_RUNTIME_PROCESS_NAME`
