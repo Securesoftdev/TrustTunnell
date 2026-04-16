@@ -946,12 +946,13 @@ impl Agent {
             &self.cfg.node_external_id,
         )?;
         println!(
-            "phase=link_config_diagnostics node={} path={} exists={} parsed={} fallback_used={} hash={} protocol={} server_address={}",
+            "phase=link_config_diagnostics node={} path={} exists={} parsed={} fallback_used={} contract_mode={} hash={} protocol={} server_address={}",
             self.cfg.node_external_id,
             link_diag.path,
             link_diag.file_exists,
             link_diag.file_parsed,
             link_diag.fallback_used,
+            link_diag.contract_mode,
             link_diag.hash.as_deref().unwrap_or("none"),
             link_diag.recognized_protocol.as_deref().unwrap_or("unknown"),
             link_diag.recognized_server_address.as_deref().unwrap_or("unknown")
@@ -990,6 +991,17 @@ impl Agent {
         let mut export_failed = 0usize;
         let mut export_failures = Vec::new();
         if !upsert_accounts.is_empty() {
+            println!(
+                "phase=export_write_start node={} contract_mode={} accounts_for_export={} removed_accounts={}",
+                self.cfg.node_external_id,
+                if link_diag.fallback_used {
+                    "legacy_fallback"
+                } else {
+                    "file_required"
+                },
+                upsert_accounts.len(),
+                removed_count
+            );
             let settings_path =
                 resolve_runtime_path(&self.cfg.trusttunnel_runtime_dir, &self.cfg.trusttunnel_config_file);
             let hosts_path =
@@ -1013,6 +1025,12 @@ impl Agent {
             generated_links = export_summary.links;
             export_failed = export_summary.failed;
             export_failures = export_summary.failures;
+            println!(
+                "phase=link_generation_complete node={} generated_links={} export_failed={}",
+                self.cfg.node_external_id,
+                generated_links.len(),
+                export_failed
+            );
         }
 
         let writer = LkBulkWriter::from_contract(
@@ -1961,7 +1979,7 @@ impl Agent {
                 candidate_path.display()
             )
         })?;
-        parse_access_artifacts(&raw).map(|_| ())
+        parse_candidate_credentials_for_validation(&raw).map(|_| ())
     }
 
     fn validate_endpoint_settings_reference(
@@ -2019,6 +2037,12 @@ impl Agent {
                 candidate_path.display()
             )
         })?;
+        println!(
+            "phase=candidate_credentials_format_detected node={} format=[[client]] parser_path=shared_credentials_parser candidate_path={} usernames_detected={}",
+            self.cfg.node_external_id,
+            candidate_path.display(),
+            usernames.len()
+        );
         let selected_usernames = select_runtime_validation_usernames(
             usernames,
             self.cfg.runtime_validation_min_users,
@@ -2864,6 +2888,16 @@ fn parse_access_artifacts(raw: &str) -> Result<Vec<sidecar_sync::AccessArtifact>
         .collect())
 }
 
+fn parse_candidate_credentials_for_validation(
+    raw: &str,
+) -> Result<Vec<sidecar_sync::AccessArtifact>, String> {
+    let parsed = parse_access_artifacts(raw)?;
+    if parsed.is_empty() {
+        return Err("credentials TOML does not contain [[client]] entries".to_string());
+    }
+    Ok(parsed)
+}
+
 fn runtime_validation_sample_username(
     credentials: &[sidecar_sync::AccessArtifact],
 ) -> Option<&str> {
@@ -2874,37 +2908,8 @@ fn runtime_validation_sample_username(
 }
 
 fn runtime_validation_usernames_from_raw_toml(raw_credentials: &str) -> Result<Vec<String>, String> {
-    let parsed_doc = raw_credentials
-        .parse::<toml_edit::Document>()
-        .map_err(|e| format!("credentials TOML parse error: {e}"))?;
-    let clients = parsed_doc
-        .get("client")
-        .and_then(toml_edit::Item::as_array_of_tables)
-        .ok_or_else(|| "credentials TOML does not contain [[client]] entries".to_string())?;
-    if clients.is_empty() {
-        return Err("credentials TOML does not contain any [[client]] entries".to_string());
-    }
-
-    let mut usernames = Vec::with_capacity(clients.len());
-    for (index, client) in clients.iter().enumerate() {
-        let username = client
-            .get("username")
-            .and_then(toml_edit::Item::as_str)
-            .ok_or_else(|| {
-                format!(
-                    "credentials TOML [[client]] entry #{} does not contain string username",
-                    index + 1
-                )
-            })?;
-        if username.is_empty() {
-            return Err(format!(
-                "credentials TOML [[client]] entry #{} has empty username",
-                index + 1
-            ));
-        }
-        usernames.push(username.to_string());
-    }
-    Ok(usernames)
+    let parsed = parse_candidate_credentials_for_validation(raw_credentials)?;
+    Ok(parsed.into_iter().map(|item| item.username).collect())
 }
 
 #[derive(Debug)]
@@ -4637,6 +4642,12 @@ password = "secret
     }
 
     #[test]
+    fn candidate_validation_parser_rejects_empty_candidate() {
+        let err = parse_candidate_credentials_for_validation("").unwrap_err();
+        assert!(err.contains("does not contain [[client]] entries"));
+    }
+
+    #[test]
     fn unified_parser_is_equivalent_for_candidate_inventory_and_runtime_precheck() {
         let raw = r#"
 [[client]]
@@ -4678,6 +4689,14 @@ password = "second"
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].password, "first");
         assert_eq!(parsed[1].password, "second");
+    }
+
+    #[test]
+    fn runtime_username_derivation_matches_syntax_parser_for_invalid_candidate() {
+        let raw = "";
+        let syntax_err = parse_candidate_credentials_for_validation(raw).unwrap_err();
+        let runtime_err = runtime_validation_usernames_from_raw_toml(raw).unwrap_err();
+        assert_eq!(syntax_err, runtime_err);
     }
 
     #[test]
@@ -4814,7 +4833,7 @@ password = "second"
     }
 
     #[tokio::test]
-    async fn candidate_validation_treats_syntax_precheck_as_diagnostic_only() {
+    async fn candidate_validation_fails_consistently_when_candidate_has_invalid_password_shape() {
         let tmp_dir = TempDir::new().unwrap();
         let agent = make_db_worker_agent_for_validation_tests(&tmp_dir, false).await;
         let candidate = agent
@@ -4822,16 +4841,14 @@ password = "second"
             .await
             .unwrap();
 
-        let files = agent
+        let err = agent
             .validate_candidate_credentials_pipeline(candidate.clone())
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(files.candidate_credentials_path, candidate);
-        agent
-            .cleanup_validation_files(&files, false, false)
-            .await
-            .unwrap();
+        assert!(err.contains("phase=runtime_startup_validation_failed"));
+        assert!(err.contains("failed to derive usernames"));
+        assert!(err.contains("password cannot be empty"));
     }
 
     #[tokio::test]

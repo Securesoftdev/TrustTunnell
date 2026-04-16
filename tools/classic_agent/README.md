@@ -36,6 +36,8 @@ Validation policy for candidate credentials:
 
 - `candidate_credentials_syntax_validation` is a diagnostic precheck (`syntax_precheck`) and
   does not decide accept/reject on its own.
+- Canonical credentials shape is `[[client]]` array-of-tables with string
+  `username` and `password` in every entry.
 - Canonical validation route is `endpoint_runtime_validation`, which executes the
   endpoint-compatible startup path (`trusttunnel_endpoint ... --client_config ...`).
 - Candidate acceptance is determined by successful `runtime_entrypoint` validation.
@@ -127,6 +129,9 @@ Optional:
 - `TRUSTTUNNEL_VALIDATION_STRICT` (default `false`; logs
   `error_class=parser_runtime_mismatch_strict` when `syntax_precheck` and
   `runtime_entrypoint` results diverge)
+- `TRUSTTUNNEL_LINK_CONFIG_ALLOW_LEGACY_FALLBACK` (`true|false`; when `true`,
+  allows TT-link export to use legacy env variables if `tt-link.toml` is
+  missing/invalid)
 - `LK_DB_TABLE` (Postgres sink table name, default `access_artifacts`)
 - `LK_DB_WRITE_FUNCTION` (Postgres function contract, default `trusttunnel_apply_access_artifacts`)
 - `LK_DB_WRITE_FUNCTION_VERSION_FUNCTION` (Postgres function contract metadata/version function, default `<LK_DB_WRITE_FUNCTION>_contract_version`)
@@ -146,6 +151,38 @@ Legacy TT-link env fallback (used only when link config file cannot be loaded):
 - `TRUSTTUNNEL_TT_LINK_DISPLAY_NAME`
 - `TRUSTTUNNEL_TT_LINK_CERT_DOMAIN`
 - `TRUSTTUNNEL_TT_LINK_DNS_SERVERS`
+
+## `tt-link.toml` contract (file mode)
+
+Current exporter contract expects a file with required fields:
+
+- `node_external_id`
+- `server_address`
+- `cert_domain`
+- `protocol` (`http2` or `http3`)
+
+Optional fields:
+
+- `custom_sni`
+- `display_name`
+- `dns_servers` (string array)
+
+Example:
+
+```toml
+node_external_id = "node-a"
+server_address = "edge.example.com:443"
+cert_domain = "edge.example.com"
+protocol = "http2"
+custom_sni = "sni.example.com"
+display_name = "Main node"
+dns_servers = ["1.1.1.1", "8.8.8.8"]
+```
+
+Diagnostics include contract mode:
+
+- `contract_mode=file_required` when file mode is enforced;
+- `contract_mode=legacy_fallback` when fallback is enabled and env-based route is used.
 
 ## Observability
 
