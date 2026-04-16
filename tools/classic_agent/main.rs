@@ -214,6 +214,38 @@ struct Config {
     runtime_validation_max_users: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DbWorkerPhaseSchedule {
+    reconcile_plan_interval: Duration,
+    apply_interval: Duration,
+    export_write_interval: Duration,
+}
+
+impl DbWorkerPhaseSchedule {
+    fn from_config(cfg: &Config) -> Self {
+        Self {
+            reconcile_plan_interval: cfg.reconcile_interval,
+            apply_interval: cfg.apply_interval,
+            export_write_interval: cfg.apply_interval,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DbWorkerTickKind {
+    Reconcile,
+    Apply,
+}
+
+impl DbWorkerTickKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Reconcile => "reconcile",
+            Self::Apply => "apply",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RuntimeMode {
     DbWorker,
@@ -608,11 +640,14 @@ impl Agent {
 
     async fn run_db_worker_loop(&mut self) {
         let lifecycle_writes_supported = self.cfg.runtime_mode.supports_lifecycle_writes();
+        let schedule = DbWorkerPhaseSchedule::from_config(&self.cfg);
         println!(
-            "db_worker mode enabled for node_external_id={} (dsn_len={}, apply_interval_sec={}, lifecycle_writes_supported={})",
+            "db_worker mode enabled for node_external_id={} (dsn_len={}, reconcile_interval_sec={}, apply_interval_sec={}, export_write_interval_sec={}, lifecycle_writes_supported={})",
             self.cfg.node_external_id,
             self.cfg.lk_db_dsn.len(),
-            self.cfg.apply_interval.as_secs(),
+            schedule.reconcile_plan_interval.as_secs(),
+            schedule.apply_interval.as_secs(),
+            schedule.export_write_interval.as_secs(),
             lifecycle_writes_supported
         );
         println!(
@@ -630,40 +665,107 @@ impl Agent {
                 &err,
             );
         }
-        let mut poll_tick = interval(self.cfg.reconcile_interval);
-        poll_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut reconcile_tick = interval(schedule.reconcile_plan_interval);
+        reconcile_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut apply_tick = interval(schedule.apply_interval);
+        apply_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut backoff = Duration::from_secs(1);
+        let mut pending_plan: Option<sidecar_sync::ReconcilePlan> = None;
         loop {
-            poll_tick.tick().await;
-            match self
-                .run_sidecar_sync_pass(sidecar_sync::PassKind::Reconcile)
-                .await
-            {
-                Ok(_) => backoff = Duration::from_secs(1),
-                Err(err) => {
-                    log_error(
-                        self.state.applied_revision.as_deref().unwrap_or("none"),
-                        &self.cfg.node_external_id,
-                        "sidecar_sync_reconcile_failed",
-                        "failed",
-                        &err,
+            let tick_kind = tokio::select! {
+                _ = reconcile_tick.tick() => DbWorkerTickKind::Reconcile,
+                _ = apply_tick.tick() => DbWorkerTickKind::Apply,
+            };
+            match tick_kind {
+                DbWorkerTickKind::Reconcile => {
+                    println!(
+                        "phase=scheduler_tick mode=db_worker tick={} trigger=reconcile_plan",
+                        tick_kind.as_str()
                     );
-                    tokio::time::sleep(backoff).await;
-                    backoff = std::cmp::min(backoff.saturating_mul(2), Duration::from_secs(300));
+                    match self.run_sidecar_reconcile_plan_phase().await {
+                        Ok(plan) => {
+                            pending_plan = Some(plan);
+                            backoff = Duration::from_secs(1);
+                        }
+                        Err(err) => {
+                            log_error(
+                                self.state.applied_revision.as_deref().unwrap_or("none"),
+                                &self.cfg.node_external_id,
+                                "sidecar_sync_reconcile_plan_failed",
+                                "failed",
+                                &err,
+                            );
+                            tokio::time::sleep(backoff).await;
+                            backoff =
+                                std::cmp::min(backoff.saturating_mul(2), Duration::from_secs(300));
+                        }
+                    }
+                }
+                DbWorkerTickKind::Apply => {
+                    println!(
+                        "phase=scheduler_tick mode=db_worker tick={} trigger=apply_export_write",
+                        tick_kind.as_str()
+                    );
+                    if let Err(err) = self
+                        .run_sidecar_apply_export_write_phase(
+                            sidecar_sync::PassKind::Reconcile,
+                            pending_plan.take(),
+                        )
+                        .await
+                    {
+                        log_error(
+                            self.state.applied_revision.as_deref().unwrap_or("none"),
+                            &self.cfg.node_external_id,
+                            "sidecar_sync_apply_export_write_failed",
+                            "failed",
+                            &err,
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff =
+                            std::cmp::min(backoff.saturating_mul(2), Duration::from_secs(300));
+                    } else {
+                        backoff = Duration::from_secs(1);
+                    }
                 }
             }
         }
     }
 
-    async fn run_sidecar_sync_pass(
+    async fn run_sidecar_reconcile_plan_phase(
         &mut self,
-        pass_kind: sidecar_sync::PassKind,
-    ) -> Result<sidecar_sync::PassStats, String> {
+    ) -> Result<sidecar_sync::ReconcilePlan, String> {
         let desired_artifacts = self.load_desired_access_artifacts().await?;
         let runtime_credentials = self.load_runtime_credentials_artifacts().await?;
-        let mut plan = sidecar_sync::reconcile_plan(&desired_artifacts, &runtime_credentials);
+        let plan = sidecar_sync::reconcile_plan(&desired_artifacts, &runtime_credentials);
+        println!(
+            "phase=reconcile_plan found={} generated={} updated={} missing={} skipped={} new={} stale={} deleted={} changed={}",
+            plan.stats.found,
+            plan.stats.generated,
+            plan.stats.updated,
+            plan.stats.missing_credentials,
+            plan.stats.skipped,
+            plan.stats.new_credentials,
+            plan.stats.stale_credentials,
+            plan.stats.deleted_credentials,
+            plan.changed
+        );
+        Ok(plan)
+    }
+
+    async fn run_sidecar_apply_export_write_phase(
+        &mut self,
+        pass_kind: sidecar_sync::PassKind,
+        plan: Option<sidecar_sync::ReconcilePlan>,
+    ) -> Result<(), String> {
+        let mut plan = plan.unwrap_or_default();
         let node = self.cfg.node_external_id.clone();
         let pass = pass_kind.as_str();
+        println!(
+            "phase=apply_start pass={} changed={} source={}",
+            pass,
+            plan.changed,
+            if plan.changed { "reconcile_tick" } else { "no_pending_plan" }
+        );
 
         if plan.changed {
             let previous_runtime_credentials = fs::read(&self.cfg.runtime_credentials_path).await.ok();
@@ -716,6 +818,7 @@ impl Agent {
             persist_state(&self.cfg.agent_state_path, &self.state).await?;
         }
 
+        println!("phase=export_write_start pass={}", pass);
         self.sync_local_inventory_export_sidecar().await?;
 
         if !plan.changed {
@@ -743,7 +846,18 @@ impl Agent {
             "sidecar_sync_pass",
             pass,
         );
-        Ok(plan.stats)
+        Ok(())
+    }
+
+    async fn run_sidecar_sync_pass(
+        &mut self,
+        pass_kind: sidecar_sync::PassKind,
+    ) -> Result<sidecar_sync::PassStats, String> {
+        let plan = self.run_sidecar_reconcile_plan_phase().await?;
+        let stats = plan.stats.clone();
+        self.run_sidecar_apply_export_write_phase(pass_kind, Some(plan))
+            .await?;
+        Ok(stats)
     }
 
     async fn load_desired_access_artifacts(&self) -> Result<Vec<sidecar_sync::AccessArtifact>, String> {
@@ -5311,5 +5425,58 @@ upload_buffer_size = 32768
     fn split_host_port_rejects_unbracketed_ipv6() {
         let err = split_host_port("2001:db8::1:443").unwrap_err();
         assert!(err.contains("host:port or [ipv6]:port"));
+    }
+
+    #[test]
+    fn db_worker_phase_schedule_uses_distinct_reconcile_and_apply_intervals() {
+        let cfg = Config {
+            lk_base_url: None,
+            runtime_mode: RuntimeMode::DbWorker,
+            lk_write_contract: LkWriteContract::PgFunction,
+            lk_db_dsn: "postgres://localhost/lk".to_string(),
+            lk_service_token: None,
+            node_external_id: "node-1".to_string(),
+            node_hostname: "node-1.example".to_string(),
+            node_stage: None,
+            node_cluster: None,
+            node_namespace: None,
+            node_rollout_group: None,
+            trusttunnel_runtime_dir: PathBuf::from("/tmp/runtime"),
+            trusttunnel_config_file: PathBuf::from("vpn.toml"),
+            trusttunnel_hosts_file: PathBuf::from("hosts.toml"),
+            bootstrap_credentials_source_path: None,
+            trusttunnel_link_config_file: PathBuf::from("tt-link.toml"),
+            runtime_credentials_path: PathBuf::from("/tmp/runtime/credentials.toml"),
+            runtime_primary_marker_path: PathBuf::from("/tmp/runtime/.runtime_credentials_primary"),
+            agent_state_path: PathBuf::from("/tmp/runtime/agent_state.json"),
+            reconcile_interval: Duration::from_secs(17),
+            apply_interval: Duration::from_secs(43),
+            heartbeat_interval: None,
+            sync_path_template: None,
+            sync_report_path: None,
+            apply_cmd: None,
+            runtime_pid_path: None,
+            runtime_process_name: None,
+            endpoint_binary: "trusttunnel_endpoint".to_string(),
+            agent_version: "test".to_string(),
+            runtime_version: "test".to_string(),
+            pending_sync_reports_path: None,
+            metrics_address: "127.0.0.1:9901".parse().unwrap(),
+            debug_preserve_temp_files: false,
+            validation_strict_mode: false,
+            runtime_validation_min_users: DEFAULT_RUNTIME_VALIDATION_MIN_USERS,
+            runtime_validation_max_users: DEFAULT_RUNTIME_VALIDATION_MAX_USERS,
+        };
+
+        let schedule = DbWorkerPhaseSchedule::from_config(&cfg);
+        assert_eq!(schedule.reconcile_plan_interval, Duration::from_secs(17));
+        assert_eq!(schedule.apply_interval, Duration::from_secs(43));
+        assert_eq!(schedule.export_write_interval, Duration::from_secs(43));
+    }
+
+    #[test]
+    fn db_worker_tick_kind_has_stable_log_labels() {
+        assert_eq!(DbWorkerTickKind::Reconcile.as_str(), "reconcile");
+        assert_eq!(DbWorkerTickKind::Apply.as_str(), "apply");
     }
 }

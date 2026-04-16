@@ -576,7 +576,8 @@ TT-link legacy fallback env vars (used only when `TRUSTTUNNEL_LINK_CONFIG_FILE` 
 Classic agent runtime credentials migration and restart recovery:
 
 - Startup bootstrap pass: if `TRUSTTUNNEL_BOOTSTRAP_CREDENTIALS_FILE` is set, runtime credentials are absent, and runtime has not yet been marked as primary, the agent imports bootstrap credentials once.
-- Periodic reconcile pass: every `AGENT_RECONCILE_INTERVAL_SEC`, the sidecar compares desired credentials with runtime credentials and applies only deltas.
+- Periodic reconcile plan phase: every `AGENT_RECONCILE_INTERVAL_SEC`, the sidecar compares desired credentials with runtime credentials and prepares a plan.
+- Periodic apply/export-write phase: every `AGENT_APPLY_INTERVAL_SEC`, the sidecar applies the latest prepared plan (if changed) and runs inventory export/write.
 - After the first successful apply, the agent creates `.runtime_credentials_primary` in `TRUSTTUNNEL_RUNTIME_DIR` and treats runtime credentials as the source of truth.
 - After this marker exists, restarts do not re-import credentials from bootstrap source.
 - If runtime credentials are lost after migration, bootstrap source is not reused; next successful reconcile reconstructs credentials from current desired state.
