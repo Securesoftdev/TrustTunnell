@@ -1112,11 +1112,24 @@ impl Agent {
             .saturating_sub(upsert_accounts.len());
         let removed_count = delta.removed.len();
 
+        let writer = LkBulkWriter::from_contract(
+            self.cfg.lk_write_contract,
+            &self.cfg.lk_db_dsn,
+            &self.cfg.node_external_id,
+            self.cfg.lk_service_token.clone(),
+        )?;
+        let use_full_snapshot_for_export = writer.active_contract() == "api";
+        let accounts_for_export = if use_full_snapshot_for_export {
+            snapshot.credentials.clone()
+        } else {
+            upsert_accounts.clone()
+        };
+
         let mut generated_links = BTreeMap::new();
         let mut export_failed = 0usize;
         let mut export_failures = Vec::new();
-        if !upsert_accounts.is_empty() {
-            let usernames = upsert_accounts
+        if !accounts_for_export.is_empty() {
+            let usernames = accounts_for_export
                 .iter()
                 .map(|account: &InventoryAccount| account.username.clone())
                 .collect::<Vec<_>>();
@@ -1171,13 +1184,7 @@ impl Agent {
             }
         }
 
-        let writer = LkBulkWriter::from_contract(
-            self.cfg.lk_write_contract,
-            &self.cfg.lk_db_dsn,
-            &self.cfg.node_external_id,
-            self.cfg.lk_service_token.clone(),
-        )?;
-        let mut records = upsert_accounts
+        let mut records = accounts_for_export
             .iter()
             .filter(|account| generated_links.contains_key(&account.username))
             .map(|account| LkArtifactRecord {
@@ -1202,25 +1209,27 @@ impl Agent {
                     .map(|item| sha256_hex(item.as_bytes())),
             })
             .collect::<Vec<_>>();
-        records.extend(delta.removed.iter().map(|username| LkArtifactRecord {
-            username: username.clone(),
-            external_node_id: self.cfg.node_external_id.clone(),
-            external_account_id: None,
-            access_bundle_id: None,
-            tt_link: None,
-            config_hash: Some(snapshot.export_config_hash.clone()),
-            active: false,
-            credential_external_id: None,
-            generated_at: Some(
-                chrono::DateTime::from_timestamp(snapshot.generated_at_unix_sec, 0)
-                    .unwrap_or_else(chrono::Utc::now)
-                    .to_rfc3339(),
-            ),
-            source: Some("classic_agent".to_string()),
-            display_name: link_cfg.display_name(),
-            source_key: Some(username.clone()),
-            link_hash: None,
-        }));
+        if !use_full_snapshot_for_export {
+            records.extend(delta.removed.iter().map(|username| LkArtifactRecord {
+                username: username.clone(),
+                external_node_id: self.cfg.node_external_id.clone(),
+                external_account_id: None,
+                access_bundle_id: None,
+                tt_link: None,
+                config_hash: Some(snapshot.export_config_hash.clone()),
+                active: false,
+                credential_external_id: None,
+                generated_at: Some(
+                    chrono::DateTime::from_timestamp(snapshot.generated_at_unix_sec, 0)
+                        .unwrap_or_else(chrono::Utc::now)
+                        .to_rfc3339(),
+                ),
+                source: Some("classic_agent".to_string()),
+                display_name: link_cfg.display_name(),
+                source_key: Some(username.clone()),
+                link_hash: None,
+            }));
+        }
         let records_count = records.len();
         let endpoint = writer.selected_endpoint().unwrap_or("n/a");
         println!(
@@ -1262,8 +1271,10 @@ impl Agent {
             write_result.failed += export_failed;
             write_result.failures.extend(export_failures.clone());
         }
-        write_result.unchanged += unchanged_count;
-        write_result.deactivated += removed_count;
+        if !use_full_snapshot_for_export {
+            write_result.unchanged += unchanged_count;
+            write_result.deactivated += removed_count;
+        }
 
         if write_result.failed == 0 {
             persist_inventory_state(&state_path, &snapshot)?;
@@ -3797,6 +3808,29 @@ mod tests {
         script_path.display().to_string()
     }
 
+    async fn run_single_request_server(
+        status: u16,
+        body: &str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let response_body = body.to_string();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0_u8; 65536];
+            let size = stream.read(&mut buffer).await.unwrap();
+            let request = String::from_utf8_lossy(&buffer[..size]).to_string();
+            let response = format!(
+                "HTTP/1.1 {status} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            request
+        });
+        (format!("http://{address}/bulk"), handle)
+    }
+
     #[cfg(feature = "legacy-lk-http")]
     #[derive(Clone)]
     struct MockResponse {
@@ -5303,6 +5337,77 @@ upload_buffer_size = 32768
         assert_eq!(plan.stats.deleted_credentials, 0);
         assert!(!plan.changed);
         assert!(plan.rendered_credentials.contains("[[client]]"));
+    }
+
+    #[tokio::test]
+    async fn sidecar_export_api_contract_uses_full_snapshot_without_inactive_artifacts() {
+        let tmp_dir = TempDir::new().unwrap();
+        let mut agent = make_db_worker_agent_for_validation_tests(&tmp_dir, false).await;
+        fs::write(
+            &agent.cfg.runtime_credentials_path,
+            b"[[client]]\nusername=\"alice\"\npassword=\"one\"\n",
+        )
+        .await
+        .unwrap();
+
+        let prior_snapshot = credentials_inventory::InventorySnapshot {
+            generated_at_unix_sec: chrono::Utc::now().timestamp(),
+            export_config_hash: "legacy-hash".to_string(),
+            credentials: vec![
+                credentials_inventory::InventoryAccount {
+                    username: "alice".to_string(),
+                    password: "one".to_string(),
+                },
+                credentials_inventory::InventoryAccount {
+                    username: "bob".to_string(),
+                    password: "two".to_string(),
+                },
+            ],
+        };
+        persist_inventory_state(&agent.workspace.inventory_state_path(), &prior_snapshot).unwrap();
+
+        let (endpoint, request_handle) = run_single_request_server(
+            200,
+            r#"{"summary":{"created":1,"updated":0,"unchanged":0,"deactivated":1,"failed":0}}"#,
+        )
+        .await;
+        agent.cfg.lk_write_contract = LkWriteContract::Api;
+        agent.cfg.lk_db_dsn = endpoint;
+        agent.cfg.lk_service_token = Some("token".to_string());
+
+        agent.sync_local_inventory_export_sidecar().await.unwrap();
+        let request = request_handle.await.unwrap();
+        assert!(request.contains("\"contract_version\":\"v1\""));
+        assert!(request.contains("\"artifacts\":["));
+        assert!(request.contains("\"username\":\"alice\""));
+        assert!(!request.contains("\"username\":\"bob\""));
+        assert!(!request.contains("\"is_current\":false"));
+    }
+
+    #[tokio::test]
+    async fn sidecar_export_does_not_persist_inventory_state_on_lk_write_failure() {
+        let tmp_dir = TempDir::new().unwrap();
+        let mut agent = make_db_worker_agent_for_validation_tests(&tmp_dir, false).await;
+        fs::write(
+            &agent.cfg.runtime_credentials_path,
+            b"[[client]]\nusername=\"alice\"\npassword=\"one\"\n",
+        )
+        .await
+        .unwrap();
+        let state_path = agent.workspace.inventory_state_path();
+        if fs::try_exists(&state_path).await.unwrap() {
+            fs::remove_file(&state_path).await.unwrap();
+        }
+
+        let (endpoint, _request_handle) =
+            run_single_request_server(500, r#"{"error":"downstream unavailable"}"#).await;
+        agent.cfg.lk_write_contract = LkWriteContract::Api;
+        agent.cfg.lk_db_dsn = endpoint;
+        agent.cfg.lk_service_token = Some("token".to_string());
+
+        let err = agent.sync_local_inventory_export_sidecar().await.unwrap_err();
+        assert!(err.contains("HTTP 500"));
+        assert!(!fs::try_exists(&state_path).await.unwrap());
     }
 
     #[cfg(feature = "legacy-lk-http")]

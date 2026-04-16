@@ -321,9 +321,12 @@ async fn write_via_api(
         let body = response.text().await.unwrap_or_default();
         let diagnostics = render_payload_diagnostics(&request_payload)?;
         return Err(format!(
-            "LK bulk API returned HTTP {}: {}. {}",
+            "LK bulk API returned HTTP {}: {}. request_id={} import_batch_id={} idempotency_key={}. {}",
             status.as_u16(),
             body.trim(),
+            request_payload.request_id,
+            request_payload.import_batch_id,
+            request_payload.idempotency_key,
             diagnostics
         ));
     }
@@ -583,9 +586,8 @@ fn build_api_request(records: Vec<LkArtifactRecord>) -> Result<LkBulkApiRequest,
     {
         return Err("LK artifacts API payload must contain exactly one external_node_id".to_string());
     }
-    let candidate_count = records.len();
-    let mut skipped_invalid = 0usize;
-    let artifacts = records
+    let mut validation_errors = Vec::new();
+    let mut artifacts = records
         .into_iter()
         .filter_map(|record| {
             let username = Some(record.username.trim().to_string()).filter(|item| !item.is_empty());
@@ -596,50 +598,77 @@ fn build_api_request(records: Vec<LkArtifactRecord>) -> Result<LkBulkApiRequest,
                 .map(ToString::to_string)
                 .filter(|item| !item.is_empty());
             if username.is_none() && credential_external_id.is_none() {
-                skipped_invalid += 1;
-                eprintln!(
-                    "phase=lk_api_artifact_skipped reason=missing_matcher external_node_id={} source_key={} username={}",
-                    record.external_node_id,
+                validation_errors.push(format!(
+                    "artifact source_key={} is missing both username and credential_external_id",
                     record.source_key.as_deref().unwrap_or("-"),
-                    record.username
-                );
+                ));
                 return None;
             }
-            let link = record
+            let Some(link) = record
                 .tt_link
                 .as_deref()
                 .map(str::trim)
                 .map(ToString::to_string)
-                .filter(|item| !item.is_empty())?;
-            let link_revision = record
+                .filter(|item| !item.is_empty()) else {
+                validation_errors.push(format!(
+                    "artifact source_key={} is missing required non-empty link",
+                    record.source_key.as_deref().unwrap_or("-")
+                ));
+                return None;
+            };
+            let Some(link_revision) = record
                 .config_hash
                 .as_deref()
                 .map(str::trim)
                 .map(ToString::to_string)
-                .filter(|item| !item.is_empty())?;
-            let source_key = record
+                .filter(|item| !item.is_empty()) else {
+                validation_errors.push(format!(
+                    "artifact source_key={} is missing required non-empty link_revision",
+                    record.source_key.as_deref().unwrap_or("-")
+                ));
+                return None;
+            };
+            let Some(source_key) = record
                 .source_key
                 .as_deref()
                 .map(str::trim)
                 .map(ToString::to_string)
                 .filter(|item| !item.is_empty())
                 .or_else(|| username.clone())
-                .or_else(|| credential_external_id.clone())?;
-            let link_hash = record
+                .or_else(|| credential_external_id.clone()) else {
+                validation_errors.push(format!(
+                    "artifact username={} has no source_key/username/credential_external_id",
+                    record.username
+                ));
+                return None;
+            };
+            let Some(link_hash) = record
                 .link_hash
                 .as_deref()
                 .map(str::trim)
                 .map(ToString::to_string)
                 .filter(|item| !item.is_empty())
-                .or_else(|| Some(link_revision.clone()))?;
-            let display_name = record
+                .or_else(|| Some(link_revision.clone())) else {
+                validation_errors.push(format!(
+                    "artifact source_key={} is missing required link_hash",
+                    source_key
+                ));
+                return None;
+            };
+            let Some(display_name) = record
                 .display_name
                 .as_deref()
                 .map(str::trim)
                 .map(ToString::to_string)
                 .filter(|item| !item.is_empty())
                 .or_else(|| username.clone())
-                .or_else(|| credential_external_id.clone())?;
+                .or_else(|| credential_external_id.clone()) else {
+                validation_errors.push(format!(
+                    "artifact source_key={} is missing required display_name",
+                    source_key
+                ));
+                return None;
+            };
             Some(LkBulkApiArtifactRequest {
                 username,
                 credential_external_id,
@@ -654,10 +683,16 @@ fn build_api_request(records: Vec<LkArtifactRecord>) -> Result<LkBulkApiRequest,
             })
         })
         .collect::<Vec<_>>();
-    if artifacts.is_empty() {
+    artifacts.sort_by(|left, right| left.source_key.cmp(&right.source_key));
+    if !validation_errors.is_empty() {
         return Err(format!(
-            "LK artifacts API payload validation failed: empty artifacts array after filtering invalid items (created candidate artifacts: {candidate_count}, skipped invalid artifacts: {skipped_invalid})"
+            "LK artifacts API payload validation failed before POST: {} invalid artifact(s): {}",
+            validation_errors.len(),
+            validation_errors.join("; ")
         ));
+    }
+    if artifacts.is_empty() {
+        return Err("LK artifacts API payload validation failed: empty artifacts array".to_string());
     }
     let idempotency_key = build_logical_batch_id(&external_node_id, &artifacts);
     let import_batch_id = format!("{}:{}", external_node_id, idempotency_key);
@@ -761,8 +796,6 @@ fn build_logical_batch_id(external_node_id: &str, artifacts: &[LkBulkApiArtifact
         seed.push_str(artifact.source_key.as_str());
         seed.push('|');
         seed.push_str(artifact.link_revision.as_str());
-        seed.push('|');
-        seed.push_str(artifact.generated_at.as_str());
         seed.push('|');
         seed.push_str(if artifact.is_current { "1" } else { "0" });
     }
@@ -1083,12 +1116,32 @@ mod tests {
     }
 
     #[test]
-    fn api_request_skips_artifact_without_matchers() {
+    fn api_request_rejects_artifact_without_matchers() {
         let mut invalid = test_record("alice");
         invalid.username.clear();
         invalid.credential_external_id = None;
         let err = build_api_request(vec![invalid]).unwrap_err();
-        assert!(err.contains("empty artifacts array after filtering invalid items"));
+        assert!(err.contains("missing both username and credential_external_id"));
+    }
+
+    #[test]
+    fn api_request_rejects_artifact_without_link() {
+        let mut invalid = test_record("alice");
+        invalid.tt_link = None;
+        let err = build_api_request(vec![invalid]).unwrap_err();
+        assert!(err.contains("missing required non-empty link"));
+    }
+
+    #[test]
+    fn api_request_batch_id_is_stable_when_generated_at_differs() {
+        let mut first_record = test_record("alice");
+        first_record.generated_at = Some("2026-04-16T00:00:00Z".to_string());
+        let first = build_api_request(vec![first_record]).unwrap();
+        let mut second_record = test_record("alice");
+        second_record.generated_at = Some("2026-04-16T01:23:45Z".to_string());
+        let second = build_api_request(vec![second_record]).unwrap();
+        assert_eq!(first.import_batch_id, second.import_batch_id);
+        assert_eq!(first.idempotency_key, second.idempotency_key);
     }
 
     #[test]
@@ -1156,6 +1209,9 @@ mod tests {
         let err = writer.write_batch(vec![test_record("alice")]).await.unwrap_err();
         assert!(err.contains("HTTP 400"));
         assert!(err.contains("invalid_input"));
+        assert!(err.contains("request_id="));
+        assert!(err.contains("import_batch_id="));
+        assert!(err.contains("idempotency_key="));
         let request = request_handle.await.unwrap();
         assert!(request.contains("\"import_batch_id\":\""));
     }
