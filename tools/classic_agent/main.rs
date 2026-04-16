@@ -243,6 +243,10 @@ impl RuntimeMode {
             )),
         }
     }
+
+    fn supports_lifecycle_writes(self) -> bool {
+        matches!(self, Self::LegacyHttp)
+    }
 }
 
 impl Config {
@@ -603,11 +607,16 @@ impl Agent {
     }
 
     async fn run_db_worker_loop(&mut self) {
+        let lifecycle_writes_supported = self.cfg.runtime_mode.supports_lifecycle_writes();
         println!(
-            "db_worker mode enabled for node_external_id={} (dsn_len={}, apply_interval_sec={})",
+            "db_worker mode enabled for node_external_id={} (dsn_len={}, apply_interval_sec={}, lifecycle_writes_supported={})",
             self.cfg.node_external_id,
             self.cfg.lk_db_dsn.len(),
-            self.cfg.apply_interval.as_secs()
+            self.cfg.apply_interval.as_secs(),
+            lifecycle_writes_supported
+        );
+        println!(
+            "phase=startup mode=db_worker lifecycle_writes=unsupported details=\"node metadata/status/revision writes are disabled; only access artifact bulk writes are enabled\""
         );
         if let Err(err) = self
             .run_sidecar_sync_pass(sidecar_sync::PassKind::Bootstrap)
@@ -4269,6 +4278,12 @@ upload_buffer_size = 32768
         assert!(!should_import_bootstrap_credentials(true, true, false));
         assert!(!should_import_bootstrap_credentials(true, false, true));
         assert!(!should_import_bootstrap_credentials(false, false, false));
+    }
+
+    #[test]
+    fn lifecycle_writes_support_depends_on_runtime_mode() {
+        assert!(!RuntimeMode::DbWorker.supports_lifecycle_writes());
+        assert!(RuntimeMode::LegacyHttp.supports_lifecycle_writes());
     }
 
     #[tokio::test]

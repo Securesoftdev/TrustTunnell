@@ -64,6 +64,9 @@ Executed every `AGENT_RECONCILE_INTERVAL_SEC`:
 
 Default mode is selected when `CLASSIC_AGENT_MODE` is unset or set to `db_worker`.
 In this mode sidecar sync and LK bulk writer run without legacy LK HTTP orchestration loops.
+`db_worker` writes only access artifacts (TT-link payloads and active/deactivated records) through
+`lk_bulk_write` contracts. Node lifecycle writes (`register`, `heartbeat`, `sync-report`; node
+metadata/status/revision updates) are unsupported in this mode.
 
 ### Legacy mode (`legacy_http`)
 
