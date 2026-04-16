@@ -45,6 +45,8 @@ const REGISTER_MAX_BACKOFF: Duration = Duration::from_secs(60);
 const HEARTBEAT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const HEARTBEAT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const HEARTBEAT_MAX_ATTEMPTS: usize = 3;
+const INVENTORY_INGEST_ATTEMPTS: usize = 3;
+const INVENTORY_INGEST_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const SYNC_REPORT_OUTBOX_FILE: &str = "pending_sync_reports.jsonl";
 const RUNTIME_PRIMARY_MARKER_FILE: &str = ".runtime_credentials_primary";
 const DEFAULT_RUNTIME_VALIDATION_MIN_USERS: usize = 1;
@@ -578,6 +580,25 @@ struct Agent {
 struct CandidateValidationFiles {
     candidate_credentials_path: PathBuf,
     temp_config_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct InventoryIngestCredential {
+    username: String,
+    password: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct InventoryIngestPayload {
+    contract_version: &'static str,
+    snapshot_version: String,
+    external_node_id: String,
+    source: String,
+    revision: String,
+    exported_at: String,
+    idempotency_key: String,
+    request_id: String,
+    credentials: Vec<InventoryIngestCredential>,
 }
 
 impl Agent {
@@ -1118,6 +1139,39 @@ impl Agent {
             &self.cfg.node_external_id,
             self.cfg.lk_service_token.clone(),
         )?;
+        if writer.active_contract() == "api" {
+            let inventory_payload = build_inventory_ingest_payload(
+                &self.cfg.node_external_id,
+                &snapshot,
+                "classic_agent",
+            )?;
+            println!(
+                "phase=inventory_payload_sent node={} endpoint={} snapshot_version={} revision={} credentials={} idempotency_key={} request_id={}",
+                self.cfg.node_external_id,
+                derive_inventory_endpoint(&self.cfg.lk_db_dsn, &self.cfg.node_external_id)?,
+                inventory_payload.snapshot_version,
+                inventory_payload.revision,
+                inventory_payload.credentials.len(),
+                inventory_payload.idempotency_key,
+                inventory_payload.request_id
+            );
+            self.post_inventory_with_retry(&inventory_payload).await?;
+            println!(
+                "phase=inventory_payload_accepted node={} snapshot_version={} revision={} credentials={} idempotency_key={} request_id={} reconcile_ready=true",
+                self.cfg.node_external_id,
+                inventory_payload.snapshot_version,
+                inventory_payload.revision,
+                inventory_payload.credentials.len(),
+                inventory_payload.idempotency_key,
+                inventory_payload.request_id
+            );
+        } else {
+            println!(
+                "phase=inventory_payload_skipped node={} contract={} reconcile_ready=false reason=inventory_requires_api_contract",
+                self.cfg.node_external_id,
+                writer.active_contract()
+            );
+        }
         let use_full_snapshot_for_export = writer.active_contract() == "api";
         let accounts_for_export = if use_full_snapshot_for_export {
             snapshot.credentials.clone()
@@ -1239,6 +1293,13 @@ impl Agent {
             self.cfg.node_external_id,
             records_count
         );
+        println!(
+            "phase=artifacts_payload_sent node={} contract={} endpoint={} records_count={} reconcile_ready=true",
+            self.cfg.node_external_id,
+            writer.active_contract(),
+            endpoint,
+            records_count
+        );
         let mut write_result = match writer.write_batch(records).await {
             Ok(result) => {
                 println!(
@@ -1252,6 +1313,14 @@ impl Agent {
                     result.unchanged,
                     result.deactivated,
                     result.failed
+                );
+                println!(
+                    "phase=artifacts_payload_accepted node={} contract={} endpoint={} records_count={} reconcile_ready={}",
+                    self.cfg.node_external_id,
+                    writer.active_contract(),
+                    endpoint,
+                    records_count,
+                    result.failed == 0
                 );
                 result
             }
@@ -1302,6 +1371,92 @@ impl Agent {
         }
 
         Ok(())
+    }
+
+    async fn post_inventory_with_retry(
+        &self,
+        payload: &InventoryIngestPayload,
+    ) -> Result<(), String> {
+        let endpoint = derive_inventory_endpoint(&self.cfg.lk_db_dsn, &self.cfg.node_external_id)?;
+        let mut backoff = INVENTORY_INGEST_INITIAL_BACKOFF;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .no_proxy()
+            .build()
+            .map_err(|e| format!("failed to build inventory ingest HTTP client: {e}"))?;
+
+        for attempt in 1..=INVENTORY_INGEST_ATTEMPTS {
+            let mut request = client.post(&endpoint).json(payload);
+            if let Some(token) = self
+                .cfg
+                .lk_service_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+            {
+                request = request.bearer_auth(token).header("X-Internal-Agent-Token", token);
+            }
+            let response = request.send().await;
+            match response {
+                Ok(resp) if resp.status().is_success() => {
+                    return Ok(());
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    let detail = format!(
+                        "inventory ingest returned HTTP {} on attempt {attempt}/{INVENTORY_INGEST_ATTEMPTS}: {}",
+                        status.as_u16(),
+                        body.trim()
+                    );
+                    if status.is_server_error() && attempt < INVENTORY_INGEST_ATTEMPTS {
+                        println!(
+                            "phase=inventory_payload_retry node={} endpoint={} attempt={} backoff_sec={} reason=server_error status={}",
+                            self.cfg.node_external_id,
+                            endpoint,
+                            attempt,
+                            backoff.as_secs(),
+                            status.as_u16()
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff = std::cmp::min(backoff.saturating_mul(2), Duration::from_secs(30));
+                        continue;
+                    }
+                    println!(
+                        "phase=reconcile_not_ready node={} reason=inventory_delivery_failed request_id={} idempotency_key={}",
+                        self.cfg.node_external_id,
+                        payload.request_id,
+                        payload.idempotency_key
+                    );
+                    return Err(detail);
+                }
+                Err(err) => {
+                    if attempt < INVENTORY_INGEST_ATTEMPTS {
+                        println!(
+                            "phase=inventory_payload_retry node={} endpoint={} attempt={} backoff_sec={} reason=network_error error={}",
+                            self.cfg.node_external_id,
+                            endpoint,
+                            attempt,
+                            backoff.as_secs(),
+                            err
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff = std::cmp::min(backoff.saturating_mul(2), Duration::from_secs(30));
+                        continue;
+                    }
+                    println!(
+                        "phase=reconcile_not_ready node={} reason=inventory_delivery_failed request_id={} idempotency_key={}",
+                        self.cfg.node_external_id,
+                        payload.request_id,
+                        payload.idempotency_key
+                    );
+                    return Err(format!(
+                        "inventory ingest request failed after {INVENTORY_INGEST_ATTEMPTS} attempts: {err}"
+                    ));
+                }
+            }
+        }
+        Err("inventory ingest retry loop exhausted".to_string())
     }
 
 
@@ -3683,6 +3838,71 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(digest.as_ref())
 }
 
+fn derive_inventory_endpoint(artifacts_endpoint: &str, external_node_id: &str) -> Result<String, String> {
+    let resolved = artifacts_endpoint.replace("{externalNodeId}", external_node_id);
+    if resolved.trim().is_empty() {
+        return Err("inventory endpoint resolution failed: artifacts endpoint is empty".to_string());
+    }
+    if let Some(prefix) = resolved.strip_suffix("/artifacts") {
+        return Ok(format!("{prefix}/inventory"));
+    }
+    Ok(format!("{}/inventory", resolved.trim_end_matches('/')))
+}
+
+fn build_inventory_ingest_payload(
+    external_node_id: &str,
+    snapshot: &credentials_inventory::InventorySnapshot,
+    source: &str,
+) -> Result<InventoryIngestPayload, String> {
+    let mut credentials = snapshot
+        .credentials
+        .iter()
+        .map(|item| InventoryIngestCredential {
+            username: item.username.clone(),
+            password: item.password.clone(),
+        })
+        .collect::<Vec<_>>();
+    credentials.sort_by(|left, right| left.username.cmp(&right.username));
+
+    let mut seed = external_node_id.trim().to_string();
+    seed.push('|');
+    seed.push_str(snapshot.export_config_hash.as_str());
+    for item in &credentials {
+        seed.push('|');
+        seed.push_str(item.username.as_str());
+        seed.push('|');
+        seed.push_str(sha256_hex(item.password.as_bytes()).as_str());
+    }
+    let logical_hash = sha256_hex(seed.as_bytes());
+    let idempotency_key = trim_id(format!("inventory-v1-{logical_hash}"), 128);
+    let snapshot_version = trim_id(format!("inventory-v1-{logical_hash}"), 128);
+    let request_id = trim_id(format!("inventory-req-{logical_hash}"), 128);
+    let exported_at = chrono::DateTime::from_timestamp(snapshot.generated_at_unix_sec, 0)
+        .ok_or_else(|| {
+            format!(
+                "inventory payload has invalid generated_at_unix_sec={}",
+                snapshot.generated_at_unix_sec
+            )
+        })?
+        .to_rfc3339();
+
+    Ok(InventoryIngestPayload {
+        contract_version: "v1",
+        snapshot_version,
+        external_node_id: external_node_id.to_string(),
+        source: source.to_string(),
+        revision: snapshot.export_config_hash.clone(),
+        exported_at,
+        idempotency_key,
+        request_id,
+        credentials,
+    })
+}
+
+fn trim_id(value: String, limit: usize) -> String {
+    value.chars().take(limit).collect()
+}
+
 fn log_sync_skip(snapshot: &SyncPayload, reason: &str) {
     println!(
         "reconcile skip: reason={} version={} checksum={} onboarding_state={} sync_required={}",
@@ -3808,27 +4028,32 @@ mod tests {
         script_path.display().to_string()
     }
 
-    async fn run_single_request_server(
-        status: u16,
-        body: &str,
-    ) -> (String, tokio::task::JoinHandle<String>) {
+    async fn run_multi_request_server(
+        responses: Vec<(u16, String)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let response_body = body.to_string();
         let handle = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut buffer = vec![0_u8; 65536];
-            let size = stream.read(&mut buffer).await.unwrap();
-            let request = String::from_utf8_lossy(&buffer[..size]).to_string();
-            let response = format!(
-                "HTTP/1.1 {status} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
-                response_body.len(),
-                response_body
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-            request
+            let mut captured = Vec::new();
+            for (status, response_body) in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = vec![0_u8; 65536];
+                let size = stream.read(&mut buffer).await.unwrap();
+                let request = String::from_utf8_lossy(&buffer[..size]).to_string();
+                captured.push(request);
+                let response = format!(
+                    "HTTP/1.1 {status} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            captured
         });
-        (format!("http://{address}/bulk"), handle)
+        (
+            format!("http://{address}/internal/trusttunnel/v1/nodes/{{externalNodeId}}/artifacts"),
+            handle,
+        )
     }
 
     #[cfg(feature = "legacy-lk-http")]
@@ -5366,22 +5591,34 @@ upload_buffer_size = 32768
         };
         persist_inventory_state(&agent.workspace.inventory_state_path(), &prior_snapshot).unwrap();
 
-        let (endpoint, request_handle) = run_single_request_server(
-            200,
-            r#"{"summary":{"created":1,"updated":0,"unchanged":0,"deactivated":1,"failed":0}}"#,
-        )
+        let (endpoint, request_handle) = run_multi_request_server(vec![
+            (
+                200,
+                r#"{"accepted":true}"#.to_string(),
+            ),
+            (
+                200,
+                r#"{"summary":{"created":1,"updated":0,"unchanged":0,"deactivated":1,"failed":0}}"#
+                    .to_string(),
+            ),
+        ])
         .await;
         agent.cfg.lk_write_contract = LkWriteContract::Api;
         agent.cfg.lk_db_dsn = endpoint;
         agent.cfg.lk_service_token = Some("token".to_string());
 
         agent.sync_local_inventory_export_sidecar().await.unwrap();
-        let request = request_handle.await.unwrap();
-        assert!(request.contains("\"contract_version\":\"v1\""));
-        assert!(request.contains("\"artifacts\":["));
-        assert!(request.contains("\"username\":\"alice\""));
-        assert!(!request.contains("\"username\":\"bob\""));
-        assert!(!request.contains("\"is_current\":false"));
+        let requests = request_handle.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("POST /internal/trusttunnel/v1/nodes/node-1/inventory"));
+        assert!(requests[0].contains("\"contract_version\":\"v1\""));
+        assert!(requests[0].contains("\"credentials\":["));
+        assert!(requests[1].contains("POST /internal/trusttunnel/v1/nodes/node-1/artifacts"));
+        assert!(requests[1].contains("\"contract_version\":\"v1\""));
+        assert!(requests[1].contains("\"artifacts\":["));
+        assert!(requests[1].contains("\"username\":\"alice\""));
+        assert!(!requests[1].contains("\"username\":\"bob\""));
+        assert!(!requests[1].contains("\"is_current\":false"));
     }
 
     #[tokio::test]
@@ -5399,14 +5636,50 @@ upload_buffer_size = 32768
             fs::remove_file(&state_path).await.unwrap();
         }
 
-        let (endpoint, _request_handle) =
-            run_single_request_server(500, r#"{"error":"downstream unavailable"}"#).await;
+        let (endpoint, _request_handle) = run_multi_request_server(vec![
+            (
+                200,
+                r#"{"accepted":true}"#.to_string(),
+            ),
+            (
+                500,
+                r#"{"error":"downstream unavailable"}"#.to_string(),
+            ),
+        ])
+        .await;
         agent.cfg.lk_write_contract = LkWriteContract::Api;
         agent.cfg.lk_db_dsn = endpoint;
         agent.cfg.lk_service_token = Some("token".to_string());
 
         let err = agent.sync_local_inventory_export_sidecar().await.unwrap_err();
         assert!(err.contains("HTTP 500"));
+        assert!(!fs::try_exists(&state_path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn sidecar_export_fails_when_inventory_delivery_fails() {
+        let tmp_dir = TempDir::new().unwrap();
+        let mut agent = make_db_worker_agent_for_validation_tests(&tmp_dir, false).await;
+        fs::write(
+            &agent.cfg.runtime_credentials_path,
+            b"[[client]]\nusername=\"alice\"\npassword=\"one\"\n",
+        )
+        .await
+        .unwrap();
+        let state_path = agent.workspace.inventory_state_path();
+
+        let (endpoint, _request_handle) = run_multi_request_server(vec![
+            (500, r#"{"error":"inventory unavailable"}"#.to_string()),
+            (500, r#"{"error":"inventory unavailable"}"#.to_string()),
+            (500, r#"{"error":"inventory unavailable"}"#.to_string()),
+        ])
+        .await;
+        agent.cfg.lk_write_contract = LkWriteContract::Api;
+        agent.cfg.lk_db_dsn = endpoint;
+        agent.cfg.lk_service_token = Some("token".to_string());
+
+        let err = agent.sync_local_inventory_export_sidecar().await.unwrap_err();
+        assert!(err.contains("inventory ingest returned HTTP 500"));
         assert!(!fs::try_exists(&state_path).await.unwrap());
     }
 
@@ -5886,6 +6159,36 @@ upload_buffer_size = 32768
     fn split_host_port_rejects_unbracketed_ipv6() {
         let err = split_host_port("2001:db8::1:443").unwrap_err();
         assert!(err.contains("host:port or [ipv6]:port"));
+    }
+
+    #[test]
+    fn derive_inventory_endpoint_replaces_artifacts_path() {
+        let endpoint = derive_inventory_endpoint(
+            "https://lk.example/internal/trusttunnel/v1/nodes/{externalNodeId}/artifacts",
+            "node-1",
+        )
+        .unwrap();
+        assert_eq!(
+            endpoint,
+            "https://lk.example/internal/trusttunnel/v1/nodes/node-1/inventory"
+        );
+    }
+
+    #[test]
+    fn inventory_payload_ids_are_stable_for_same_snapshot() {
+        let snapshot = credentials_inventory::InventorySnapshot {
+            generated_at_unix_sec: 1_710_000_000,
+            export_config_hash: "cfg-hash".to_string(),
+            credentials: vec![credentials_inventory::InventoryAccount {
+                username: "alice".to_string(),
+                password: "secret".to_string(),
+            }],
+        };
+        let first = build_inventory_ingest_payload("node-1", &snapshot, "classic_agent").unwrap();
+        let second = build_inventory_ingest_payload("node-1", &snapshot, "classic_agent").unwrap();
+        assert_eq!(first.idempotency_key, second.idempotency_key);
+        assert_eq!(first.snapshot_version, second.snapshot_version);
+        assert_eq!(first.request_id, second.request_id);
     }
 
     #[test]
