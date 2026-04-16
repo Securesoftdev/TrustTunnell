@@ -210,6 +210,7 @@ struct Config {
     metrics_address: SocketAddr,
     debug_preserve_temp_files: bool,
     validation_strict_mode: bool,
+    syntax_validation_diagnostic_only: bool,
     runtime_validation_min_users: usize,
     runtime_validation_max_users: usize,
 }
@@ -395,6 +396,16 @@ impl Config {
                 )
             })
             .unwrap_or(false);
+        let syntax_validation_diagnostic_only = optional_env_nonempty(
+            "TRUSTTUNNEL_CANDIDATE_SYNTAX_DIAGNOSTIC_ONLY",
+        )
+        .map(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
         let runtime_validation_min_users = optional_env_nonempty(
             "TRUSTTUNNEL_RUNTIME_VALIDATION_MIN_USERS",
         )
@@ -470,6 +481,7 @@ impl Config {
             metrics_address,
             debug_preserve_temp_files,
             validation_strict_mode,
+            syntax_validation_diagnostic_only,
             runtime_validation_min_users,
             runtime_validation_max_users,
         };
@@ -744,6 +756,12 @@ impl Agent {
     ) -> Result<sidecar_sync::ReconcilePlan, String> {
         let desired_artifacts = self.load_desired_access_artifacts().await?;
         let runtime_credentials = self.load_runtime_credentials_artifacts().await?;
+        println!(
+            "phase=source_inventory_summary node={} source_inventory_count={} runtime_inventory_count={}",
+            self.cfg.node_external_id,
+            desired_artifacts.len(),
+            runtime_credentials.len()
+        );
         let plan = sidecar_sync::reconcile_plan(&desired_artifacts, &runtime_credentials);
         println!(
             "phase=reconcile_plan found={} generated={} updated={} missing={} skipped={} new={} stale={} deleted={} changed={}",
@@ -756,6 +774,12 @@ impl Agent {
             plan.stats.stale_credentials,
             plan.stats.deleted_credentials,
             plan.changed
+        );
+        println!(
+            "phase=reconcile_invariants node={} source_inventory_count={} reconcile_found_count={}",
+            self.cfg.node_external_id,
+            desired_artifacts.len(),
+            plan.stats.found
         );
         Ok(plan)
     }
@@ -776,6 +800,11 @@ impl Agent {
         );
 
         if plan.changed {
+            println!(
+                "phase=apply_plan_summary node={} planned_credentials_count={}",
+                self.cfg.node_external_id,
+                plan.stats.found
+            );
             let previous_runtime_credentials = fs::read(&self.cfg.runtime_credentials_path).await.ok();
             let tmp_credentials_path = self
                 .write_runtime_credentials_tmp(plan.rendered_credentials.as_bytes())
@@ -869,16 +898,55 @@ impl Agent {
     }
 
     async fn load_desired_access_artifacts(&self) -> Result<Vec<sidecar_sync::AccessArtifact>, String> {
-        let Some(source_path) = self.cfg.bootstrap_credentials_source_path.as_ref() else {
+        if let Some(source_path) = self.cfg.bootstrap_credentials_source_path.as_ref() {
+            let raw = fs::read_to_string(source_path).await.map_err(|e| {
+                format!(
+                    "failed to read desired access artifacts {}: {e}",
+                    source_path.display()
+                )
+            })?;
+            let parsed = parse_access_artifacts(&raw)?;
+            println!(
+                "phase=source_inventory_loaded node={} source=bootstrap_credentials path={} source_inventory_count={}",
+                self.cfg.node_external_id,
+                source_path.display(),
+                parsed.len()
+            );
+            return Ok(parsed);
+        }
+
+        if !fs::try_exists(&self.cfg.runtime_credentials_path)
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to check runtime credentials {}: {e}",
+                    self.cfg.runtime_credentials_path.display()
+                )
+            })?
+        {
+            println!(
+                "phase=source_inventory_loaded node={} source=none source_inventory_count=0",
+                self.cfg.node_external_id
+            );
             return Ok(Vec::new());
-        };
-        let raw = fs::read_to_string(source_path).await.map_err(|e| {
-            format!(
-                "failed to read desired access artifacts {}: {e}",
-                source_path.display()
-            )
-        })?;
-        parse_access_artifacts(&raw)
+        }
+
+        let raw = fs::read_to_string(&self.cfg.runtime_credentials_path)
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to read runtime credentials for desired inventory {}: {e}",
+                    self.cfg.runtime_credentials_path.display()
+                )
+            })?;
+        let parsed = parse_access_artifacts(&raw)?;
+        println!(
+            "phase=source_inventory_loaded node={} source=runtime_credentials_fallback path={} source_inventory_count={}",
+            self.cfg.node_external_id,
+            self.cfg.runtime_credentials_path.display(),
+            parsed.len()
+        );
+        Ok(parsed)
     }
 
     async fn load_runtime_credentials_artifacts(
@@ -1923,6 +1991,17 @@ impl Agent {
         fs::write(&tmp_path, data)
             .await
             .map_err(|e| format!("failed to write candidate credentials {}: {e}", tmp_path.display()))?;
+        let candidate_raw = String::from_utf8_lossy(data);
+        let candidate_written_count = parse_access_artifacts(&candidate_raw)
+            .map(|artifacts| artifacts.len())
+            .unwrap_or_default();
+        println!(
+            "phase=candidate_credentials_written node={} candidate_path={} candidate_written_count={} candidate_has_client_entries={}",
+            self.cfg.node_external_id,
+            tmp_path.display(),
+            candidate_written_count,
+            candidate_written_count > 0
+        );
 
         Ok(tmp_path)
     }
@@ -2226,14 +2305,31 @@ impl Agent {
             self.cfg.node_external_id,
             candidate_path.display()
         );
+        println!(
+            "phase=credentials_validation_mode node={} validation_mode={}",
+            self.cfg.node_external_id,
+            if self.cfg.syntax_validation_diagnostic_only {
+                "diagnostic_only"
+            } else {
+                "fail_fast"
+            }
+        );
         let syntax_precheck_result = self.validate_candidate_credentials_syntax(&candidate_path);
         if let Err(err) = &syntax_precheck_result {
             println!(
-                "phase=credentials_validation_failed node={} parser=parse_access_artifacts stage=candidate_credentials_syntax validation_path=syntax_precheck file={} diagnostic_only=true error={}",
+                "phase=credentials_validation_failed node={} parser=parse_access_artifacts stage=candidate_credentials_syntax validation_path=syntax_precheck file={} diagnostic_only={} error={}",
                 self.cfg.node_external_id,
                 candidate_path.display(),
+                self.cfg.syntax_validation_diagnostic_only,
                 err
             );
+            if !self.cfg.syntax_validation_diagnostic_only {
+                return Err(format!(
+                    "phase=credentials_validation_failed node={} parser=parse_access_artifacts stage=candidate_credentials_syntax validation_path=syntax_precheck file={}: {err}",
+                    self.cfg.node_external_id,
+                    candidate_path.display()
+                ));
+            }
         } else {
             println!(
                 "phase=credentials_validation_ok node={} parser=parse_access_artifacts stage=candidate_credentials_syntax validation_path=syntax_precheck file={}",
@@ -3822,6 +3918,7 @@ message_queue_capacity = 4096
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files: false,
             validation_strict_mode: false,
+            syntax_validation_diagnostic_only: false,
             runtime_validation_min_users: DEFAULT_RUNTIME_VALIDATION_MIN_USERS,
             runtime_validation_max_users: DEFAULT_RUNTIME_VALIDATION_MAX_USERS,
         };
@@ -3937,6 +4034,7 @@ upload_buffer_size = 32768
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files,
             validation_strict_mode,
+            syntax_validation_diagnostic_only: false,
             runtime_validation_min_users: DEFAULT_RUNTIME_VALIDATION_MIN_USERS,
             runtime_validation_max_users: DEFAULT_RUNTIME_VALIDATION_MAX_USERS,
         };
@@ -4183,6 +4281,7 @@ upload_buffer_size = 32768
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files: false,
             validation_strict_mode: false,
+            syntax_validation_diagnostic_only: false,
             runtime_validation_min_users: DEFAULT_RUNTIME_VALIDATION_MIN_USERS,
             runtime_validation_max_users: DEFAULT_RUNTIME_VALIDATION_MAX_USERS,
         };
@@ -4281,6 +4380,7 @@ upload_buffer_size = 32768
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files: false,
             validation_strict_mode: false,
+            syntax_validation_diagnostic_only: false,
             runtime_validation_min_users: DEFAULT_RUNTIME_VALIDATION_MIN_USERS,
             runtime_validation_max_users: DEFAULT_RUNTIME_VALIDATION_MAX_USERS,
         };
@@ -4363,6 +4463,7 @@ upload_buffer_size = 32768
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files: false,
             validation_strict_mode: false,
+            syntax_validation_diagnostic_only: false,
             runtime_validation_min_users: DEFAULT_RUNTIME_VALIDATION_MIN_USERS,
             runtime_validation_max_users: DEFAULT_RUNTIME_VALIDATION_MAX_USERS,
         };
@@ -4537,6 +4638,7 @@ upload_buffer_size = 32768
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files: false,
             validation_strict_mode: false,
+            syntax_validation_diagnostic_only: false,
             runtime_validation_min_users: DEFAULT_RUNTIME_VALIDATION_MIN_USERS,
             runtime_validation_max_users: DEFAULT_RUNTIME_VALIDATION_MAX_USERS,
         };
@@ -4817,7 +4919,8 @@ password = "second"
     #[tokio::test]
     async fn candidate_validation_failure_keeps_debug_artifacts() {
         let tmp_dir = TempDir::new().unwrap();
-        let agent = make_db_worker_agent_for_validation_tests(&tmp_dir, true).await;
+        let mut agent = make_db_worker_agent_for_validation_tests(&tmp_dir, true).await;
+        agent.cfg.syntax_validation_diagnostic_only = true;
         let candidate = agent
             .write_runtime_credentials_tmp(b"credentials_file = \"not-credentials\"")
             .await
@@ -4830,6 +4933,24 @@ password = "second"
         assert!(err.contains("phase=runtime_startup_validation_failed"));
         assert!(err.contains("validation_path=runtime_entrypoint"));
         assert!(candidate.exists());
+    }
+
+    #[tokio::test]
+    async fn candidate_validation_fails_fast_on_syntax_error_by_default() {
+        let tmp_dir = TempDir::new().unwrap();
+        let agent = make_db_worker_agent_for_validation_tests(&tmp_dir, false).await;
+        let candidate = agent
+            .write_runtime_credentials_tmp(b"credentials_file = \"not-credentials\"")
+            .await
+            .unwrap();
+
+        let err = agent
+            .validate_candidate_credentials_pipeline(candidate)
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("phase=credentials_validation_failed"));
+        assert!(!err.contains("runtime_startup_validation_failed"));
     }
 
     #[tokio::test]
@@ -4846,8 +4967,7 @@ password = "second"
             .await
             .unwrap_err();
 
-        assert!(err.contains("phase=runtime_startup_validation_failed"));
-        assert!(err.contains("failed to derive usernames"));
+        assert!(err.contains("phase=credentials_validation_failed"));
         assert!(err.contains("password cannot be empty"));
     }
 
@@ -4977,6 +5097,7 @@ upload_buffer_size = 32768
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files: false,
             validation_strict_mode: false,
+            syntax_validation_diagnostic_only: false,
             runtime_validation_min_users: DEFAULT_RUNTIME_VALIDATION_MIN_USERS,
             runtime_validation_max_users: DEFAULT_RUNTIME_VALIDATION_MAX_USERS,
         };
@@ -5031,6 +5152,26 @@ upload_buffer_size = 32768
         assert_eq!(plan.stats.missing_credentials, 1);
         assert_eq!(plan.stats.deleted_credentials, 1);
         assert!(plan.changed);
+    }
+
+    #[tokio::test]
+    async fn sidecar_reconcile_uses_runtime_source_when_bootstrap_is_missing() {
+        let tmp_dir = TempDir::new().unwrap();
+        let mut agent = make_db_worker_agent_for_validation_tests(&tmp_dir, false).await;
+        fs::write(
+            &agent.cfg.runtime_credentials_path,
+            b"[[client]]\nusername=\"alice\"\npassword=\"one\"\n\n[[client]]\nusername=\"bob\"\npassword=\"two\"\n",
+        )
+        .await
+        .unwrap();
+        agent.cfg.bootstrap_credentials_source_path = None;
+
+        let plan = agent.run_sidecar_reconcile_plan_phase().await.unwrap();
+        assert_eq!(plan.stats.found, 2);
+        assert_eq!(plan.stats.missing_credentials, 0);
+        assert_eq!(plan.stats.deleted_credentials, 0);
+        assert!(!plan.changed);
+        assert!(plan.rendered_credentials.contains("[[client]]"));
     }
 
     #[cfg(feature = "legacy-lk-http")]
@@ -5548,6 +5689,7 @@ upload_buffer_size = 32768
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files: false,
             validation_strict_mode: false,
+            syntax_validation_diagnostic_only: false,
             runtime_validation_min_users: DEFAULT_RUNTIME_VALIDATION_MIN_USERS,
             runtime_validation_max_users: DEFAULT_RUNTIME_VALIDATION_MAX_USERS,
         };
