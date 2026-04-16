@@ -1,6 +1,7 @@
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::process::Command;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -39,6 +40,14 @@ impl LkArtifactRecord {
             .filter(|item| !item.is_empty())
         {
             return format!("bundle:{bundle_id}");
+        }
+        if let Some(credential_external_id) = self
+            .credential_external_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+        {
+            return format!("node_credential:{}:{credential_external_id}", self.external_node_id);
         }
         format!("node_user:{}:{}", self.external_node_id, self.username)
     }
@@ -103,16 +112,18 @@ enum LkBulkSink {
     },
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct LkBulkApiRequest {
     contract_version: &'static str,
+    snapshot_version: &'static str,
     external_node_id: String,
+    import_batch_id: String,
+    idempotency_key: String,
+    request_id: String,
     artifacts: Vec<LkBulkApiArtifactRequest>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    snapshot_version: Option<&'static str>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct LkBulkApiArtifactRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     username: Option<String>,
@@ -267,18 +278,6 @@ impl LkBulkWriter {
 fn validate_records(records: &[LkArtifactRecord]) -> Result<(), String> {
     let mut seen = BTreeSet::new();
     for record in records {
-        let has_username = !record.username.trim().is_empty();
-        let has_credential_external_id = record
-            .credential_external_id
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|item| !item.is_empty());
-        if !has_username && !has_credential_external_id {
-            return Err(
-                "LK artifact record requires non-empty username or credential_external_id"
-                    .to_string(),
-            );
-        }
         if record.external_node_id.trim().is_empty() {
             return Err(format!(
                 "LK artifact record for {} has empty external_node_id",
@@ -300,6 +299,7 @@ async fn write_via_api(
     records: Vec<LkArtifactRecord>,
 ) -> Result<LkBatchWriteResult, String> {
     let request_payload = build_api_request(records)?;
+    validate_api_payload_contract(&request_payload)?;
     log_api_payload_shape(endpoint, &request_payload)?;
     let mut request = client.post(endpoint).json(&request_payload);
     if let Some(token) = service_token.map(str::trim).filter(|item| !item.is_empty()) {
@@ -572,6 +572,7 @@ fn validate_contract_response_shape(raw: &str, contract: &str, source: &str) -> 
 }
 
 fn build_api_request(records: Vec<LkArtifactRecord>) -> Result<LkBulkApiRequest, String> {
+    static REQUEST_SEQ: AtomicU64 = AtomicU64::new(1);
     let external_node_id = records
         .first()
         .map(|item| item.external_node_id.clone())
@@ -582,9 +583,11 @@ fn build_api_request(records: Vec<LkArtifactRecord>) -> Result<LkBulkApiRequest,
     {
         return Err("LK artifacts API payload must contain exactly one external_node_id".to_string());
     }
+    let candidate_count = records.len();
+    let mut skipped_invalid = 0usize;
     let artifacts = records
         .into_iter()
-        .map(|record| {
+        .filter_map(|record| {
             let username = Some(record.username.trim().to_string()).filter(|item| !item.is_empty());
             let credential_external_id = record
                 .credential_external_id
@@ -593,22 +596,27 @@ fn build_api_request(records: Vec<LkArtifactRecord>) -> Result<LkBulkApiRequest,
                 .map(ToString::to_string)
                 .filter(|item| !item.is_empty());
             if username.is_none() && credential_external_id.is_none() {
-                return Err("LK artifacts API item requires `username` or `credential_external_id`".to_string());
+                skipped_invalid += 1;
+                eprintln!(
+                    "phase=lk_api_artifact_skipped reason=missing_matcher external_node_id={} source_key={} username={}",
+                    record.external_node_id,
+                    record.source_key.as_deref().unwrap_or("-"),
+                    record.username
+                );
+                return None;
             }
             let link = record
                 .tt_link
                 .as_deref()
                 .map(str::trim)
                 .map(ToString::to_string)
-                .filter(|item| !item.is_empty())
-                .ok_or_else(|| "LK artifacts API item requires non-empty `link`".to_string())?;
+                .filter(|item| !item.is_empty())?;
             let link_revision = record
                 .config_hash
                 .as_deref()
                 .map(str::trim)
                 .map(ToString::to_string)
-                .filter(|item| !item.is_empty())
-                .ok_or_else(|| "LK artifacts API item requires non-empty `link_revision`".to_string())?;
+                .filter(|item| !item.is_empty())?;
             let source_key = record
                 .source_key
                 .as_deref()
@@ -616,16 +624,14 @@ fn build_api_request(records: Vec<LkArtifactRecord>) -> Result<LkBulkApiRequest,
                 .map(ToString::to_string)
                 .filter(|item| !item.is_empty())
                 .or_else(|| username.clone())
-                .or_else(|| credential_external_id.clone())
-                .ok_or_else(|| "LK artifacts API item requires non-empty `source_key`".to_string())?;
+                .or_else(|| credential_external_id.clone())?;
             let link_hash = record
                 .link_hash
                 .as_deref()
                 .map(str::trim)
                 .map(ToString::to_string)
                 .filter(|item| !item.is_empty())
-                .or_else(|| Some(link_revision.clone()))
-                .ok_or_else(|| "LK artifacts API item requires non-empty `link_hash`".to_string())?;
+                .or_else(|| Some(link_revision.clone()))?;
             let display_name = record
                 .display_name
                 .as_deref()
@@ -633,9 +639,8 @@ fn build_api_request(records: Vec<LkArtifactRecord>) -> Result<LkBulkApiRequest,
                 .map(ToString::to_string)
                 .filter(|item| !item.is_empty())
                 .or_else(|| username.clone())
-                .or_else(|| credential_external_id.clone())
-                .ok_or_else(|| "LK artifacts API item requires non-empty `display_name`".to_string())?;
-            Ok(LkBulkApiArtifactRequest {
+                .or_else(|| credential_external_id.clone())?;
+            Some(LkBulkApiArtifactRequest {
                 username,
                 credential_external_id,
                 link,
@@ -648,12 +653,30 @@ fn build_api_request(records: Vec<LkArtifactRecord>) -> Result<LkBulkApiRequest,
                 link_hash,
             })
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Vec<_>>();
+    if artifacts.is_empty() {
+        return Err(format!(
+            "LK artifacts API payload validation failed: empty artifacts array after filtering invalid items (created candidate artifacts: {candidate_count}, skipped invalid artifacts: {skipped_invalid})"
+        ));
+    }
+    let idempotency_key = build_logical_batch_id(&external_node_id, &artifacts);
+    let import_batch_id = format!("{}:{}", external_node_id, idempotency_key);
+    let request_id = format!(
+        "req-{}-{}",
+        chrono::Utc::now().timestamp_millis(),
+        REQUEST_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let import_batch_id = trim_id(import_batch_id, 128);
+    let idempotency_key = trim_id(idempotency_key, 128);
+    let request_id = trim_id(request_id, 128);
     Ok(LkBulkApiRequest {
         contract_version: "v1",
+        snapshot_version: "v1",
         external_node_id,
+        import_batch_id,
+        idempotency_key,
+        request_id,
         artifacts,
-        snapshot_version: Some("v1"),
     })
 }
 
@@ -661,10 +684,13 @@ fn log_api_payload_shape(endpoint: &str, payload: &LkBulkApiRequest) -> Result<(
     let diagnostics = render_payload_diagnostics(payload)?;
     let sample_artifact = render_redacted_sample_artifact(payload)?;
     eprintln!(
-        "phase=lk_api_payload_debug endpoint={} external_node_id={} artifacts_count={} diagnostics={} sample_artifact={}",
+        "phase=lk_api_payload_debug endpoint={} external_node_id={} artifacts_count={} import_batch_id={} request_id={} idempotency_key={} diagnostics={} sample_artifact={}",
         endpoint,
         payload.external_node_id,
         payload.artifacts.len(),
+        payload.import_batch_id,
+        payload.request_id,
+        payload.idempotency_key,
         diagnostics,
         sample_artifact
     );
@@ -689,6 +715,64 @@ fn render_payload_diagnostics(payload: &LkBulkApiRequest) -> Result<String, Stri
         "payload_top_level_keys={top_level_keys:?} payload_artifacts_count={} first_artifact_keys={first_artifact_keys:?}",
         payload.artifacts.len()
     ))
+}
+
+fn validate_api_payload_contract(payload: &LkBulkApiRequest) -> Result<(), String> {
+    if payload.import_batch_id.trim().is_empty() {
+        return Err("missing import_batch_id".to_string());
+    }
+    if payload.idempotency_key.trim().is_empty() {
+        return Err("missing idempotency_key".to_string());
+    }
+    if payload.request_id.trim().is_empty() {
+        return Err("missing request_id".to_string());
+    }
+    if payload.artifacts.is_empty() {
+        return Err("empty artifacts array when write was expected".to_string());
+    }
+    for item in &payload.artifacts {
+        if item
+            .username
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(|value| value.is_empty())
+            && item
+                .credential_external_id
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(|value| value.is_empty())
+        {
+            return Err("artifact without username/credential_external_id".to_string());
+        }
+        if chrono::DateTime::parse_from_rfc3339(item.generated_at.as_str()).is_err() {
+            return Err("invalid generated_at format".to_string());
+        }
+        if item.link_revision.trim().is_empty() {
+            return Err("invalid link_revision type".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn build_logical_batch_id(external_node_id: &str, artifacts: &[LkBulkApiArtifactRequest]) -> String {
+    let mut seed = external_node_id.to_string();
+    for artifact in artifacts {
+        seed.push('|');
+        seed.push_str(artifact.source_key.as_str());
+        seed.push('|');
+        seed.push_str(artifact.link_revision.as_str());
+        seed.push('|');
+        seed.push_str(artifact.generated_at.as_str());
+        seed.push('|');
+        seed.push_str(if artifact.is_current { "1" } else { "0" });
+    }
+    let digest = ring::digest::digest(&ring::digest::SHA256, seed.as_bytes());
+    let hash = hex::encode(digest.as_ref());
+    format!("batch-v1-{hash}")
+}
+
+fn trim_id(value: String, limit: usize) -> String {
+    value.chars().take(limit).collect()
 }
 
 fn render_redacted_sample_artifact(payload: &LkBulkApiRequest) -> Result<String, String> {
@@ -929,6 +1013,9 @@ mod tests {
         assert_eq!(encoded["contract_version"], "v1");
         assert_eq!(encoded["snapshot_version"], "v1");
         assert_eq!(encoded["external_node_id"], "node-1");
+        assert!(encoded["import_batch_id"].is_string());
+        assert!(encoded["request_id"].is_string());
+        assert!(encoded["idempotency_key"].is_string());
         assert_eq!(encoded["artifacts"][0]["username"], "alice");
         assert_eq!(encoded["artifacts"][0]["link"], "tt://alice");
         assert_eq!(encoded["artifacts"][0]["link_revision"], "hash-1");
@@ -944,7 +1031,11 @@ mod tests {
         let payload = build_api_request(vec![test_record("alice")]).unwrap();
         let encoded = serde_json::to_value(payload).unwrap();
         assert!(encoded["contract_version"].is_string());
+        assert!(encoded["snapshot_version"].is_string());
         assert!(encoded["external_node_id"].is_string());
+        assert!(encoded["import_batch_id"].is_string());
+        assert!(encoded["request_id"].is_string());
+        assert!(encoded["idempotency_key"].is_string());
         assert!(encoded["artifacts"].is_array());
         assert!(encoded["artifacts"][0]["username"].is_string());
         assert!(encoded["artifacts"][0]["link"].is_string());
@@ -971,6 +1062,33 @@ mod tests {
         assert_eq!(encoded["artifacts"][0]["source_key"], "cred-1");
         assert_eq!(encoded["artifacts"][0]["display_name"], "cred-1");
         assert!(encoded["artifacts"][0].get("username").is_none());
+    }
+
+    #[test]
+    fn api_request_reuses_batch_ids_for_same_logical_payload() {
+        let first = build_api_request(vec![test_record("alice")]).unwrap();
+        let second = build_api_request(vec![test_record("alice")]).unwrap();
+        assert_eq!(first.import_batch_id, second.import_batch_id);
+        assert_eq!(first.idempotency_key, second.idempotency_key);
+        assert_ne!(first.request_id, second.request_id);
+    }
+
+    #[test]
+    fn api_request_new_batch_gets_new_import_batch_id() {
+        let first = build_api_request(vec![test_record("alice")]).unwrap();
+        let mut changed = test_record("alice");
+        changed.config_hash = Some("hash-2".to_string());
+        let second = build_api_request(vec![changed]).unwrap();
+        assert_ne!(first.import_batch_id, second.import_batch_id);
+    }
+
+    #[test]
+    fn api_request_skips_artifact_without_matchers() {
+        let mut invalid = test_record("alice");
+        invalid.username.clear();
+        invalid.credential_external_id = None;
+        let err = build_api_request(vec![invalid]).unwrap_err();
+        assert!(err.contains("empty artifacts array after filtering invalid items"));
     }
 
     #[test]
@@ -1020,7 +1138,26 @@ mod tests {
         assert!(request.contains("POST /internal/trusttunnel/v1/nodes/node-1/artifacts"));
         assert!(request.contains("\"contract_version\":\"v1\""));
         assert!(request.contains("\"external_node_id\":\"node-1\""));
+        assert!(request.contains("\"import_batch_id\":\""));
+        assert!(request.contains("\"request_id\":\""));
+        assert!(request.contains("\"idempotency_key\":\""));
         assert!(request.contains("\"artifacts\":["));
+    }
+
+    #[tokio::test]
+    async fn api_write_route_returns_contract_error_without_import_batch_id() {
+        let (endpoint, request_handle) = run_single_request_server(
+            400,
+            r#"{"error":"invalid_input","details":"missing import_batch_id"}"#,
+        )
+        .await;
+        let writer = LkBulkWriter::from_contract(LkWriteContract::Api, &endpoint, "node-1", None)
+            .unwrap();
+        let err = writer.write_batch(vec![test_record("alice")]).await.unwrap_err();
+        assert!(err.contains("HTTP 400"));
+        assert!(err.contains("invalid_input"));
+        let request = request_handle.await.unwrap();
+        assert!(request.contains("\"import_batch_id\":\""));
     }
 
     #[tokio::test]
