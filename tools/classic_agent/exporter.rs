@@ -497,4 +497,22 @@ mod tests {
 
         assert!(err.contains("timed out"));
     }
+
+    #[tokio::test]
+    async fn exporter_reports_clear_error_when_binary_path_is_invalid() {
+        let temp_dir = TempDir::new().unwrap();
+        let err = run_export_command(
+            "/missing/trusttunnel_endpoint",
+            &temp_dir.path().join("vpn.toml"),
+            &temp_dir.path().join("hosts.toml"),
+            &EndpointExportOptions::new("1.1.1.1:443".to_string(), None, None, vec![]),
+            "alice",
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.contains("failed to execute endpoint command"));
+        assert!(err.contains("No such file or directory"));
+    }
 }

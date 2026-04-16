@@ -556,7 +556,8 @@ Optional:
 - `AGENT_METRICS_ADDRESS` (default `127.0.0.1:9901`, Prometheus endpoint exposed as `GET /metrics`)
 - `TRUSTTUNNEL_BOOTSTRAP_CREDENTIALS_FILE` (read-only bootstrap credentials source)
 - `TRUSTTUNNEL_APPLY_CMD` (command executed after runtime credentials update)
-- `TRUSTTUNNEL_ENDPOINT_BINARY` (default `trusttunnel_endpoint`)
+- `TRUSTTUNNEL_ENDPOINT_BIN` (default `/usr/local/bin/trusttunnel_endpoint`; falls back to `trusttunnel_endpoint` from `PATH` only when default path is unavailable)
+- `TRUSTTUNNEL_ENDPOINT_BINARY` (legacy alias for `TRUSTTUNNEL_ENDPOINT_BIN`)
 - `TRUSTTUNNEL_AGENT_VERSION` (default `classic_agent` package version)
 - `TRUSTTUNNEL_RUNTIME_VERSION` (default `unknown`)
 - `LK_DB_TABLE` (default `access_artifacts` for Postgres sink)
@@ -588,9 +589,10 @@ Classic agent runtime credentials migration and restart recovery:
 
 Classic agent architecture boundaries:
 
-- `trusttunnel_endpoint` is the data plane (traffic handling and runtime parser/validation).
+- `trusttunnel_endpoint` container is the data plane (traffic handling and runtime parser/validation).
 - `classic_agent` sidecar owns control-plane inventory and synchronization (credentials inventory snapshot, delta detection, LK bulk upsert/deactivate).
 - `tt://` generation is delegated only to the endpoint export command (`trusttunnel_endpoint ... --format deeplink`); sidecar does not construct deep links itself.
+- `trusttunnel-classic-agent` image also ships `trusttunnel_endpoint` binary for local startup validation and link export execution; this does not replace the separate `trusttunnel_endpoint` container in the pod.
 
 Classic agent sidecar observability:
 

@@ -49,6 +49,7 @@ const SYNC_REPORT_OUTBOX_FILE: &str = "pending_sync_reports.jsonl";
 const RUNTIME_PRIMARY_MARKER_FILE: &str = ".runtime_credentials_primary";
 const DEFAULT_RUNTIME_VALIDATION_MIN_USERS: usize = 1;
 const DEFAULT_RUNTIME_VALIDATION_MAX_USERS: usize = 100;
+const DEFAULT_ENDPOINT_BINARY_PATH: &str = "/usr/local/bin/trusttunnel_endpoint";
 
 mod sidecar_sync {
     use super::sha256_hex;
@@ -369,8 +370,7 @@ impl Config {
             .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
         let runtime_version =
             optional_env_nonempty("TRUSTTUNNEL_RUNTIME_VERSION").unwrap_or_else(|| "unknown".to_string());
-        let endpoint_binary = optional_env_nonempty("TRUSTTUNNEL_ENDPOINT_BINARY")
-            .unwrap_or_else(|| "trusttunnel_endpoint".to_string());
+        let endpoint_binary = resolve_endpoint_binary_from_env();
         let pending_sync_reports_path = if runtime_mode == RuntimeMode::LegacyHttp {
             Some(trusttunnel_runtime_dir.join(SYNC_REPORT_OUTBOX_FILE))
         } else {
@@ -641,6 +641,17 @@ impl Agent {
             }
         });
 
+        if let Err(err) = self.resolve_and_validate_endpoint_binary().await {
+            log_error(
+                "unknown",
+                &self.cfg.node_external_id,
+                "endpoint_binary_check_failed",
+                "failed",
+                &err,
+            );
+            std::process::exit(2);
+        }
+
         if let Err(err) = self.bootstrap_runtime_credentials().await {
             log_error(
                 "bootstrap_import_failed",
@@ -656,6 +667,52 @@ impl Agent {
             RuntimeMode::DbWorker => self.run_db_worker_loop().await,
             RuntimeMode::LegacyHttp => self.run_legacy_http_loop().await,
         }
+    }
+
+    async fn resolve_and_validate_endpoint_binary(&mut self) -> Result<(), String> {
+        println!(
+            "phase=endpoint_binary_check_begin node={} endpoint_bin_path={}",
+            self.cfg.node_external_id, self.cfg.endpoint_binary
+        );
+        let resolved = if self.cfg.endpoint_binary == DEFAULT_ENDPOINT_BINARY_PATH {
+            if is_executable_file(Path::new(DEFAULT_ENDPOINT_BINARY_PATH)) {
+                DEFAULT_ENDPOINT_BINARY_PATH.to_string()
+            } else {
+                let path_fallback = "trusttunnel_endpoint";
+                if is_command_available_in_path(path_fallback).await {
+                    path_fallback.to_string()
+                } else {
+                    DEFAULT_ENDPOINT_BINARY_PATH.to_string()
+                }
+            }
+        } else {
+            self.cfg.endpoint_binary.clone()
+        };
+        self.cfg.endpoint_binary = resolved;
+
+        if !is_executable_file(Path::new(&self.cfg.endpoint_binary))
+            && !is_command_available_in_path(&self.cfg.endpoint_binary).await
+        {
+            println!(
+                "phase=endpoint_binary_check_failed node={} endpoint_bin_path={} found=false executable=false",
+                self.cfg.node_external_id, self.cfg.endpoint_binary
+            );
+            return Err(format!(
+                "trusttunnel_endpoint binary not found at {}; set TRUSTTUNNEL_ENDPOINT_BIN or rebuild classic-agent image with endpoint binary included",
+                self.cfg.endpoint_binary
+            ));
+        }
+
+        let executable = if Path::new(&self.cfg.endpoint_binary).components().count() > 1 {
+            is_executable_file(Path::new(&self.cfg.endpoint_binary))
+        } else {
+            true
+        };
+        println!(
+            "phase=endpoint_binary_check_ok node={} endpoint_bin_path={} found=true executable={}",
+            self.cfg.node_external_id, self.cfg.endpoint_binary, executable
+        );
+        Ok(())
     }
 
     async fn run_db_worker_loop(&mut self) {
@@ -1059,15 +1116,20 @@ impl Agent {
         let mut export_failed = 0usize;
         let mut export_failures = Vec::new();
         if !upsert_accounts.is_empty() {
+            let usernames = upsert_accounts
+                .iter()
+                .map(|account: &InventoryAccount| account.username.clone())
+                .collect::<Vec<_>>();
             println!(
-                "phase=export_write_start node={} contract_mode={} accounts_for_export={} removed_accounts={}",
+                "phase=link_generation_started node={} contract_mode={} endpoint_bin_path={} accounts_for_export={} removed_accounts={}",
                 self.cfg.node_external_id,
                 if link_diag.fallback_used {
                     "legacy_fallback"
                 } else {
                     "file_required"
                 },
-                upsert_accounts.len(),
+                self.cfg.endpoint_binary,
+                usernames.len(),
                 removed_count
             );
             let settings_path =
@@ -1085,20 +1147,28 @@ impl Agent {
                     link_cfg.dns_servers(),
                 ),
             );
-            let usernames = upsert_accounts
-                .iter()
-                .map(|account: &InventoryAccount| account.username.clone())
-                .collect::<Vec<_>>();
             let export_summary = exporter.export_usernames(usernames).await?;
             generated_links = export_summary.links;
             export_failed = export_summary.failed;
             export_failures = export_summary.failures;
+            let export_binary_invocation_failed = export_failures
+                .iter()
+                .filter(|x| x.contains("failed to execute endpoint command"))
+                .count();
             println!(
-                "phase=link_generation_complete node={} generated_links={} export_failed={}",
+                "phase=link_generation_complete node={} endpoint_bin_path={} generated_links={} export_failed={} export_failed_binary_invocation={}",
                 self.cfg.node_external_id,
+                self.cfg.endpoint_binary,
                 generated_links.len(),
-                export_failed
+                export_failed,
+                export_binary_invocation_failed
             );
+            for (username, _) in &generated_links {
+                println!(
+                    "phase=link_generation_exported node={} endpoint_bin_path={} username={}",
+                    self.cfg.node_external_id, self.cfg.endpoint_binary, username
+                );
+            }
         }
 
         let writer = LkBulkWriter::from_contract(
@@ -3480,6 +3550,41 @@ fn optional_env_nonempty(name: &str) -> Option<String> {
     optional_env(name).filter(|value| !value.trim().is_empty())
 }
 
+fn resolve_endpoint_binary_from_env() -> String {
+    if let Some(path) = optional_env_nonempty("TRUSTTUNNEL_ENDPOINT_BIN") {
+        return path;
+    }
+    if let Some(path) = optional_env_nonempty("TRUSTTUNNEL_ENDPOINT_BINARY") {
+        return path;
+    }
+    DEFAULT_ENDPOINT_BINARY_PATH.to_string()
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file() && (meta.permissions().mode() & 0o111 != 0))
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path).map(|meta| meta.is_file()).unwrap_or(false)
+}
+
+async fn is_command_available_in_path(command: &str) -> bool {
+    if command.trim().is_empty() {
+        return false;
+    }
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {command} >/dev/null 2>&1"))
+        .status()
+        .await;
+    matches!(status, Ok(exit) if exit.success())
+}
+
 fn non_empty_value(name: &str, raw: String) -> Result<String, String> {
     let value = raw.trim();
     if value.is_empty() {
@@ -4880,6 +4985,32 @@ password = "second"
             .validate_endpoint_runtime_entrypoint(&temp_config_path, &candidate)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn endpoint_binary_startup_check_detects_present_binary() {
+        let tmp_dir = TempDir::new().unwrap();
+        let mut agent = make_db_worker_agent_for_validation_tests(&tmp_dir, false).await;
+        let args_log_path = agent.cfg.trusttunnel_runtime_dir.join("endpoint_args.log");
+        let endpoint_binary = make_fake_endpoint_script(&tmp_dir, &args_log_path);
+        agent.cfg.endpoint_binary = endpoint_binary;
+
+        agent.resolve_and_validate_endpoint_binary().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn endpoint_binary_startup_check_fails_when_binary_missing() {
+        let tmp_dir = TempDir::new().unwrap();
+        let mut agent = make_db_worker_agent_for_validation_tests(&tmp_dir, false).await;
+        agent.cfg.endpoint_binary = tmp_dir
+            .path()
+            .join("missing_trusttunnel_endpoint")
+            .display()
+            .to_string();
+
+        let err = agent.resolve_and_validate_endpoint_binary().await.unwrap_err();
+        assert!(err.contains("trusttunnel_endpoint binary not found at"));
+        assert!(err.contains("set TRUSTTUNNEL_ENDPOINT_BIN"));
     }
 
     #[tokio::test]
