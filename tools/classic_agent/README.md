@@ -17,17 +17,18 @@ inventory-driven sidecar synchronization.
 `classic_agent` executes these stages in strict order for each sync cycle:
 
 1. `bootstrap_credentials_import` (startup-only, guarded by runtime primary marker)
-2. `reconcile_apply_runtime_state`
-3. `candidate_credentials_write`
-4. `candidate_credentials_syntax_validation`
-5. `temp_endpoint_config_render`
-6. `endpoint_runtime_validation`
-7. `export_readiness_check`
-8. `inventory_snapshot_load_and_state_load`
-9. `inventory_delta_missing_stale_removed`
-10. `tt_link_export`
-11. `lk_bulk_write`
-12. `post_write_state_persist`
+2. `reconcile_plan_runtime_state` (every `AGENT_RECONCILE_INTERVAL_SEC`)
+3. `candidate_credentials_write` (on apply tick, only for changed plan)
+4. `candidate_credentials_syntax_validation` (on apply tick, only for changed plan)
+5. `temp_endpoint_config_render` (on apply tick, only for changed plan)
+6. `endpoint_runtime_validation` (on apply tick, only for changed plan)
+7. `apply_runtime_state` (on apply tick, only for changed plan)
+8. `export_readiness_check` (every `AGENT_APPLY_INTERVAL_SEC`)
+9. `inventory_snapshot_load_and_state_load` (every `AGENT_APPLY_INTERVAL_SEC`)
+10. `inventory_delta_missing_stale_removed` (every `AGENT_APPLY_INTERVAL_SEC`)
+11. `tt_link_export` (every `AGENT_APPLY_INTERVAL_SEC`)
+12. `lk_bulk_write` (every `AGENT_APPLY_INTERVAL_SEC`)
+13. `post_write_state_persist` (every `AGENT_APPLY_INTERVAL_SEC`)
 
 All candidate/debug/state artifacts are written under `TRUSTTUNNEL_RUNTIME_DIR` via runtime workspace helpers.
 
@@ -48,15 +49,20 @@ Executed once on startup:
 - runs sidecar sync with pass label `bootstrap`;
 - validates/promotes credentials atomically, applies runtime, and marks runtime primary.
 
-### 2) Periodic reconcile pass
+### 2) Periodic reconcile plan phase
 
 Executed every `AGENT_RECONCILE_INTERVAL_SEC`:
 
 - compares desired and runtime credentials;
 - computes counters (`found/generated/updated/missing/skipped/errors` and
-  `new/stale/deleted`);
-- applies only the detected delta;
-- syncs inventory to LK via bulk upsert/deactivate.
+  `new/stale/deleted`).
+
+### 3) Periodic apply and export/write phase
+
+Executed every `AGENT_APPLY_INTERVAL_SEC`:
+
+- applies the latest prepared reconcile plan when changes were detected;
+- runs inventory export and LK bulk upsert/deactivate.
 
 ## Runtime modes
 
