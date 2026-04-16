@@ -2,6 +2,7 @@
 
 ## 1.0.28
 
+- [Fix] `trusttunnel-classic-agent` image now includes `/usr/local/bin/trusttunnel_endpoint`, and `classic_agent` now performs startup fail-fast endpoint-binary checks with explicit `TRUSTTUNNEL_ENDPOINT_BIN` path resolution for unified runtime validation and TT-link export invocation.
 - [Fix] `classic_agent` sidecar reconcile now falls back to runtime credentials as source inventory when bootstrap source is not configured, preventing false mass-delete plans (`found=0/deleted=N`) and preserving `[[client]]` candidate generation.
 - [Fix] `classic_agent` candidate syntax validation is now fail-fast by default (with optional debug-only mode via `TRUSTTUNNEL_CANDIDATE_SYNTAX_DIAGNOSTIC_ONLY=true`), so invalid candidate credentials stop the pipeline before runtime startup validation.
 

@@ -70,5 +70,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build-classic-agent /home/TrustTunnel/target/release/classic_agent /bin/
+COPY --from=build-endpoint /home/TrustTunnel/target/release/trusttunnel_endpoint /usr/local/bin/
+RUN ln -s /usr/local/bin/trusttunnel_endpoint /bin/trusttunnel_endpoint
 WORKDIR /runtime
 ENTRYPOINT ["/bin/classic_agent"]

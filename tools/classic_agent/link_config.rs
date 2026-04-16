@@ -269,6 +269,15 @@ fn optional_env_nonempty(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock poisoned")
+    }
 
     #[test]
     fn parses_and_validates_config_toml() {
@@ -348,6 +357,7 @@ dns_servers = ["8.8.8.8", "1.1.1.1"]
 
     #[test]
     fn loads_legacy_env_when_file_not_used() {
+        let _env_guard = env_lock();
         std::env::set_var("TRUSTTUNNEL_TT_LINK_HOST", "legacy.example.com");
         std::env::set_var("TRUSTTUNNEL_TT_LINK_PORT", "8443");
         std::env::set_var("TRUSTTUNNEL_TT_LINK_PROTOCOL", "http3");
@@ -374,6 +384,7 @@ dns_servers = ["8.8.8.8", "1.1.1.1"]
 
     #[test]
     fn missing_file_error_describes_expected_shape() {
+        let _env_guard = env_lock();
         std::env::remove_var("TRUSTTUNNEL_LINK_CONFIG_ALLOW_LEGACY_FALLBACK");
         std::env::remove_var("TRUSTTUNNEL_TT_LINK_HOST");
         let path = std::env::temp_dir().join("missing-link-config.toml");
@@ -409,6 +420,7 @@ protocol = "http2"
 
     #[test]
     fn missing_required_field_reports_actionable_error() {
+        let _env_guard = env_lock();
         std::env::remove_var("TRUSTTUNNEL_LINK_CONFIG_ALLOW_LEGACY_FALLBACK");
         std::env::remove_var("TRUSTTUNNEL_TT_LINK_HOST");
         std::env::remove_var("TRUSTTUNNEL_TT_LINK_PORT");
@@ -434,6 +446,7 @@ protocol = "http2"
 
     #[test]
     fn diagnostics_report_legacy_fallback_contract_mode() {
+        let _env_guard = env_lock();
         std::env::set_var("TRUSTTUNNEL_LINK_CONFIG_ALLOW_LEGACY_FALLBACK", "true");
         std::env::set_var("TRUSTTUNNEL_TT_LINK_HOST", "legacy.example.com");
         let dir = tempfile::tempdir().unwrap();
