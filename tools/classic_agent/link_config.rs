@@ -26,9 +26,20 @@ pub(crate) struct LinkConfigDiagnostics {
     pub(crate) recognized_protocol: Option<String>,
     pub(crate) recognized_server_address: Option<String>,
     pub(crate) fallback_used: bool,
+    pub(crate) contract_mode: String,
 }
 
 impl LinkGenerationConfig {
+    const REQUIRED_FIELDS: [&'static str; 4] =
+        ["node_external_id", "server_address", "cert_domain", "protocol"];
+
+    fn expected_shape_hint() -> String {
+        format!(
+            "expected TOML shape with required fields [{}]: node_external_id=\"...\", server_address=\"host:port\", cert_domain=\"...\", protocol=\"http2|http3\"",
+            Self::REQUIRED_FIELDS.join(", ")
+        )
+    }
+
     pub(crate) fn load_from_file(path: &Path) -> Result<Self, String> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| format!("failed to read link generation config {}: {e}", path.display()))?;
@@ -56,6 +67,7 @@ impl LinkGenerationConfig {
         let mut diagnostics = LinkConfigDiagnostics {
             path: path.display().to_string(),
             file_exists: path.exists(),
+            contract_mode: "file_required".to_string(),
             ..LinkConfigDiagnostics::default()
         };
         match Self::load_from_file(path) {
@@ -72,19 +84,22 @@ impl LinkGenerationConfig {
                     .unwrap_or(false);
                 if !fallback_allowed {
                     return Err(format!(
-                        "{file_err}; file-based link config is required at {} (set TRUSTTUNNEL_LINK_CONFIG_ALLOW_LEGACY_FALLBACK=true to allow legacy env fallback)",
-                        path.display()
+                        "{file_err}; file-based link config is required at {} (contract_mode=file_required, set TRUSTTUNNEL_LINK_CONFIG_ALLOW_LEGACY_FALLBACK=true to allow legacy env fallback); {}",
+                        path.display(),
+                        Self::expected_shape_hint()
                     ));
                 }
                 let Some(legacy) = Self::load_from_legacy_env(node_external_id)? else {
                     return Err(format!(
-                        "{file_err}; expected TOML shape: node_external_id=\"...\", server_address=\"host:port\", cert_domain=\"...\", protocol=\"http2|http3\""
+                        "{file_err}; contract_mode=legacy_fallback_enabled, but legacy TT link env vars are not configured; {}",
+                        Self::expected_shape_hint()
                     ));
                 };
                 println!(
                     "link generation config file unavailable, using legacy TT link env variables"
                 );
                 diagnostics.fallback_used = true;
+                diagnostics.contract_mode = "legacy_fallback".to_string();
                 diagnostics.hash = Some(legacy.config_hash());
                 diagnostics.recognized_protocol = Some(legacy.protocol().to_string());
                 diagnostics.recognized_server_address = Some(legacy.server_address().to_string());
@@ -364,6 +379,7 @@ dns_servers = ["8.8.8.8", "1.1.1.1"]
         let path = std::env::temp_dir().join("missing-link-config.toml");
         let err = LinkGenerationConfig::load_from_file_or_legacy_env(&path, "node-a").unwrap_err();
         assert!(err.contains("file-based link config is required"));
+        assert!(err.contains("required fields [node_external_id, server_address, cert_domain, protocol]"));
     }
 
     #[test]
@@ -387,6 +403,47 @@ protocol = "http2"
         assert!(diagnostics.file_exists);
         assert!(diagnostics.file_parsed);
         assert!(!diagnostics.fallback_used);
+        assert_eq!(diagnostics.contract_mode, "file_required");
         assert!(diagnostics.hash.is_some());
+    }
+
+    #[test]
+    fn missing_required_field_reports_actionable_error() {
+        std::env::remove_var("TRUSTTUNNEL_LINK_CONFIG_ALLOW_LEGACY_FALLBACK");
+        std::env::remove_var("TRUSTTUNNEL_TT_LINK_HOST");
+        std::env::remove_var("TRUSTTUNNEL_TT_LINK_PORT");
+        std::env::remove_var("TRUSTTUNNEL_TT_LINK_PROTOCOL");
+        std::env::remove_var("TRUSTTUNNEL_TT_LINK_CUSTOM_SNI");
+        std::env::remove_var("TRUSTTUNNEL_TT_LINK_DNS_SERVERS");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tt-link.toml");
+        std::fs::write(
+            &path,
+            r#"
+server_address = "edge.example.com:443"
+cert_domain = "edge.example.com"
+protocol = "http2"
+"#,
+        )
+        .unwrap();
+
+        let err = LinkGenerationConfig::load_from_file_or_legacy_env(&path, "node-a").unwrap_err();
+        assert!(err.contains("missing field `node_external_id`"));
+        assert!(err.contains("required fields [node_external_id, server_address, cert_domain, protocol]"));
+    }
+
+    #[test]
+    fn diagnostics_report_legacy_fallback_contract_mode() {
+        std::env::set_var("TRUSTTUNNEL_LINK_CONFIG_ALLOW_LEGACY_FALLBACK", "true");
+        std::env::set_var("TRUSTTUNNEL_TT_LINK_HOST", "legacy.example.com");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.toml");
+
+        let (_, diagnostics) = LinkGenerationConfig::load_with_diagnostics(&path, "node-a").unwrap();
+        assert!(diagnostics.fallback_used);
+        assert_eq!(diagnostics.contract_mode, "legacy_fallback");
+
+        std::env::remove_var("TRUSTTUNNEL_LINK_CONFIG_ALLOW_LEGACY_FALLBACK");
+        std::env::remove_var("TRUSTTUNNEL_TT_LINK_HOST");
     }
 }
