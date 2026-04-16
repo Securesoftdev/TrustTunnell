@@ -105,8 +105,11 @@ enum LkBulkSink {
 
 #[derive(Serialize)]
 struct LkBulkApiRequest {
+    contract_version: &'static str,
     external_node_id: String,
     artifacts: Vec<LkBulkApiArtifactRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot_version: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -115,19 +118,14 @@ struct LkBulkApiArtifactRequest {
     username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     credential_external_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    link: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    link_revision: Option<String>,
+    link: String,
+    link_revision: String,
     is_current: bool,
     generated_at: String,
     source: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    display_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    link_hash: Option<String>,
+    display_name: String,
+    source_key: String,
+    link_hash: String,
 }
 
 impl LkBulkWriter {
@@ -269,8 +267,17 @@ impl LkBulkWriter {
 fn validate_records(records: &[LkArtifactRecord]) -> Result<(), String> {
     let mut seen = BTreeSet::new();
     for record in records {
-        if record.username.trim().is_empty() {
-            return Err("LK artifact record has empty username".to_string());
+        let has_username = !record.username.trim().is_empty();
+        let has_credential_external_id = record
+            .credential_external_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|item| !item.is_empty());
+        if !has_username && !has_credential_external_id {
+            return Err(
+                "LK artifact record requires non-empty username or credential_external_id"
+                    .to_string(),
+            );
         }
         if record.external_node_id.trim().is_empty() {
             return Err(format!(
@@ -293,6 +300,7 @@ async fn write_via_api(
     records: Vec<LkArtifactRecord>,
 ) -> Result<LkBatchWriteResult, String> {
     let request_payload = build_api_request(records)?;
+    log_api_payload_shape(endpoint, &request_payload)?;
     let mut request = client.post(endpoint).json(&request_payload);
     if let Some(token) = service_token.map(str::trim).filter(|item| !item.is_empty()) {
         request = request.bearer_auth(token);
@@ -311,10 +319,12 @@ async fn write_via_api(
     }
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
+        let diagnostics = render_payload_diagnostics(&request_payload)?;
         return Err(format!(
-            "LK bulk API returned HTTP {}: {}",
+            "LK bulk API returned HTTP {}: {}. {}",
             status.as_u16(),
-            body.trim()
+            body.trim(),
+            diagnostics
         ));
     }
 
@@ -585,24 +595,114 @@ fn build_api_request(records: Vec<LkArtifactRecord>) -> Result<LkBulkApiRequest,
             if username.is_none() && credential_external_id.is_none() {
                 return Err("LK artifacts API item requires `username` or `credential_external_id`".to_string());
             }
+            let link = record
+                .tt_link
+                .as_deref()
+                .map(str::trim)
+                .map(ToString::to_string)
+                .filter(|item| !item.is_empty())
+                .ok_or_else(|| "LK artifacts API item requires non-empty `link`".to_string())?;
+            let link_revision = record
+                .config_hash
+                .as_deref()
+                .map(str::trim)
+                .map(ToString::to_string)
+                .filter(|item| !item.is_empty())
+                .ok_or_else(|| "LK artifacts API item requires non-empty `link_revision`".to_string())?;
+            let source_key = record
+                .source_key
+                .as_deref()
+                .map(str::trim)
+                .map(ToString::to_string)
+                .filter(|item| !item.is_empty())
+                .or_else(|| username.clone())
+                .or_else(|| credential_external_id.clone())
+                .ok_or_else(|| "LK artifacts API item requires non-empty `source_key`".to_string())?;
+            let link_hash = record
+                .link_hash
+                .as_deref()
+                .map(str::trim)
+                .map(ToString::to_string)
+                .filter(|item| !item.is_empty())
+                .or_else(|| Some(link_revision.clone()))
+                .ok_or_else(|| "LK artifacts API item requires non-empty `link_hash`".to_string())?;
+            let display_name = record
+                .display_name
+                .as_deref()
+                .map(str::trim)
+                .map(ToString::to_string)
+                .filter(|item| !item.is_empty())
+                .or_else(|| username.clone())
+                .or_else(|| credential_external_id.clone())
+                .ok_or_else(|| "LK artifacts API item requires non-empty `display_name`".to_string())?;
             Ok(LkBulkApiArtifactRequest {
                 username,
                 credential_external_id,
-                link: record.tt_link,
-                link_revision: record.config_hash,
+                link,
+                link_revision,
                 is_current: record.active,
                 generated_at: record.generated_at.unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
                 source: record.source.unwrap_or_else(|| "trusttunnel_classic_agent".to_string()),
-                display_name: record.display_name,
-                source_key: record.source_key,
-                link_hash: record.link_hash,
+                display_name,
+                source_key,
+                link_hash,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(LkBulkApiRequest {
+        contract_version: "v1",
         external_node_id,
         artifacts,
+        snapshot_version: Some("v1"),
     })
+}
+
+fn log_api_payload_shape(endpoint: &str, payload: &LkBulkApiRequest) -> Result<(), String> {
+    let diagnostics = render_payload_diagnostics(payload)?;
+    let sample_artifact = render_redacted_sample_artifact(payload)?;
+    eprintln!(
+        "phase=lk_api_payload_debug endpoint={} external_node_id={} artifacts_count={} diagnostics={} sample_artifact={}",
+        endpoint,
+        payload.external_node_id,
+        payload.artifacts.len(),
+        diagnostics,
+        sample_artifact
+    );
+    Ok(())
+}
+
+fn render_payload_diagnostics(payload: &LkBulkApiRequest) -> Result<String, String> {
+    let value = serde_json::to_value(payload)
+        .map_err(|e| format!("failed to render payload diagnostics: {e}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "failed to render payload diagnostics: root is not object".to_string())?;
+    let top_level_keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    let first_artifact_keys = object
+        .get("artifacts")
+        .and_then(|item| item.as_array())
+        .and_then(|items| items.first())
+        .and_then(|item| item.as_object())
+        .map(|item| item.keys().map(String::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    Ok(format!(
+        "payload_top_level_keys={top_level_keys:?} payload_artifacts_count={} first_artifact_keys={first_artifact_keys:?}",
+        payload.artifacts.len()
+    ))
+}
+
+fn render_redacted_sample_artifact(payload: &LkBulkApiRequest) -> Result<String, String> {
+    let mut sample = serde_json::to_value(payload.artifacts.first())
+        .map_err(|e| format!("failed to render payload sample artifact: {e}"))?;
+    if let Some(obj) = sample.as_object_mut() {
+        for (key, value) in obj {
+            if key == "is_current" {
+                continue;
+            }
+            *value = serde_json::Value::String("[redacted]".to_string());
+        }
+    }
+    serde_json::to_string(&sample).map_err(|e| format!("failed to stringify payload sample artifact: {e}"))
 }
 
 fn parse_api_response_contract(raw: &str) -> Result<LkBatchWriteResult, String> {
@@ -826,12 +926,51 @@ mod tests {
     fn api_request_payload_uses_external_node_and_artifacts_shape() {
         let payload = build_api_request(vec![test_record("alice")]).unwrap();
         let encoded = serde_json::to_value(payload).unwrap();
+        assert_eq!(encoded["contract_version"], "v1");
+        assert_eq!(encoded["snapshot_version"], "v1");
         assert_eq!(encoded["external_node_id"], "node-1");
         assert_eq!(encoded["artifacts"][0]["username"], "alice");
         assert_eq!(encoded["artifacts"][0]["link"], "tt://alice");
         assert_eq!(encoded["artifacts"][0]["link_revision"], "hash-1");
+        assert_eq!(encoded["artifacts"][0]["link_hash"], "abc");
+        assert_eq!(encoded["artifacts"][0]["source_key"], "alice");
+        assert_eq!(encoded["artifacts"][0]["display_name"], "Primary");
         assert_eq!(encoded["artifacts"][0]["is_current"], true);
         assert_eq!(encoded["artifacts"][0]["source"], "classic_agent");
+    }
+
+    #[test]
+    fn api_request_payload_requires_canonical_field_types() {
+        let payload = build_api_request(vec![test_record("alice")]).unwrap();
+        let encoded = serde_json::to_value(payload).unwrap();
+        assert!(encoded["contract_version"].is_string());
+        assert!(encoded["external_node_id"].is_string());
+        assert!(encoded["artifacts"].is_array());
+        assert!(encoded["artifacts"][0]["username"].is_string());
+        assert!(encoded["artifacts"][0]["link"].is_string());
+        assert!(encoded["artifacts"][0]["link_revision"].is_string());
+        assert!(encoded["artifacts"][0]["link_hash"].is_string());
+        assert!(encoded["artifacts"][0]["source_key"].is_string());
+        assert!(encoded["artifacts"][0]["is_current"].is_boolean());
+        assert!(encoded["artifacts"][0]["generated_at"].is_string());
+        assert!(encoded["artifacts"][0]["source"].is_string());
+        assert!(encoded["artifacts"][0]["display_name"].is_string());
+    }
+
+    #[test]
+    fn api_request_payload_supports_credential_external_id_without_username() {
+        let mut record = test_record("alice");
+        record.username = String::new();
+        record.credential_external_id = Some("cred-1".to_string());
+        record.display_name = None;
+        record.source_key = None;
+
+        let payload = build_api_request(vec![record]).unwrap();
+        let encoded = serde_json::to_value(payload).unwrap();
+        assert_eq!(encoded["artifacts"][0]["credential_external_id"], "cred-1");
+        assert_eq!(encoded["artifacts"][0]["source_key"], "cred-1");
+        assert_eq!(encoded["artifacts"][0]["display_name"], "cred-1");
+        assert!(encoded["artifacts"][0].get("username").is_none());
     }
 
     #[test]
@@ -879,6 +1018,7 @@ mod tests {
 
         let request = request_handle.await.unwrap();
         assert!(request.contains("POST /internal/trusttunnel/v1/nodes/node-1/artifacts"));
+        assert!(request.contains("\"contract_version\":\"v1\""));
         assert!(request.contains("\"external_node_id\":\"node-1\""));
         assert!(request.contains("\"artifacts\":["));
     }
@@ -927,6 +1067,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(invalid_error.contains("HTTP 422"));
+        assert!(invalid_error.contains("payload_top_level_keys="));
+        assert!(invalid_error.contains("first_artifact_keys="));
 
         let (not_found_endpoint, _) = run_single_request_server(
             404,
