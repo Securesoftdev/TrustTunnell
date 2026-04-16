@@ -34,8 +34,11 @@ All candidate/debug/state artifacts are written under `TRUSTTUNNEL_RUNTIME_DIR` 
 
 Validation policy for candidate credentials:
 
-- `candidate_credentials_syntax_validation` is a diagnostic precheck (`syntax_precheck`) and
-  does not decide accept/reject on its own.
+- `candidate_credentials_syntax_validation` is fail-fast by default and blocks
+  apply/export/write if candidate TOML is invalid.
+- Optional debug mode:
+  `TRUSTTUNNEL_CANDIDATE_SYNTAX_DIAGNOSTIC_ONLY=true` keeps syntax validation
+  diagnostic-only and allows runtime validation to continue.
 - Canonical credentials shape is `[[client]]` array-of-tables with string
   `username` and `password` in every entry.
 - Canonical validation route is `endpoint_runtime_validation`, which executes the

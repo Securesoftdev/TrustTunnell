@@ -2,6 +2,9 @@
 
 ## 1.0.28
 
+- [Fix] `classic_agent` sidecar reconcile now falls back to runtime credentials as source inventory when bootstrap source is not configured, preventing false mass-delete plans (`found=0/deleted=N`) and preserving `[[client]]` candidate generation.
+- [Fix] `classic_agent` candidate syntax validation is now fail-fast by default (with optional debug-only mode via `TRUSTTUNNEL_CANDIDATE_SYNTAX_DIAGNOSTIC_ONLY=true`), so invalid candidate credentials stop the pipeline before runtime startup validation.
+
 - [Feature] `classic_agent` now reads TT link generation settings from `agent-link-config.toml`-compatible config (with `server_address`, `cert_domain`, `custom_sni`, `protocol`, and `dns_servers`) and exports a full connect bundle payload so LK can store and return ready-to-use TT links without rebuilding deep-link fields.
 - [Feature] `classic_agent` now generates deterministic per-account TrustTunnel deep links from synced LK access bundles and sends them back in `sync-report` payloads for LK-side storage and user delivery.
 - [Fix] `classic_agent` sync checksum validation now rejects mismatched 64-hex checksums instead of accepting any hex-like value, preventing false-positive sync applies.
