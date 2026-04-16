@@ -313,7 +313,7 @@ impl Config {
         let reconcile_interval = duration_required_from_env("AGENT_RECONCILE_INTERVAL_SEC")?;
         let apply_interval = duration_required_from_env("AGENT_APPLY_INTERVAL_SEC")?;
 
-        let (lk_base_url, lk_service_token, node_stage, node_cluster, node_namespace, node_rollout_group, heartbeat_interval, sync_path_template, sync_report_path) =
+        let (lk_base_url, mut lk_service_token, node_stage, node_cluster, node_namespace, node_rollout_group, heartbeat_interval, sync_path_template, sync_report_path) =
             if runtime_mode == RuntimeMode::LegacyHttp {
                 (
                     Some(required_env("LK_BASE_URL")?),
@@ -335,6 +335,14 @@ impl Config {
             } else {
                 (None, None, None, None, None, None, None, None, None)
             };
+        if runtime_mode == RuntimeMode::DbWorker {
+            lk_service_token = optional_env_nonempty("LK_SERVICE_TOKEN");
+        }
+        if lk_write_contract == LkWriteContract::Api && lk_service_token.is_none() {
+            return Err(
+                "LK_SERVICE_TOKEN is required when LK_WRITE_CONTRACT=api".to_string(),
+            );
+        }
 
         let apply_cmd = std::env::var("TRUSTTUNNEL_APPLY_CMD")
             .ok()
@@ -1010,6 +1018,7 @@ impl Agent {
         let writer = LkBulkWriter::from_contract(
             self.cfg.lk_write_contract,
             &self.cfg.lk_db_dsn,
+            &self.cfg.node_external_id,
             self.cfg.lk_service_token.clone(),
         )?;
         let mut records = upsert_accounts
@@ -1023,6 +1032,18 @@ impl Agent {
                 tt_link: generated_links.get(&account.username).cloned(),
                 config_hash: Some(snapshot.export_config_hash.clone()),
                 active: true,
+                credential_external_id: None,
+                generated_at: Some(
+                    chrono::DateTime::from_timestamp(snapshot.generated_at_unix_sec, 0)
+                        .unwrap_or_else(chrono::Utc::now)
+                        .to_rfc3339(),
+                ),
+                source: Some("classic_agent".to_string()),
+                display_name: link_cfg.display_name(),
+                source_key: Some(account.username.clone()),
+                link_hash: generated_links
+                    .get(&account.username)
+                    .map(|item| sha256_hex(item.as_bytes())),
             })
             .collect::<Vec<_>>();
         records.extend(delta.removed.iter().map(|username| LkArtifactRecord {
@@ -1033,8 +1054,54 @@ impl Agent {
             tt_link: None,
             config_hash: Some(snapshot.export_config_hash.clone()),
             active: false,
+            credential_external_id: None,
+            generated_at: Some(
+                chrono::DateTime::from_timestamp(snapshot.generated_at_unix_sec, 0)
+                    .unwrap_or_else(chrono::Utc::now)
+                    .to_rfc3339(),
+            ),
+            source: Some("classic_agent".to_string()),
+            display_name: link_cfg.display_name(),
+            source_key: Some(username.clone()),
+            link_hash: None,
         }));
-        let mut write_result = writer.write_batch(records).await?;
+        let records_count = records.len();
+        let endpoint = writer.selected_endpoint().unwrap_or("n/a");
+        println!(
+            "phase=lk_api_write_begin contract={} endpoint={} external_node_id={} records_count={}",
+            writer.active_contract(),
+            endpoint,
+            self.cfg.node_external_id,
+            records_count
+        );
+        let mut write_result = match writer.write_batch(records).await {
+            Ok(result) => {
+                println!(
+                    "phase=lk_api_write_ok contract={} endpoint={} external_node_id={} records_count={} response_summary={{created:{},updated:{},unchanged:{},deactivated:{},failed:{}}}",
+                    writer.active_contract(),
+                    endpoint,
+                    self.cfg.node_external_id,
+                    records_count,
+                    result.created,
+                    result.updated,
+                    result.unchanged,
+                    result.deactivated,
+                    result.failed
+                );
+                result
+            }
+            Err(err) => {
+                eprintln!(
+                    "phase=lk_api_write_failed contract={} endpoint={} external_node_id={} records_count={} error={}",
+                    writer.active_contract(),
+                    endpoint,
+                    self.cfg.node_external_id,
+                    records_count,
+                    err
+                );
+                return Err(err);
+            }
+        };
         if export_failed > 0 {
             write_result.failed += export_failed;
             write_result.failures.extend(export_failures.clone());
