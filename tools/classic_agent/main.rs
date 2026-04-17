@@ -45,6 +45,7 @@ const REGISTER_MAX_BACKOFF: Duration = Duration::from_secs(60);
 const HEARTBEAT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const HEARTBEAT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const HEARTBEAT_MAX_ATTEMPTS: usize = 3;
+const DEFAULT_DB_WORKER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const INVENTORY_INGEST_ATTEMPTS: usize = 3;
 const INVENTORY_INGEST_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const SYNC_REPORT_OUTBOX_FILE: &str = "pending_sync_reports.jsonl";
@@ -200,7 +201,7 @@ struct Config {
     agent_state_path: PathBuf,
     reconcile_interval: Duration,
     apply_interval: Duration,
-    heartbeat_interval: Option<Duration>,
+    heartbeat_interval: Duration,
     sync_path_template: Option<String>,
     sync_report_path: Option<String>,
     apply_cmd: Option<String>,
@@ -317,7 +318,7 @@ impl Config {
         let reconcile_interval = duration_required_from_env("AGENT_RECONCILE_INTERVAL_SEC")?;
         let apply_interval = duration_required_from_env("AGENT_APPLY_INTERVAL_SEC")?;
 
-        let (lk_base_url, mut lk_service_token, node_stage, node_cluster, node_namespace, node_rollout_group, heartbeat_interval, sync_path_template, sync_report_path) =
+        let (lk_base_url, lk_service_token, node_stage, node_cluster, node_namespace, node_rollout_group, heartbeat_interval, sync_path_template, sync_report_path) =
             if runtime_mode == RuntimeMode::LegacyHttp {
                 (
                     Some(required_env("LK_BASE_URL")?),
@@ -326,7 +327,7 @@ impl Config {
                     optional_env_nonempty("NODE_CLUSTER"),
                     optional_env_nonempty("NODE_NAMESPACE"),
                     optional_env_nonempty("NODE_ROLLOUT_GROUP"),
-                    Some(duration_required_from_env("AGENT_HEARTBEAT_INTERVAL_SEC")?),
+                    duration_required_from_env("AGENT_HEARTBEAT_INTERVAL_SEC")?,
                     Some(
                         std::env::var("LK_SYNC_PATH_TEMPLATE")
                             .unwrap_or_else(|_| DEFAULT_SYNC_PATH_TEMPLATE.to_string()),
@@ -337,16 +338,31 @@ impl Config {
                     ),
                 )
             } else {
-                (None, None, None, None, None, None, None, None, None)
+                let lifecycle_base_url = optional_env_nonempty("LK_LIFECYCLE_BASE_URL")
+                    .or_else(|| optional_env_nonempty("LK_BASE_URL"))
+                    .or_else(|| derive_lifecycle_base_url_from_artifacts_endpoint(&lk_db_dsn));
+                let service_token = optional_env_nonempty("LK_SERVICE_TOKEN");
+                let heartbeat_interval = optional_env_nonempty("AGENT_HEARTBEAT_INTERVAL_SEC")
+                    .map(|raw| {
+                        let secs = raw
+                            .parse::<u64>()
+                            .map_err(|e| format!("AGENT_HEARTBEAT_INTERVAL_SEC must be u64 seconds: {e}"))?;
+                        Ok::<Duration, String>(Duration::from_secs(secs))
+                    })
+                    .transpose()?
+                    .unwrap_or(DEFAULT_DB_WORKER_HEARTBEAT_INTERVAL);
+                (
+                    lifecycle_base_url,
+                    service_token,
+                    None,
+                    None,
+                    None,
+                    None,
+                    heartbeat_interval,
+                    None,
+                    None,
+                )
             };
-        if runtime_mode == RuntimeMode::DbWorker {
-            lk_service_token = optional_env_nonempty("LK_SERVICE_TOKEN");
-        }
-        if lk_write_contract == LkWriteContract::Api && lk_service_token.is_none() {
-            return Err(
-                "LK_SERVICE_TOKEN is required when LK_WRITE_CONTRACT=api".to_string(),
-            );
-        }
 
         let apply_cmd = std::env::var("TRUSTTUNNEL_APPLY_CMD")
             .ok()
@@ -487,8 +503,43 @@ impl Config {
             runtime_validation_min_users,
             runtime_validation_max_users,
         };
+        cfg.validate_lifecycle_config()?;
         cfg.validate_paths()?;
         Ok(cfg)
+    }
+
+    fn validate_lifecycle_config(&self) -> Result<(), String> {
+        if !self.runtime_mode.supports_lifecycle_writes() {
+            return Ok(());
+        }
+        let Some(base_url) = self.lk_base_url.as_ref().map(|raw| raw.trim()) else {
+            return Err(
+                "lifecycle writes are enabled but lifecycle base URL is missing; set LK_LIFECYCLE_BASE_URL (preferred), LK_BASE_URL, or provide LK_DB_DSN as an artifacts endpoint URL".to_string(),
+            );
+        };
+        if base_url.is_empty() {
+            return Err(
+                "lifecycle writes are enabled but lifecycle base URL is empty; set LK_LIFECYCLE_BASE_URL (preferred) or LK_BASE_URL".to_string(),
+            );
+        }
+        let parsed = reqwest::Url::parse(base_url)
+            .map_err(|e| format!("lifecycle writes are enabled but lifecycle base URL is invalid ({base_url}): {e}"))?;
+        if parsed.host_str().is_none() {
+            return Err(format!(
+                "lifecycle writes are enabled but lifecycle base URL has no host: {base_url}"
+            ));
+        }
+        if self
+            .lk_service_token
+            .as_ref()
+            .map(|raw| raw.trim().is_empty())
+            .unwrap_or(true)
+        {
+            return Err(
+                "lifecycle writes are enabled but LK_SERVICE_TOKEN is missing or empty".to_string(),
+            );
+        }
+        Ok(())
     }
 
     fn validate_paths(&self) -> Result<(), String> {
@@ -618,6 +669,7 @@ impl InventoryIngestSource {
 
 impl Agent {
     async fn new(cfg: Config) -> Result<Self, String> {
+        cfg.validate_lifecycle_config()?;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .no_proxy()
@@ -633,9 +685,18 @@ impl Agent {
             node_namespace: cfg.node_namespace.clone(),
             node_rollout_group: cfg.node_rollout_group.clone(),
         };
+        let lk_base_url = cfg
+            .lk_base_url
+            .clone()
+            .unwrap_or_default();
+        if cfg.runtime_mode.supports_lifecycle_writes() && lk_base_url.trim().is_empty() {
+            return Err(
+                "failed to initialize lifecycle API client: empty lifecycle base URL".to_string(),
+            );
+        }
         let lk_api = LkApiClient::new(
             client,
-            cfg.lk_base_url.clone().unwrap_or_default(),
+            lk_base_url,
             cfg.lk_service_token.clone().unwrap_or_default(),
             DEFAULT_REGISTER_PATH.to_string(),
             DEFAULT_HEARTBEAT_PATH.to_string(),
@@ -754,10 +815,7 @@ impl Agent {
     async fn run_db_worker_loop(&mut self) {
         let lifecycle_writes_supported = self.cfg.runtime_mode.supports_lifecycle_writes();
         let schedule = DbWorkerPhaseSchedule::from_config(&self.cfg);
-        let heartbeat_interval = self
-            .cfg
-            .heartbeat_interval
-            .unwrap_or_else(|| Duration::from_secs(30));
+        let heartbeat_interval = self.cfg.heartbeat_interval;
         println!(
             "db_worker mode enabled for node_external_id={} (dsn_len={}, reconcile_interval_sec={}, apply_interval_sec={}, export_write_interval_sec={}, heartbeat_interval_sec={}, lifecycle_writes_supported={})",
             self.cfg.node_external_id,
@@ -1496,10 +1554,7 @@ impl Agent {
 
     async fn run_legacy_http_loop(&mut self) {
         self.bootstrap_register().await;
-        let heartbeat_interval = self
-            .cfg
-            .heartbeat_interval
-            .unwrap_or_else(|| Duration::from_secs(30));
+        let heartbeat_interval = self.cfg.heartbeat_interval;
 
         let mut poll_tick = interval(self.cfg.reconcile_interval);
         poll_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -3901,6 +3956,24 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(digest.as_ref())
 }
 
+fn derive_lifecycle_base_url_from_artifacts_endpoint(artifacts_endpoint: &str) -> Option<String> {
+    let endpoint = artifacts_endpoint.trim();
+    if endpoint.is_empty() {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(endpoint).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    let mut base_url = format!("{}://{host}", parsed.scheme());
+    if let Some(port) = parsed.port() {
+        base_url.push(':');
+        base_url.push_str(port.to_string().as_str());
+    }
+    Some(base_url)
+}
+
 fn derive_inventory_endpoint(artifacts_endpoint: &str, external_node_id: &str) -> Result<String, String> {
     let resolved = artifacts_endpoint.replace("{externalNodeId}", external_node_id);
     if resolved.trim().is_empty() {
@@ -4383,7 +4456,7 @@ message_queue_capacity = 4096
             agent_state_path: runtime_dir.join("agent_state.json"),
             reconcile_interval: Duration::from_secs(60),
             apply_interval: Duration::from_secs(60),
-            heartbeat_interval: Some(Duration::from_secs(30)),
+            heartbeat_interval: Duration::from_secs(30),
             sync_path_template: Some("/sync/{externalNodeId}".to_string()),
             sync_report_path: Some("/sync-report".to_string()),
             apply_cmd: apply_cmd.map(ToString::to_string),
@@ -4478,11 +4551,11 @@ upload_buffer_size = 32768
         let endpoint_binary = make_fake_endpoint_script(temp_dir, &endpoint_args_log_path);
 
         let cfg = Config {
-            lk_base_url: None,
+            lk_base_url: Some("http://localhost".to_string()),
             runtime_mode: RuntimeMode::DbWorker,
             lk_write_contract: LkWriteContract::PgFunction,
             lk_db_dsn: "postgres://localhost/lk".to_string(),
-            lk_service_token: None,
+            lk_service_token: Some("token".to_string()),
             node_external_id: "node-1".to_string(),
             node_hostname: "node-1.example".to_string(),
             node_stage: None,
@@ -4499,7 +4572,7 @@ upload_buffer_size = 32768
             agent_state_path: runtime_dir.join("agent_state.json"),
             reconcile_interval: Duration::from_secs(10),
             apply_interval: Duration::from_secs(10),
-            heartbeat_interval: None,
+            heartbeat_interval: DEFAULT_DB_WORKER_HEARTBEAT_INTERVAL,
             sync_path_template: None,
             sync_report_path: None,
             apply_cmd: None,
@@ -4725,11 +4798,11 @@ upload_buffer_size = 32768
             }],
         };
         let cfg = Config {
-            lk_base_url: Some("http://localhost".to_string()),
+            lk_base_url: None,
             runtime_mode: RuntimeMode::DbWorker,
             lk_write_contract: LkWriteContract::PgFunction,
             lk_db_dsn: "postgres://localhost/lk".to_string(),
-            lk_service_token: Some("token".to_string()),
+            lk_service_token: None,
             node_external_id: "node-1".to_string(),
             node_hostname: "node-1.example".to_string(),
             node_stage: None,
@@ -4746,7 +4819,7 @@ upload_buffer_size = 32768
             agent_state_path: PathBuf::from("agent_state.json"),
             reconcile_interval: Duration::from_secs(10),
             apply_interval: Duration::from_secs(10),
-            heartbeat_interval: Some(Duration::from_secs(30)),
+            heartbeat_interval: Duration::from_secs(30),
             sync_path_template: Some("/sync/{externalNodeId}".to_string()),
             sync_report_path: Some("/sync-report".to_string()),
             apply_cmd: None,
@@ -4824,11 +4897,11 @@ upload_buffer_size = 32768
         .unwrap();
 
         let cfg = Config {
-            lk_base_url: Some("http://localhost".to_string()),
+            lk_base_url: None,
             runtime_mode: RuntimeMode::DbWorker,
             lk_write_contract: LkWriteContract::PgFunction,
             lk_db_dsn: "postgres://localhost/lk".to_string(),
-            lk_service_token: Some("token".to_string()),
+            lk_service_token: None,
             node_external_id: "node-1".to_string(),
             node_hostname: "node-1.example".to_string(),
             node_stage: None,
@@ -4845,7 +4918,7 @@ upload_buffer_size = 32768
             agent_state_path: PathBuf::from("agent_state.json"),
             reconcile_interval: Duration::from_secs(10),
             apply_interval: Duration::from_secs(10),
-            heartbeat_interval: Some(Duration::from_secs(30)),
+            heartbeat_interval: Duration::from_secs(30),
             sync_path_template: Some("/sync/{externalNodeId}".to_string()),
             sync_report_path: Some("/sync-report".to_string()),
             apply_cmd: None,
@@ -4928,7 +5001,7 @@ upload_buffer_size = 32768
             agent_state_path: PathBuf::from("agent_state.json"),
             reconcile_interval: Duration::from_secs(10),
             apply_interval: Duration::from_secs(10),
-            heartbeat_interval: Some(Duration::from_secs(30)),
+            heartbeat_interval: Duration::from_secs(30),
             sync_path_template: Some("/sync/{externalNodeId}".to_string()),
             sync_report_path: Some("/sync-report".to_string()),
             apply_cmd: None,
@@ -5052,7 +5125,7 @@ upload_buffer_size = 32768
     }
 
     #[tokio::test]
-    async fn db_worker_mode_does_not_require_lk_http_configuration() {
+    async fn db_worker_mode_requires_lifecycle_configuration() {
         let temp_dir = TempDir::new().unwrap();
         let runtime_dir = temp_dir.path().join("runtime");
         fs::create_dir_all(&runtime_dir).await.unwrap();
@@ -5103,7 +5176,7 @@ upload_buffer_size = 32768
             agent_state_path: runtime_dir.join("agent_state.json"),
             reconcile_interval: Duration::from_secs(60),
             apply_interval: Duration::from_secs(60),
-            heartbeat_interval: None,
+            heartbeat_interval: DEFAULT_DB_WORKER_HEARTBEAT_INTERVAL,
             sync_path_template: None,
             sync_report_path: None,
             apply_cmd: None,
@@ -5121,9 +5194,8 @@ upload_buffer_size = 32768
             runtime_validation_max_users: DEFAULT_RUNTIME_VALIDATION_MAX_USERS,
         };
 
-        let agent = Agent::new(cfg).await.unwrap();
-        assert!(agent.cfg.lk_base_url.is_none());
-        assert!(agent.cfg.lk_service_token.is_none());
+        let err = Agent::new(cfg).await.err().unwrap();
+        assert!(err.contains("lifecycle writes are enabled"));
     }
 
     #[tokio::test]
@@ -5567,11 +5639,11 @@ upload_buffer_size = 32768
         let endpoint_binary = make_fake_endpoint_script(&tmp_dir, &endpoint_args_log_path);
 
         let cfg = Config {
-            lk_base_url: None,
+            lk_base_url: Some("http://localhost".to_string()),
             runtime_mode: RuntimeMode::DbWorker,
             lk_write_contract: LkWriteContract::PgFunction,
             lk_db_dsn: "postgres://localhost/lk".to_string(),
-            lk_service_token: None,
+            lk_service_token: Some("token".to_string()),
             node_external_id: "node-1".to_string(),
             node_hostname: "node-1.example".to_string(),
             node_stage: None,
@@ -5588,7 +5660,7 @@ upload_buffer_size = 32768
             agent_state_path: runtime_dir.join("agent_state.json"),
             reconcile_interval: Duration::from_secs(10),
             apply_interval: Duration::from_secs(10),
-            heartbeat_interval: None,
+            heartbeat_interval: DEFAULT_DB_WORKER_HEARTBEAT_INTERVAL,
             sync_path_template: None,
             sync_report_path: None,
             apply_cmd: None,
@@ -6298,6 +6370,23 @@ upload_buffer_size = 32768
     }
 
     #[test]
+    fn derive_lifecycle_base_url_uses_scheme_and_host_from_artifacts_endpoint() {
+        let base_url = derive_lifecycle_base_url_from_artifacts_endpoint(
+            "https://lk.example:8443/internal/trusttunnel/v1/nodes/{externalNodeId}/artifacts",
+        )
+        .unwrap();
+        assert_eq!(base_url, "https://lk.example:8443");
+    }
+
+    #[test]
+    fn derive_lifecycle_base_url_returns_none_for_non_url_dsn() {
+        let postgres = derive_lifecycle_base_url_from_artifacts_endpoint("postgres://localhost/lk");
+        assert!(postgres.is_none());
+        let invalid = derive_lifecycle_base_url_from_artifacts_endpoint("not-a-url");
+        assert!(invalid.is_none());
+    }
+
+    #[test]
     fn inventory_payload_ids_are_stable_for_same_snapshot() {
         let snapshot = credentials_inventory::InventorySnapshot {
             generated_at_unix_sec: 1_710_000_000,
@@ -6384,7 +6473,7 @@ upload_buffer_size = 32768
             agent_state_path: PathBuf::from("/tmp/runtime/agent_state.json"),
             reconcile_interval: Duration::from_secs(17),
             apply_interval: Duration::from_secs(43),
-            heartbeat_interval: None,
+            heartbeat_interval: DEFAULT_DB_WORKER_HEARTBEAT_INTERVAL,
             sync_path_template: None,
             sync_report_path: None,
             apply_cmd: None,
