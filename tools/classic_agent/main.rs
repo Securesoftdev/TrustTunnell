@@ -591,14 +591,29 @@ struct InventoryIngestCredential {
 #[derive(Clone, Debug, Serialize)]
 struct InventoryIngestPayload {
     contract_version: &'static str,
-    snapshot_version: String,
+    snapshot_version: &'static str,
     external_node_id: String,
     source: String,
-    revision: String,
+    revision: i64,
     exported_at: String,
     idempotency_key: String,
     request_id: String,
     credentials: Vec<InventoryIngestCredential>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InventoryIngestSource {
+    Bootstrap,
+    Imported,
+}
+
+impl InventoryIngestSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Bootstrap => "bootstrap",
+            Self::Imported => "imported",
+        }
+    }
 }
 
 impl Agent {
@@ -934,7 +949,11 @@ impl Agent {
         }
 
         println!("phase=export_write_start pass={}", pass);
-        self.sync_local_inventory_export_sidecar().await?;
+        let inventory_source = match pass_kind {
+            sidecar_sync::PassKind::Bootstrap => InventoryIngestSource::Bootstrap,
+            sidecar_sync::PassKind::Reconcile => InventoryIngestSource::Imported,
+        };
+        self.sync_local_inventory_export_sidecar(inventory_source).await?;
 
         if !plan.changed {
             plan.stats.skipped += plan.stats.missing_credentials;
@@ -1078,7 +1097,10 @@ impl Agent {
         }
     }
 
-    async fn sync_local_inventory_export_sidecar(&self) -> Result<(), String> {
+    async fn sync_local_inventory_export_sidecar(
+        &self,
+        inventory_source: InventoryIngestSource,
+    ) -> Result<(), String> {
         let settings_path = resolve_runtime_path(&self.cfg.trusttunnel_runtime_dir, &self.cfg.trusttunnel_config_file);
         let credentials_path = resolve_credentials_path_from_settings(
             &self.cfg.trusttunnel_runtime_dir,
@@ -1143,7 +1165,7 @@ impl Agent {
             let inventory_payload = build_inventory_ingest_payload(
                 &self.cfg.node_external_id,
                 &snapshot,
-                "classic_agent",
+                inventory_source,
             )?;
             println!(
                 "phase=inventory_payload_sent node={} endpoint={} snapshot_version={} revision={} credentials={} idempotency_key={} request_id={}",
@@ -1407,7 +1429,7 @@ impl Agent {
                     let detail = format!(
                         "inventory ingest returned HTTP {} on attempt {attempt}/{INVENTORY_INGEST_ATTEMPTS}: {}",
                         status.as_u16(),
-                        body.trim()
+                        inventory_error_details(body.trim())
                     );
                     if status.is_server_error() && attempt < INVENTORY_INGEST_ATTEMPTS {
                         println!(
@@ -3573,16 +3595,34 @@ fn read_pid(pid_path: &Path) -> Option<u32> {
 }
 
 fn find_pid_by_name(process_name: &str) -> Option<u32> {
+    let candidates = process_name_candidates(process_name);
     let entries = read_dir("/proc").ok()?;
     for entry in entries.flatten() {
         let file_name = entry.file_name();
         let pid = file_name.to_str()?.parse::<u32>().ok()?;
         let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
-        if comm.trim() == process_name {
+        if candidates.iter().any(|item| comm.trim() == item) {
             return Some(pid);
         }
     }
     None
+}
+
+fn process_name_candidates(process_name: &str) -> Vec<String> {
+    let normalized = process_name.trim();
+    if normalized.is_empty() {
+        return vec!["trusttunnel_endpoint".to_string()];
+    }
+    let mut candidates = vec![normalized.to_string()];
+    let hyphen = normalized.replace('_', "-");
+    if hyphen != normalized {
+        candidates.push(hyphen);
+    }
+    let underscore = normalized.replace('-', "_");
+    if underscore != normalized && !candidates.iter().any(|item| item == &underscore) {
+        candidates.push(underscore);
+    }
+    candidates
 }
 
 fn is_pid_alive(pid: u32) -> bool {
@@ -3703,6 +3743,17 @@ mod runtime_status_tests {
     #[test]
     fn normalize_health_status_uses_safe_default_for_unknown_values() {
         assert_eq!(normalize_health_status("something-new"), "degraded");
+    }
+
+    #[test]
+    fn process_name_candidates_accept_hyphen_and_underscore_variants() {
+        let from_underscore = process_name_candidates("trusttunnel_endpoint");
+        assert!(from_underscore.contains(&"trusttunnel_endpoint".to_string()));
+        assert!(from_underscore.contains(&"trusttunnel-endpoint".to_string()));
+
+        let from_hyphen = process_name_candidates("trusttunnel-endpoint");
+        assert!(from_hyphen.contains(&"trusttunnel-endpoint".to_string()));
+        assert!(from_hyphen.contains(&"trusttunnel_endpoint".to_string()));
     }
 }
 
@@ -3852,7 +3903,7 @@ fn derive_inventory_endpoint(artifacts_endpoint: &str, external_node_id: &str) -
 fn build_inventory_ingest_payload(
     external_node_id: &str,
     snapshot: &credentials_inventory::InventorySnapshot,
-    source: &str,
+    source: InventoryIngestSource,
 ) -> Result<InventoryIngestPayload, String> {
     let mut credentials = snapshot
         .credentials
@@ -3875,7 +3926,6 @@ fn build_inventory_ingest_payload(
     }
     let logical_hash = sha256_hex(seed.as_bytes());
     let idempotency_key = trim_id(format!("inventory-v1-{logical_hash}"), 128);
-    let snapshot_version = trim_id(format!("inventory-v1-{logical_hash}"), 128);
     let request_id = trim_id(format!("inventory-req-{logical_hash}"), 128);
     let exported_at = chrono::DateTime::from_timestamp(snapshot.generated_at_unix_sec, 0)
         .ok_or_else(|| {
@@ -3888,15 +3938,67 @@ fn build_inventory_ingest_payload(
 
     Ok(InventoryIngestPayload {
         contract_version: "v1",
-        snapshot_version,
+        snapshot_version: "v1",
         external_node_id: external_node_id.to_string(),
-        source: source.to_string(),
-        revision: snapshot.export_config_hash.clone(),
+        source: source.as_str().to_string(),
+        revision: snapshot.generated_at_unix_sec,
         exported_at,
         idempotency_key,
         request_id,
         credentials,
     })
+}
+
+fn inventory_error_details(raw_body: &str) -> String {
+    let trimmed = raw_body.trim();
+    if trimmed.is_empty() {
+        return "<empty response body>".to_string();
+    }
+    if let Some(detail) = extract_contract_mismatch_detail(trimmed) {
+        return format!("{trimmed} (contract_mismatch={detail})");
+    }
+    trimmed.to_string()
+}
+
+fn extract_contract_mismatch_detail(raw_body: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(raw_body).ok()?;
+    if let Some(field) = value
+        .pointer("/field")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        let message = value
+            .pointer("/message")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .unwrap_or("invalid field value");
+        return Some(format!("{field}: {message}"));
+    }
+    if let Some(errors) = value.get("errors").and_then(serde_json::Value::as_array) {
+        let detailed = errors
+            .iter()
+            .filter_map(|item| {
+                let field = item
+                    .get("field")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|x| !x.is_empty())?;
+                let message = item
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|x| !x.is_empty())
+                    .unwrap_or("invalid field value");
+                Some(format!("{field}: {message}"))
+            })
+            .collect::<Vec<_>>();
+        if !detailed.is_empty() {
+            return Some(detailed.join(", "));
+        }
+    }
+    None
 }
 
 fn trim_id(value: String, limit: usize) -> String {
@@ -5607,7 +5709,10 @@ upload_buffer_size = 32768
         agent.cfg.lk_db_dsn = endpoint;
         agent.cfg.lk_service_token = Some("token".to_string());
 
-        agent.sync_local_inventory_export_sidecar().await.unwrap();
+        agent
+            .sync_local_inventory_export_sidecar(InventoryIngestSource::Imported)
+            .await
+            .unwrap();
         let requests = request_handle.await.unwrap();
         assert_eq!(requests.len(), 2);
         assert!(requests[0].contains("POST /internal/trusttunnel/v1/nodes/node-1/inventory"));
@@ -5651,7 +5756,10 @@ upload_buffer_size = 32768
         agent.cfg.lk_db_dsn = endpoint;
         agent.cfg.lk_service_token = Some("token".to_string());
 
-        let err = agent.sync_local_inventory_export_sidecar().await.unwrap_err();
+        let err = agent
+            .sync_local_inventory_export_sidecar(InventoryIngestSource::Imported)
+            .await
+            .unwrap_err();
         assert!(err.contains("HTTP 500"));
         assert!(!fs::try_exists(&state_path).await.unwrap());
     }
@@ -5678,7 +5786,10 @@ upload_buffer_size = 32768
         agent.cfg.lk_db_dsn = endpoint;
         agent.cfg.lk_service_token = Some("token".to_string());
 
-        let err = agent.sync_local_inventory_export_sidecar().await.unwrap_err();
+        let err = agent
+            .sync_local_inventory_export_sidecar(InventoryIngestSource::Imported)
+            .await
+            .unwrap_err();
         assert!(err.contains("inventory ingest returned HTTP 500"));
         assert!(!fs::try_exists(&state_path).await.unwrap());
     }
@@ -6184,11 +6295,57 @@ upload_buffer_size = 32768
                 password: "secret".to_string(),
             }],
         };
-        let first = build_inventory_ingest_payload("node-1", &snapshot, "classic_agent").unwrap();
-        let second = build_inventory_ingest_payload("node-1", &snapshot, "classic_agent").unwrap();
+        let first =
+            build_inventory_ingest_payload("node-1", &snapshot, InventoryIngestSource::Imported)
+                .unwrap();
+        let second =
+            build_inventory_ingest_payload("node-1", &snapshot, InventoryIngestSource::Imported)
+                .unwrap();
         assert_eq!(first.idempotency_key, second.idempotency_key);
-        assert_eq!(first.snapshot_version, second.snapshot_version);
         assert_eq!(first.request_id, second.request_id);
+        assert_eq!(first.snapshot_version, "v1");
+    }
+
+    #[test]
+    fn inventory_payload_matches_lk_contract_v1_shape() {
+        let snapshot = credentials_inventory::InventorySnapshot {
+            generated_at_unix_sec: 1_710_000_000,
+            export_config_hash: "cfg-hash".to_string(),
+            credentials: vec![credentials_inventory::InventoryAccount {
+                username: "alice".to_string(),
+                password: "secret".to_string(),
+            }],
+        };
+        let payload =
+            build_inventory_ingest_payload("node-1", &snapshot, InventoryIngestSource::Bootstrap)
+                .unwrap();
+        let value = serde_json::to_value(&payload).unwrap();
+
+        assert_eq!(value["contract_version"], "v1");
+        assert_eq!(value["snapshot_version"], "v1");
+        assert_eq!(value["external_node_id"], "node-1");
+        assert_eq!(value["source"], "bootstrap");
+        assert!(value["revision"].is_i64());
+        assert_eq!(value["revision"], 1_710_000_000_i64);
+        assert!(value["exported_at"].as_str().unwrap().contains('T'));
+        assert!(value["idempotency_key"].as_str().unwrap().starts_with("inventory-v1-"));
+        assert!(value["request_id"].as_str().unwrap().starts_with("inventory-req-"));
+        assert_eq!(value["credentials"][0]["username"], "alice");
+        assert_eq!(value["credentials"][0]["password"], "secret");
+    }
+
+    #[test]
+    fn inventory_source_uses_only_contract_values() {
+        assert_eq!(InventoryIngestSource::Bootstrap.as_str(), "bootstrap");
+        assert_eq!(InventoryIngestSource::Imported.as_str(), "imported");
+    }
+
+    #[test]
+    fn inventory_error_details_include_field_level_mismatch() {
+        let body = r#"{"error":"invalid_input","errors":[{"field":"snapshot_version","message":"must be equal to v1"}]}"#;
+        let rendered = inventory_error_details(body);
+        assert!(rendered.contains("snapshot_version"));
+        assert!(rendered.contains("must be equal to v1"));
     }
 
     #[test]
