@@ -281,7 +281,7 @@ impl RuntimeMode {
     }
 
     fn supports_lifecycle_writes(self) -> bool {
-        matches!(self, Self::LegacyHttp)
+        matches!(self, Self::DbWorker | Self::LegacyHttp)
     }
 }
 
@@ -754,18 +754,24 @@ impl Agent {
     async fn run_db_worker_loop(&mut self) {
         let lifecycle_writes_supported = self.cfg.runtime_mode.supports_lifecycle_writes();
         let schedule = DbWorkerPhaseSchedule::from_config(&self.cfg);
+        let heartbeat_interval = self
+            .cfg
+            .heartbeat_interval
+            .unwrap_or_else(|| Duration::from_secs(30));
         println!(
-            "db_worker mode enabled for node_external_id={} (dsn_len={}, reconcile_interval_sec={}, apply_interval_sec={}, export_write_interval_sec={}, lifecycle_writes_supported={})",
+            "db_worker mode enabled for node_external_id={} (dsn_len={}, reconcile_interval_sec={}, apply_interval_sec={}, export_write_interval_sec={}, heartbeat_interval_sec={}, lifecycle_writes_supported={})",
             self.cfg.node_external_id,
             self.cfg.lk_db_dsn.len(),
             schedule.reconcile_plan_interval.as_secs(),
             schedule.apply_interval.as_secs(),
             schedule.export_write_interval.as_secs(),
+            heartbeat_interval.as_secs(),
             lifecycle_writes_supported
         );
         println!(
-            "phase=startup mode=db_worker lifecycle_writes=unsupported details=\"node metadata/status/revision writes are disabled; only access artifact bulk writes are enabled\""
+            "phase=startup mode=db_worker lifecycle_writes=enabled level=minimal details=\"register+heartbeat enabled; metadata/status/revision writes remain disabled\""
         );
+        self.bootstrap_register().await;
         if let Err(err) = self
             .run_sidecar_sync_pass(sidecar_sync::PassKind::Bootstrap)
             .await
@@ -782,12 +788,18 @@ impl Agent {
         reconcile_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut apply_tick = interval(schedule.apply_interval);
         apply_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut heartbeat_tick = interval(heartbeat_interval);
+        heartbeat_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut backoff = Duration::from_secs(1);
         let mut pending_plan: Option<sidecar_sync::ReconcilePlan> = None;
         loop {
             let tick_kind = tokio::select! {
                 _ = reconcile_tick.tick() => DbWorkerTickKind::Reconcile,
                 _ = apply_tick.tick() => DbWorkerTickKind::Apply,
+                _ = heartbeat_tick.tick() => {
+                    self.send_heartbeat_with_retry().await;
+                    continue;
+                }
             };
             match tick_kind {
                 DbWorkerTickKind::Reconcile => {
@@ -5035,7 +5047,7 @@ upload_buffer_size = 32768
 
     #[test]
     fn lifecycle_writes_support_depends_on_runtime_mode() {
-        assert!(!RuntimeMode::DbWorker.supports_lifecycle_writes());
+        assert!(RuntimeMode::DbWorker.supports_lifecycle_writes());
         assert!(RuntimeMode::LegacyHttp.supports_lifecycle_writes());
     }
 
