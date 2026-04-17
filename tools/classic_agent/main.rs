@@ -622,6 +622,7 @@ struct Agent {
     state: AgentState,
     node_metadata: NodeMetadata,
     last_apply_status: String,
+    db_worker_health: DbWorkerHealthState,
     metrics: Arc<AgentMetrics>,
     sync_report_backoff: Duration,
     sync_report_next_retry_at: Instant,
@@ -650,6 +651,11 @@ struct InventoryIngestPayload {
     idempotency_key: String,
     request_id: String,
     credentials: Vec<InventoryIngestCredential>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct InventoryIngestAttempt {
+    had_retry: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -717,6 +723,7 @@ impl Agent {
             state,
             node_metadata,
             last_apply_status: "pending".to_string(),
+            db_worker_health: DbWorkerHealthState::default(),
             metrics,
             sync_report_backoff: SYNC_REPORT_INITIAL_BACKOFF,
             sync_report_next_retry_at: Instant::now(),
@@ -790,6 +797,7 @@ impl Agent {
         if !is_executable_file(Path::new(&self.cfg.endpoint_binary))
             && !is_command_available_in_path(&self.cfg.endpoint_binary).await
         {
+            self.db_worker_health.runtime_prerequisites_valid = false;
             println!(
                 "phase=endpoint_binary_check_failed node={} endpoint_bin_path={} found=false executable=false",
                 self.cfg.node_external_id, self.cfg.endpoint_binary
@@ -809,6 +817,7 @@ impl Agent {
             "phase=endpoint_binary_check_ok node={} endpoint_bin_path={} found=true executable={}",
             self.cfg.node_external_id, self.cfg.endpoint_binary, executable
         );
+        self.db_worker_health.runtime_prerequisites_valid = true;
         Ok(())
     }
 
@@ -976,8 +985,12 @@ impl Agent {
                 .validate_candidate_credentials_pipeline(tmp_credentials_path)
                 .await
             {
-                Ok(files) => files,
+                Ok(files) => {
+                    self.db_worker_health.candidate_validation_valid = true;
+                    files
+                }
                 Err(err) => {
+                    self.db_worker_health.candidate_validation_valid = false;
                     plan.stats.errors += 1;
                     self.update_sidecar_sync_metrics(pass, &plan.stats);
                     return Err(err);
@@ -1003,6 +1016,7 @@ impl Agent {
                 Err(err) => Err(err),
             };
             if let Err(apply_err) = apply_result {
+                self.db_worker_health.candidate_validation_valid = false;
                 let rollback_result = self.rollback_runtime(previous_runtime_credentials).await;
                 plan.stats.errors += 1;
                 self.update_sidecar_sync_metrics(pass, &plan.stats);
@@ -1016,6 +1030,7 @@ impl Agent {
             self.state.credentials_sha256 = plan.rendered_sha256.clone();
             self.mark_runtime_as_primary().await?;
             persist_state(&self.cfg.agent_state_path, &self.state).await?;
+            self.db_worker_health.candidate_validation_valid = true;
         }
 
         println!("phase=export_write_start pass={}", pass);
@@ -1168,7 +1183,7 @@ impl Agent {
     }
 
     async fn sync_local_inventory_export_sidecar(
-        &self,
+        &mut self,
         inventory_source: InventoryIngestSource,
     ) -> Result<(), String> {
         let settings_path = resolve_runtime_path(&self.cfg.trusttunnel_runtime_dir, &self.cfg.trusttunnel_config_file);
@@ -1247,7 +1262,18 @@ impl Agent {
                 inventory_payload.idempotency_key,
                 inventory_payload.request_id
             );
-            self.post_inventory_with_retry(&inventory_payload).await?;
+            let inventory_attempt = match self.post_inventory_with_retry(&inventory_payload).await {
+                Ok(attempt) => attempt,
+                Err(err) => {
+                    self.db_worker_health.inventory_status = DbWorkerSignalStatus::Degraded;
+                    return Err(err);
+                }
+            };
+            self.db_worker_health.inventory_status = if inventory_attempt.had_retry {
+                DbWorkerSignalStatus::Degraded
+            } else {
+                DbWorkerSignalStatus::Ok
+            };
             println!(
                 "phase=inventory_payload_accepted node={} snapshot_version={} revision={} credentials={} idempotency_key={} request_id={} reconcile_ready=true",
                 self.cfg.node_external_id,
@@ -1258,6 +1284,7 @@ impl Agent {
                 inventory_payload.request_id
             );
         } else {
+            self.db_worker_health.inventory_status = DbWorkerSignalStatus::Disabled;
             println!(
                 "phase=inventory_payload_skipped node={} contract={} reconcile_ready=false reason=inventory_requires_api_contract",
                 self.cfg.node_external_id,
@@ -1417,6 +1444,7 @@ impl Agent {
                 result
             }
             Err(err) => {
+                self.db_worker_health.artifacts_status = DbWorkerSignalStatus::Degraded;
                 eprintln!(
                     "phase=lk_api_write_failed contract={} endpoint={} external_node_id={} records_count={} error={}",
                     writer.active_contract(),
@@ -1440,6 +1468,11 @@ impl Agent {
         if write_result.failed == 0 {
             persist_inventory_state(&state_path, &snapshot)?;
         }
+        self.db_worker_health.artifacts_status = if write_result.failed == 0 {
+            DbWorkerSignalStatus::Ok
+        } else {
+            DbWorkerSignalStatus::Degraded
+        };
         println!(
             "phase=inventory_sync node={} inventory_counts={{credentials:{},missing:{},stale:{},removed:{}}} export_counts={{generated:{},failed:{}}} write_counts={{created:{},updated:{},unchanged:{},deactivated:{},failed:{}}}",
             self.cfg.node_external_id,
@@ -1468,9 +1501,10 @@ impl Agent {
     async fn post_inventory_with_retry(
         &self,
         payload: &InventoryIngestPayload,
-    ) -> Result<(), String> {
+    ) -> Result<InventoryIngestAttempt, String> {
         let endpoint = derive_inventory_endpoint(&self.cfg.lk_db_dsn, &self.cfg.node_external_id)?;
         let mut backoff = INVENTORY_INGEST_INITIAL_BACKOFF;
+        let mut had_retry = false;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .no_proxy()
@@ -1491,7 +1525,7 @@ impl Agent {
             let response = request.send().await;
             match response {
                 Ok(resp) if resp.status().is_success() => {
-                    return Ok(());
+                    return Ok(InventoryIngestAttempt { had_retry });
                 }
                 Ok(resp) => {
                     let status = resp.status();
@@ -1502,6 +1536,7 @@ impl Agent {
                         inventory_error_details(body.trim())
                     );
                     if status.is_server_error() && attempt < INVENTORY_INGEST_ATTEMPTS {
+                        had_retry = true;
                         println!(
                             "phase=inventory_payload_retry node={} endpoint={} attempt={} backoff_sec={} reason=server_error status={}",
                             self.cfg.node_external_id,
@@ -1524,6 +1559,7 @@ impl Agent {
                 }
                 Err(err) => {
                     if attempt < INVENTORY_INGEST_ATTEMPTS {
+                        had_retry = true;
                         println!(
                             "phase=inventory_payload_retry node={} endpoint={} attempt={} backoff_sec={} reason=network_error error={}",
                             self.cfg.node_external_id,
@@ -2144,24 +2180,32 @@ impl Agent {
     }
 
     async fn send_heartbeat(&self) -> Result<(), HeartbeatFailure> {
-        let runtime_status = RuntimeStatus::collect(
-            self.cfg
-                .runtime_pid_path
-                .as_deref()
-                .unwrap_or_else(|| Path::new("trusttunnel.pid")),
-            self.cfg
-                .runtime_process_name
-                .as_deref()
-                .unwrap_or("trusttunnel_endpoint"),
-            &self.cfg.runtime_credentials_path,
-        );
+        let runtime_status = match self.cfg.runtime_mode {
+            RuntimeMode::DbWorker => RuntimeStatus::collect_db_worker(&self.cfg.runtime_credentials_path),
+            RuntimeMode::LegacyHttp => RuntimeStatus::collect(
+                self.cfg
+                    .runtime_pid_path
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new("trusttunnel.pid")),
+                self.cfg
+                    .runtime_process_name
+                    .as_deref()
+                    .unwrap_or("trusttunnel_endpoint"),
+                &self.cfg.runtime_credentials_path,
+            ),
+        };
+        let raw_health_status = match self.cfg.runtime_mode {
+            RuntimeMode::DbWorker => self.db_worker_health.health_status(),
+            RuntimeMode::LegacyHttp => runtime_status.health_status(),
+        };
         let current_revision = self.state.applied_revision.as_deref().unwrap_or("");
         let normalized_payload = normalize_heartbeat_payload(
             current_revision,
-            runtime_status.health_status(),
+            raw_health_status,
             &self.last_apply_status,
             &self.cfg.agent_version,
             &self.cfg.runtime_version,
+            self.cfg.runtime_mode,
         );
         if let Some(metric) = &self.metrics.endpoint_process_status {
             metric
@@ -2867,6 +2911,57 @@ struct RuntimeStatus {
     memory_percent: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DbWorkerSignalStatus {
+    Unknown,
+    Ok,
+    Degraded,
+    Disabled,
+}
+
+impl DbWorkerSignalStatus {
+    fn is_disabled(self) -> bool {
+        matches!(self, Self::Disabled)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DbWorkerHealthState {
+    inventory_status: DbWorkerSignalStatus,
+    artifacts_status: DbWorkerSignalStatus,
+    candidate_validation_valid: bool,
+    runtime_prerequisites_valid: bool,
+}
+
+impl Default for DbWorkerHealthState {
+    fn default() -> Self {
+        Self {
+            inventory_status: DbWorkerSignalStatus::Unknown,
+            artifacts_status: DbWorkerSignalStatus::Unknown,
+            candidate_validation_valid: true,
+            runtime_prerequisites_valid: true,
+        }
+    }
+}
+
+impl DbWorkerHealthState {
+    fn health_status(&self) -> &'static str {
+        if !self.runtime_prerequisites_valid
+            || !self.candidate_validation_valid
+            || self.inventory_status.is_disabled()
+            || self.artifacts_status.is_disabled()
+        {
+            return "disabled";
+        }
+        if matches!(self.inventory_status, DbWorkerSignalStatus::Ok)
+            && matches!(self.artifacts_status, DbWorkerSignalStatus::Ok)
+        {
+            return "ok";
+        }
+        "degraded"
+    }
+}
+
 struct AgentMetrics {
     registry: Registry,
     reconcile_total: IntCounterVec,
@@ -3094,12 +3189,13 @@ fn normalize_heartbeat_payload(
     last_apply_status: &str,
     agent_version: &str,
     runtime_version: &str,
+    runtime_mode: RuntimeMode,
 ) -> NormalizedHeartbeatPayload {
     let _ = normalize_required_string(agent_version, "unknown");
     let _ = normalize_required_string(runtime_version, "unknown");
     NormalizedHeartbeatPayload {
         current_revision: normalize_optional_revision(current_revision),
-        health_status: normalize_health_status(health_status),
+        health_status: normalize_health_status(health_status, runtime_mode),
         last_apply_status: normalize_last_apply_status(last_apply_status),
     }
 }
@@ -3131,13 +3227,23 @@ fn normalize_required_string(value: &str, fallback: &str) -> String {
     normalized.to_string()
 }
 
-fn normalize_health_status(raw_status: &str) -> &'static str {
+fn normalize_health_status(raw_status: &str, runtime_mode: RuntimeMode) -> &'static str {
     let status = raw_status.trim().to_ascii_lowercase();
-    match status.as_str() {
-        "healthy" | "alive" | "ready" | "ok" => "ok",
-        "warning" | "degraded" | "limited" => "degraded",
-        "dead" | "stopped" | "offline" | "fatal" | "failed" | "disabled" => "disabled",
-        _ => "degraded",
+    match runtime_mode {
+        RuntimeMode::LegacyHttp => match status.as_str() {
+            "healthy" | "alive" | "ready" | "ok" => "ok",
+            "warning" | "degraded" | "limited" => "degraded",
+            "dead" | "stopped" | "offline" | "fatal" | "failed" | "disabled" => "disabled",
+            _ => "degraded",
+        },
+        RuntimeMode::DbWorker => match status.as_str() {
+            "healthy" | "alive" | "ready" | "ok" | "success" => "ok",
+            "warning" | "degraded" | "limited" | "dead" | "stopped" | "offline" | "failed" => {
+                "degraded"
+            }
+            "fatal" | "disabled" => "disabled",
+            _ => "degraded",
+        },
     }
 }
 
@@ -3178,6 +3284,16 @@ impl RuntimeStatus {
             return "healthy";
         }
         "degraded"
+    }
+
+    fn collect_db_worker(credentials_file: &Path) -> Self {
+        Self {
+            alive: true,
+            metrics_available: false,
+            active_clients: count_active_clients(credentials_file).unwrap_or(0),
+            cpu_percent: 0.0,
+            memory_percent: 0.0,
+        }
     }
 }
 
@@ -3789,7 +3905,7 @@ mod runtime_status_tests {
 
     #[test]
     fn normalize_heartbeat_payload_falls_back_to_non_empty_contract_fields() {
-        let payload = normalize_heartbeat_payload("", "dead", "", "", "");
+        let payload = normalize_heartbeat_payload("", "dead", "", "", "", RuntimeMode::LegacyHttp);
 
         assert_eq!(payload.current_revision, None);
         assert_eq!(payload.health_status, "disabled");
@@ -3798,18 +3914,43 @@ mod runtime_status_tests {
 
     #[test]
     fn normalize_health_status_maps_legacy_values_to_lk_contract() {
-        assert_eq!(normalize_health_status("healthy"), "ok");
-        assert_eq!(normalize_health_status("alive"), "ok");
-        assert_eq!(normalize_health_status("ready"), "ok");
-        assert_eq!(normalize_health_status("warning"), "degraded");
-        assert_eq!(normalize_health_status("limited"), "degraded");
-        assert_eq!(normalize_health_status("offline"), "disabled");
-        assert_eq!(normalize_health_status("failed"), "disabled");
+        assert_eq!(normalize_health_status("healthy", RuntimeMode::LegacyHttp), "ok");
+        assert_eq!(normalize_health_status("alive", RuntimeMode::LegacyHttp), "ok");
+        assert_eq!(normalize_health_status("ready", RuntimeMode::LegacyHttp), "ok");
+        assert_eq!(normalize_health_status("warning", RuntimeMode::LegacyHttp), "degraded");
+        assert_eq!(normalize_health_status("limited", RuntimeMode::LegacyHttp), "degraded");
+        assert_eq!(normalize_health_status("offline", RuntimeMode::LegacyHttp), "disabled");
+        assert_eq!(normalize_health_status("failed", RuntimeMode::LegacyHttp), "disabled");
     }
 
     #[test]
     fn normalize_health_status_uses_safe_default_for_unknown_values() {
-        assert_eq!(normalize_health_status("something-new"), "degraded");
+        assert_eq!(
+            normalize_health_status("something-new", RuntimeMode::LegacyHttp),
+            "degraded"
+        );
+    }
+
+    #[test]
+    fn normalize_health_status_in_db_worker_does_not_force_disabled_for_dead_process_checks() {
+        assert_eq!(normalize_health_status("dead", RuntimeMode::DbWorker), "degraded");
+        assert_eq!(normalize_health_status("offline", RuntimeMode::DbWorker), "degraded");
+        assert_eq!(normalize_health_status("failed", RuntimeMode::DbWorker), "degraded");
+        assert_eq!(normalize_health_status("disabled", RuntimeMode::DbWorker), "disabled");
+    }
+
+    #[test]
+    fn db_worker_health_state_maps_pipeline_signals_to_contract_status() {
+        let mut state = DbWorkerHealthState::default();
+        state.inventory_status = DbWorkerSignalStatus::Ok;
+        state.artifacts_status = DbWorkerSignalStatus::Ok;
+        assert_eq!(state.health_status(), "ok");
+
+        state.artifacts_status = DbWorkerSignalStatus::Degraded;
+        assert_eq!(state.health_status(), "degraded");
+
+        state.runtime_prerequisites_valid = false;
+        assert_eq!(state.health_status(), "disabled");
     }
 
     #[test]
