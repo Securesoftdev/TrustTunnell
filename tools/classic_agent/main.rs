@@ -838,6 +838,15 @@ impl Agent {
         println!(
             "phase=startup mode=db_worker lifecycle_writes=enabled level=minimal details=\"register+heartbeat enabled; metadata/status/revision writes remain disabled\""
         );
+        println!(
+            "phase=lifecycle_writes_enabled_for_db_worker mode=db_worker node={} lifecycle_writes_supported={} reconcile_interval_sec={} apply_interval_sec={} export_write_interval_sec={} heartbeat_interval_sec={}",
+            self.cfg.node_external_id,
+            lifecycle_writes_supported,
+            schedule.reconcile_plan_interval.as_secs(),
+            schedule.apply_interval.as_secs(),
+            schedule.export_write_interval.as_secs(),
+            heartbeat_interval.as_secs()
+        );
         self.bootstrap_register().await;
         if let Err(err) = self
             .run_sidecar_sync_pass(sidecar_sync::PassKind::Bootstrap)
@@ -1530,6 +1539,16 @@ impl Agent {
                 Ok(resp) => {
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
+                    let field_mismatch_details = extract_contract_mismatch_detail(body.trim())
+                        .unwrap_or_else(|| "none".to_string());
+                    println!(
+                        "phase=inventory_payload_rejected node={} status={} request_id={} idempotency_key={} field_level_errors={}",
+                        self.cfg.node_external_id,
+                        status.as_u16(),
+                        payload.request_id,
+                        payload.idempotency_key,
+                        field_mismatch_details
+                    );
                     let detail = format!(
                         "inventory ingest returned HTTP {} on attempt {attempt}/{INVENTORY_INGEST_ATTEMPTS}: {}",
                         status.as_u16(),
@@ -1550,10 +1569,11 @@ impl Agent {
                         continue;
                     }
                     println!(
-                        "phase=reconcile_not_ready node={} reason=inventory_delivery_failed request_id={} idempotency_key={}",
+                        "phase=reconcile_not_ready node={} reason=inventory_delivery_failed request_id={} idempotency_key={} field_level_errors={}",
                         self.cfg.node_external_id,
                         payload.request_id,
-                        payload.idempotency_key
+                        payload.idempotency_key,
+                        field_mismatch_details
                     );
                     return Err(detail);
                 }
@@ -1573,7 +1593,7 @@ impl Agent {
                         continue;
                     }
                     println!(
-                        "phase=reconcile_not_ready node={} reason=inventory_delivery_failed request_id={} idempotency_key={}",
+                        "phase=reconcile_not_ready node={} reason=inventory_delivery_failed request_id={} idempotency_key={} field_level_errors=none",
                         self.cfg.node_external_id,
                         payload.request_id,
                         payload.idempotency_key
@@ -2225,6 +2245,12 @@ impl Agent {
                 last_apply_status: normalized_payload.last_apply_status,
             },
         };
+        println!(
+            "phase=heartbeat_sent node={} revision={} health={}",
+            self.cfg.node_external_id,
+            normalized_payload.current_revision.as_deref().unwrap_or("none"),
+            normalized_payload.health_status
+        );
         self.lk_api
             .heartbeat(&payload)
             .await
@@ -2241,6 +2267,12 @@ impl Agent {
                 }
                 HeartbeatFailure::Api(err)
             })?;
+        println!(
+            "phase=heartbeat_accepted node={} revision={} health={}",
+            self.cfg.node_external_id,
+            normalized_payload.current_revision.as_deref().unwrap_or("none"),
+            normalized_payload.health_status
+        );
         if let Some(metric) = &self.metrics.runtime_health_total {
             metric
                 .with_label_values(&[
@@ -6882,6 +6914,15 @@ upload_buffer_size = 32768
         let rendered = inventory_error_details(body);
         assert!(rendered.contains("snapshot_version"));
         assert!(rendered.contains("must be equal to v1"));
+    }
+
+    #[test]
+    fn extract_contract_mismatch_detail_reads_top_level_field_message() {
+        let body = r#"{"field":"credentials","message":"must not be empty"}"#;
+        assert_eq!(
+            extract_contract_mismatch_detail(body).as_deref(),
+            Some("credentials: must not be empty")
+        );
     }
 
     #[test]
