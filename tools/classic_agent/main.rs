@@ -4497,6 +4497,25 @@ mod tests {
     }
 
     #[cfg(feature = "legacy-lk-http")]
+    async fn wait_for_captured_requests(
+        server: &MockHttpServer,
+        min_count: usize,
+        timeout: Duration,
+    ) -> Vec<CapturedRequest> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let captured = server.captured().await;
+            if captured.len() >= min_count {
+                return captured;
+            }
+            if Instant::now() >= deadline {
+                return captured;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(feature = "legacy-lk-http")]
     async fn make_agent(
         temp_dir: &TempDir,
         base_url: &str,
@@ -4574,6 +4593,8 @@ message_queue_capacity = 4096
         )
         .await
         .unwrap();
+        let endpoint_args_log_path = runtime_dir.join("agent-endpoint-args.log");
+        let endpoint_binary = make_fake_endpoint_script(temp_dir, &endpoint_args_log_path);
 
         let cfg = Config {
             lk_base_url: Some(base_url.to_string()),
@@ -6227,6 +6248,279 @@ upload_buffer_size = 32768
             .unwrap();
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].status, "error");
+    }
+
+    #[cfg(feature = "legacy-lk-http")]
+    #[tokio::test]
+    async fn db_worker_registers_on_startup_with_contract_v1_payload() {
+        let server = MockHttpServer::start().await;
+        let tmp_dir = TempDir::new().unwrap();
+        let mut agent = make_agent(&tmp_dir, &server.base_url, None).await;
+        agent.cfg.heartbeat_interval = Duration::from_millis(40);
+        agent.cfg.reconcile_interval = Duration::from_secs(3600);
+        agent.cfg.apply_interval = Duration::from_secs(3600);
+        server
+            .enqueue(
+                Method::POST,
+                DEFAULT_REGISTER_PATH,
+                HyperStatusCode::OK,
+                r#"{"accepted":true}"#,
+            )
+            .await;
+        for _ in 0..4 {
+            server
+                .enqueue(
+                    Method::POST,
+                    DEFAULT_HEARTBEAT_PATH,
+                    HyperStatusCode::OK,
+                    r#"{"accepted":true}"#,
+                )
+                .await;
+        }
+
+        let worker = tokio::spawn(async move {
+            agent.run_db_worker_loop().await;
+        });
+        let requests =
+            wait_for_captured_requests(&server, 2, Duration::from_secs(2)).await;
+        worker.abort();
+
+        let register = requests
+            .iter()
+            .find(|x| x.method == Method::POST && x.path == DEFAULT_REGISTER_PATH)
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&register.body).unwrap();
+        assert_eq!(payload["contract_version"], "v1");
+        assert_eq!(payload["external_node_id"], "node-1");
+        assert_eq!(payload["hostname"], "node-1.example");
+        assert_eq!(payload["agent_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(payload["runtime_version"], "test");
+        assert_eq!(payload["cluster"], "cluster-a");
+        assert_eq!(payload["stage"], "prod");
+    }
+
+    #[cfg(feature = "legacy-lk-http")]
+    #[tokio::test]
+    async fn db_worker_sends_periodic_heartbeat_and_observes_accepted_responses() {
+        let server = MockHttpServer::start().await;
+        let tmp_dir = TempDir::new().unwrap();
+        let mut agent = make_agent(&tmp_dir, &server.base_url, None).await;
+        agent.cfg.heartbeat_interval = Duration::from_millis(40);
+        agent.cfg.reconcile_interval = Duration::from_secs(3600);
+        agent.cfg.apply_interval = Duration::from_secs(3600);
+        agent.db_worker_health.inventory_status = DbWorkerSignalStatus::Ok;
+        agent.db_worker_health.artifacts_status = DbWorkerSignalStatus::Ok;
+        server
+            .enqueue(
+                Method::POST,
+                DEFAULT_REGISTER_PATH,
+                HyperStatusCode::OK,
+                r#"{"accepted":true}"#,
+            )
+            .await;
+        for _ in 0..8 {
+            server
+                .enqueue(
+                    Method::POST,
+                    DEFAULT_HEARTBEAT_PATH,
+                    HyperStatusCode::OK,
+                    r#"{"accepted":true}"#,
+                )
+                .await;
+        }
+
+        let worker = tokio::spawn(async move {
+            agent.run_db_worker_loop().await;
+        });
+        let requests =
+            wait_for_captured_requests(&server, 4, Duration::from_secs(2)).await;
+        worker.abort();
+
+        let heartbeats: Vec<&CapturedRequest> = requests
+            .iter()
+            .filter(|x| x.method == Method::POST && x.path == DEFAULT_HEARTBEAT_PATH)
+            .collect();
+        assert!(heartbeats.len() >= 2);
+        let first_payload: serde_json::Value = serde_json::from_str(&heartbeats[0].body).unwrap();
+        assert_eq!(first_payload["contract_version"], "v1");
+        let health_status = first_payload["health_status"].as_str().unwrap();
+        assert!(matches!(health_status, "ok" | "degraded" | "disabled"));
+        assert_eq!(first_payload["stats"]["last_apply_status"], "pending");
+    }
+
+    #[cfg(feature = "legacy-lk-http")]
+    #[tokio::test]
+    async fn db_worker_heartbeat_does_not_disable_live_node_without_legacy_pid() {
+        let server = MockHttpServer::start().await;
+        let tmp_dir = TempDir::new().unwrap();
+        let mut agent = make_agent(&tmp_dir, &server.base_url, None).await;
+        agent.cfg.runtime_pid_path = None;
+        agent.db_worker_health.inventory_status = DbWorkerSignalStatus::Ok;
+        agent.db_worker_health.artifacts_status = DbWorkerSignalStatus::Ok;
+        server
+            .enqueue(
+                Method::POST,
+                DEFAULT_HEARTBEAT_PATH,
+                HyperStatusCode::OK,
+                r#"{"accepted":true}"#,
+            )
+            .await;
+
+        agent.send_heartbeat().await.unwrap();
+        let requests = server.captured().await;
+        let heartbeat = requests
+            .iter()
+            .find(|x| x.method == Method::POST && x.path == DEFAULT_HEARTBEAT_PATH)
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&heartbeat.body).unwrap();
+        assert_eq!(payload["health_status"], "ok");
+        assert_ne!(payload["health_status"], "disabled");
+    }
+
+    #[cfg(feature = "legacy-lk-http")]
+    #[tokio::test]
+    async fn lk_happy_path_register_heartbeat_inventory_artifacts_keeps_order_and_contract() {
+        let server = MockHttpServer::start().await;
+        let tmp_dir = TempDir::new().unwrap();
+        let mut agent = make_agent(&tmp_dir, &server.base_url, None).await;
+        fs::write(
+            &agent.cfg.runtime_credentials_path,
+            b"[[client]]\nusername=\"alice\"\npassword=\"one\"\n",
+        )
+        .await
+        .unwrap();
+        agent.cfg.lk_write_contract = LkWriteContract::Api;
+        agent.cfg.lk_db_dsn = format!(
+            "{}/internal/trusttunnel/v1/nodes/{{externalNodeId}}/artifacts",
+            server.base_url
+        );
+        server
+            .enqueue(
+                Method::POST,
+                DEFAULT_REGISTER_PATH,
+                HyperStatusCode::OK,
+                r#"{"accepted":true}"#,
+            )
+            .await;
+        server
+            .enqueue(
+                Method::POST,
+                DEFAULT_HEARTBEAT_PATH,
+                HyperStatusCode::OK,
+                r#"{"accepted":true}"#,
+            )
+            .await;
+        server
+            .enqueue(
+                Method::POST,
+                "/internal/trusttunnel/v1/nodes/node-1/inventory",
+                HyperStatusCode::OK,
+                r#"{"accepted":true}"#,
+            )
+            .await;
+        server
+            .enqueue(
+                Method::POST,
+                "/internal/trusttunnel/v1/nodes/node-1/artifacts",
+                HyperStatusCode::OK,
+                r#"{"summary":{"created":1,"updated":0,"unchanged":0,"deactivated":0,"failed":0}}"#,
+            )
+            .await;
+
+        agent.bootstrap_register().await;
+        agent.send_heartbeat().await.unwrap();
+        agent
+            .sync_local_inventory_export_sidecar(InventoryIngestSource::Imported)
+            .await
+            .unwrap();
+
+        let requests = server.captured().await;
+        let sequence: Vec<&str> = requests.iter().map(|x| x.path.as_str()).collect();
+        assert_eq!(
+            sequence,
+            vec![
+                DEFAULT_REGISTER_PATH,
+                DEFAULT_HEARTBEAT_PATH,
+                "/internal/trusttunnel/v1/nodes/node-1/inventory",
+                "/internal/trusttunnel/v1/nodes/node-1/artifacts",
+            ]
+        );
+        let register: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
+        let heartbeat: serde_json::Value = serde_json::from_str(&requests[1].body).unwrap();
+        let inventory: serde_json::Value = serde_json::from_str(&requests[2].body).unwrap();
+        let artifacts: serde_json::Value = serde_json::from_str(&requests[3].body).unwrap();
+        assert_eq!(register["contract_version"], "v1");
+        assert_eq!(heartbeat["contract_version"], "v1");
+        assert_eq!(inventory["contract_version"], "v1");
+        assert_eq!(artifacts["contract_version"], "v1");
+        assert_eq!(inventory["external_node_id"], "node-1");
+        assert_eq!(artifacts["external_node_id"], "node-1");
+    }
+
+    #[cfg(feature = "legacy-lk-http")]
+    #[tokio::test]
+    async fn canonical_inventory_payload_is_accepted_without_invalid_input() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request_handle = tokio::spawn(async move {
+            let mut captured = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = vec![0_u8; 65536];
+                let size = stream.read(&mut buffer).await.unwrap();
+                let request = String::from_utf8_lossy(&buffer[..size]).to_string();
+                let is_inventory = request.contains("/inventory");
+                let (status, body) = if is_inventory
+                    && request.contains("\"contract_version\":\"v1\"")
+                    && request.contains("\"snapshot_version\":\"v1\"")
+                    && request.contains("\"external_node_id\":\"node-1\"")
+                    && request.contains("\"credentials\":[")
+                {
+                    (200, r#"{"accepted":true}"#)
+                } else if is_inventory {
+                    (
+                        400,
+                        r#"{"error":"invalid_input","details":"inventory shape mismatch"}"#,
+                    )
+                } else {
+                    (
+                        200,
+                        r#"{"summary":{"created":1,"updated":0,"unchanged":0,"deactivated":0,"failed":0}}"#,
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                captured.push(request);
+            }
+            captured
+        });
+
+        let tmp_dir = TempDir::new().unwrap();
+        let mut agent = make_db_worker_agent_for_validation_tests(&tmp_dir, false).await;
+        fs::write(
+            &agent.cfg.runtime_credentials_path,
+            b"[[client]]\nusername=\"alice\"\npassword=\"one\"\n",
+        )
+        .await
+        .unwrap();
+        agent.cfg.lk_write_contract = LkWriteContract::Api;
+        agent.cfg.lk_db_dsn = format!(
+            "http://{address}/internal/trusttunnel/v1/nodes/{{externalNodeId}}/artifacts"
+        );
+        agent.cfg.lk_service_token = Some("token".to_string());
+
+        agent
+            .sync_local_inventory_export_sidecar(InventoryIngestSource::Imported)
+            .await
+            .unwrap();
+        let requests = request_handle.await.unwrap();
+        assert!(requests[0].contains("/inventory"));
+        assert!(requests[0].contains("\"contract_version\":\"v1\""));
+        assert!(!requests[0].contains("\"error\":\"invalid_input\""));
     }
 
     #[cfg(feature = "legacy-lk-http")]
