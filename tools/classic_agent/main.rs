@@ -3034,7 +3034,14 @@ impl AgentMetrics {
             &["node", "pass", "outcome"],
         )
         .map_err(|e| format!("failed to create sidecar_sync_item_total metric: {e}"))?;
-        let runtime_health_total = None;
+        let runtime_health_total = IntCounterVec::new(
+            Opts::new(
+                "classic_agent_runtime_health_total",
+                "Total heartbeat delivery attempts by status",
+            ),
+            &["node", "revision", "status", "error_class"],
+        )
+        .map_err(|e| format!("failed to create runtime_health_total metric: {e}"))?;
         let tt_link_generation_total = IntCounterVec::new(
             Opts::new(
                 "classic_agent_tt_link_generation_total",
@@ -3080,8 +3087,22 @@ impl AgentMetrics {
             &["node"],
         )
         .map_err(|e| format!("failed to create credentials_count metric: {e}"))?;
-        let runtime_health_status = None;
-        let endpoint_process_status = None;
+        let runtime_health_status = IntGaugeVec::new(
+            Opts::new(
+                "classic_agent_runtime_health_status",
+                "Runtime heartbeat health status (1=accepted, 0=degraded)",
+            ),
+            &["node"],
+        )
+        .map_err(|e| format!("failed to create runtime_health_status metric: {e}"))?;
+        let endpoint_process_status = IntGaugeVec::new(
+            Opts::new(
+                "classic_agent_endpoint_process_status",
+                "Endpoint process liveness status (1=alive, 0=not_alive)",
+            ),
+            &["node"],
+        )
+        .map_err(|e| format!("failed to create endpoint_process_status metric: {e}"))?;
 
         registry
             .register(Box::new(reconcile_total.clone()))
@@ -3095,6 +3116,9 @@ impl AgentMetrics {
         registry
             .register(Box::new(tt_link_generation_total.clone()))
             .map_err(|e| format!("failed to register tt_link_generation_total metric: {e}"))?;
+        registry
+            .register(Box::new(runtime_health_total.clone()))
+            .map_err(|e| format!("failed to register runtime_health_total metric: {e}"))?;
         registry
             .register(Box::new(apply_total.clone()))
             .map_err(|e| format!("failed to register apply_total metric: {e}"))?;
@@ -3110,12 +3134,20 @@ impl AgentMetrics {
         registry
             .register(Box::new(credentials_count.clone()))
             .map_err(|e| format!("failed to register credentials_count metric: {e}"))?;
+        registry
+            .register(Box::new(runtime_health_status.clone()))
+            .map_err(|e| format!("failed to register runtime_health_status metric: {e}"))?;
+        registry
+            .register(Box::new(endpoint_process_status.clone()))
+            .map_err(|e| format!("failed to register endpoint_process_status metric: {e}"))?;
 
         let labels = &[node];
         last_successful_reconcile.with_label_values(labels).set(0);
         last_failed_reconcile.with_label_values(labels).set(0);
         apply_duration_ms.with_label_values(labels).set(0);
         credentials_count.with_label_values(labels).set(0);
+        runtime_health_status.with_label_values(labels).set(0);
+        endpoint_process_status.with_label_values(labels).set(0);
         for pass in ["bootstrap", "reconcile"] {
             sidecar_sync_pass_total
                 .with_label_values(&[node, pass, "ok"])
@@ -3131,14 +3163,14 @@ impl AgentMetrics {
             sidecar_sync_pass_total,
             sidecar_sync_item_total,
             tt_link_generation_total,
-            runtime_health_total,
+            runtime_health_total: Some(runtime_health_total),
             apply_total,
             last_successful_reconcile,
             last_failed_reconcile,
             apply_duration_ms,
             credentials_count,
-            runtime_health_status,
-            endpoint_process_status,
+            runtime_health_status: Some(runtime_health_status),
+            endpoint_process_status: Some(endpoint_process_status),
         })
     }
 }
@@ -5447,6 +5479,13 @@ upload_buffer_size = 32768
         ));
         assert!(names.contains(&"classic_agent_apply_duration_milliseconds".to_string()));
         assert!(names.contains(&"classic_agent_credentials_count".to_string()));
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("classic_agent_runtime_health"))
+        );
+        assert!(names.contains(&"classic_agent_runtime_health_status".to_string()));
+        assert!(names.contains(&"classic_agent_endpoint_process_status".to_string()));
         assert!(
             names
                 .iter()
