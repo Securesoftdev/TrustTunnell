@@ -53,6 +53,9 @@ const RUNTIME_PRIMARY_MARKER_FILE: &str = ".runtime_credentials_primary";
 const DEFAULT_RUNTIME_VALIDATION_MIN_USERS: usize = 1;
 const DEFAULT_RUNTIME_VALIDATION_MAX_USERS: usize = 100;
 const DEFAULT_ENDPOINT_BINARY_PATH: &str = "/usr/local/bin/trusttunnel_endpoint";
+const LINK_GENERATION_STARTED_PHASE: &str = "link_generation_started";
+const LINK_GENERATION_COMPLETE_PHASE: &str = "link_generation_complete";
+const LINK_GENERATION_EXPORTED_PHASE: &str = "link_generation_exported";
 
 mod sidecar_sync {
     use super::sha256_hex;
@@ -213,6 +216,7 @@ struct Config {
     pending_sync_reports_path: Option<PathBuf>,
     metrics_address: SocketAddr,
     debug_preserve_temp_files: bool,
+    debug_verbose_export_logs: bool,
     validation_strict_mode: bool,
     syntax_validation_diagnostic_only: bool,
     runtime_validation_min_users: usize,
@@ -406,6 +410,7 @@ impl Config {
                 )
             })
             .unwrap_or(false);
+        let debug_verbose_export_logs = env_flag_enabled("TRUSTTUNNEL_DEBUG_VERBOSE_EXPORT_LOGS");
         let validation_strict_mode = optional_env_nonempty("TRUSTTUNNEL_VALIDATION_STRICT")
             .map(|raw| {
                 matches!(
@@ -498,6 +503,7 @@ impl Config {
             pending_sync_reports_path,
             metrics_address,
             debug_preserve_temp_files,
+            debug_verbose_export_logs,
             validation_strict_mode,
             syntax_validation_diagnostic_only,
             runtime_validation_min_users,
@@ -1316,7 +1322,8 @@ impl Agent {
                 .map(|account: &InventoryAccount| account.username.clone())
                 .collect::<Vec<_>>();
             println!(
-                "phase=link_generation_started node={} contract_mode={} endpoint_bin_path={} accounts_for_export={} removed_accounts={}",
+                "phase={} node={} contract_mode={} endpoint_bin_path={} accounts_for_export={} removed_accounts={}",
+                LINK_GENERATION_STARTED_PHASE,
                 self.cfg.node_external_id,
                 if link_diag.fallback_used {
                     "legacy_fallback"
@@ -1351,18 +1358,22 @@ impl Agent {
                 .filter(|x| x.contains("failed to execute endpoint command"))
                 .count();
             println!(
-                "phase=link_generation_complete node={} endpoint_bin_path={} generated_links={} export_failed={} export_failed_binary_invocation={}",
+                "phase={} node={} endpoint_bin_path={} generated_links={} export_failed={} export_failed_binary_invocation={}",
+                LINK_GENERATION_COMPLETE_PHASE,
                 self.cfg.node_external_id,
                 self.cfg.endpoint_binary,
                 generated_links.len(),
                 export_failed,
                 export_binary_invocation_failed
             );
-            for (username, _) in &generated_links {
-                println!(
-                    "phase=link_generation_exported node={} endpoint_bin_path={} username={}",
-                    self.cfg.node_external_id, self.cfg.endpoint_binary, username
-                );
+            if self.cfg.debug_verbose_export_logs {
+                for username in generated_links.keys() {
+                    println!(
+                        "phase={} node={} endpoint_bin_path={} username={}",
+                        LINK_GENERATION_EXPORTED_PHASE,
+                        self.cfg.node_external_id, self.cfg.endpoint_binary, username
+                    );
+                }
             }
         }
 
@@ -4039,6 +4050,17 @@ fn optional_env_nonempty(name: &str) -> Option<String> {
     optional_env(name).filter(|value| !value.trim().is_empty())
 }
 
+fn env_flag_enabled(name: &str) -> bool {
+    optional_env_nonempty(name)
+        .map(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn resolve_endpoint_binary_from_env() -> String {
     if let Some(path) = optional_env_nonempty("TRUSTTUNNEL_ENDPOINT_BIN") {
         return path;
@@ -4694,6 +4716,7 @@ message_queue_capacity = 4096
             pending_sync_reports_path: Some(runtime_dir.join(SYNC_REPORT_OUTBOX_FILE)),
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files: false,
+            debug_verbose_export_logs: false,
             validation_strict_mode: false,
             syntax_validation_diagnostic_only: false,
             runtime_validation_min_users: DEFAULT_RUNTIME_VALIDATION_MIN_USERS,
@@ -4810,6 +4833,7 @@ upload_buffer_size = 32768
             pending_sync_reports_path: None,
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files,
+            debug_verbose_export_logs: false,
             validation_strict_mode,
             syntax_validation_diagnostic_only: false,
             runtime_validation_min_users: DEFAULT_RUNTIME_VALIDATION_MIN_USERS,
@@ -5057,6 +5081,7 @@ upload_buffer_size = 32768
             pending_sync_reports_path: Some(PathBuf::from("pending_sync_reports.jsonl")),
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files: false,
+            debug_verbose_export_logs: false,
             validation_strict_mode: false,
             syntax_validation_diagnostic_only: false,
             runtime_validation_min_users: DEFAULT_RUNTIME_VALIDATION_MIN_USERS,
@@ -5156,6 +5181,7 @@ upload_buffer_size = 32768
             pending_sync_reports_path: Some(PathBuf::from("pending_sync_reports.jsonl")),
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files: false,
+            debug_verbose_export_logs: false,
             validation_strict_mode: false,
             syntax_validation_diagnostic_only: false,
             runtime_validation_min_users: DEFAULT_RUNTIME_VALIDATION_MIN_USERS,
@@ -5239,6 +5265,7 @@ upload_buffer_size = 32768
             pending_sync_reports_path: Some(PathBuf::from("pending_sync_reports.jsonl")),
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files: false,
+            debug_verbose_export_logs: false,
             validation_strict_mode: false,
             syntax_validation_diagnostic_only: false,
             runtime_validation_min_users: DEFAULT_RUNTIME_VALIDATION_MIN_USERS,
@@ -5345,6 +5372,27 @@ upload_buffer_size = 32768
     }
 
     #[test]
+    fn verbose_export_logs_flag_defaults_to_disabled() {
+        let key = "TRUSTTUNNEL_DEBUG_VERBOSE_EXPORT_LOGS";
+        std::env::remove_var(key);
+        assert!(!env_flag_enabled(key));
+    }
+
+    #[test]
+    fn verbose_export_logs_flag_enables_per_username_logging() {
+        let key = "TRUSTTUNNEL_DEBUG_VERBOSE_EXPORT_LOGS";
+        std::env::set_var(key, "1");
+        assert!(env_flag_enabled(key));
+        std::env::remove_var(key);
+    }
+
+    #[test]
+    fn link_generation_summary_phases_remain_stable() {
+        assert_eq!(LINK_GENERATION_STARTED_PHASE, "link_generation_started");
+        assert_eq!(LINK_GENERATION_COMPLETE_PHASE, "link_generation_complete");
+    }
+
+    #[test]
     fn lifecycle_writes_support_depends_on_runtime_mode() {
         assert!(RuntimeMode::DbWorker.supports_lifecycle_writes());
         assert!(RuntimeMode::LegacyHttp.supports_lifecycle_writes());
@@ -5414,6 +5462,7 @@ upload_buffer_size = 32768
             pending_sync_reports_path: None,
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files: false,
+            debug_verbose_export_logs: false,
             validation_strict_mode: false,
             syntax_validation_diagnostic_only: false,
             runtime_validation_min_users: DEFAULT_RUNTIME_VALIDATION_MIN_USERS,
@@ -5905,6 +5954,7 @@ upload_buffer_size = 32768
             pending_sync_reports_path: None,
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files: false,
+            debug_verbose_export_logs: false,
             validation_strict_mode: false,
             syntax_validation_diagnostic_only: false,
             runtime_validation_min_users: DEFAULT_RUNTIME_VALIDATION_MIN_USERS,
@@ -7000,6 +7050,7 @@ upload_buffer_size = 32768
             pending_sync_reports_path: None,
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
             debug_preserve_temp_files: false,
+            debug_verbose_export_logs: false,
             validation_strict_mode: false,
             syntax_validation_diagnostic_only: false,
             runtime_validation_min_users: DEFAULT_RUNTIME_VALIDATION_MIN_USERS,

@@ -144,6 +144,8 @@ Optional:
 - `TRUSTTUNNEL_VALIDATION_STRICT` (default `false`; logs
   `error_class=parser_runtime_mismatch_strict` when `syntax_precheck` and
   `runtime_entrypoint` results diverge)
+- `TRUSTTUNNEL_DEBUG_VERBOSE_EXPORT_LOGS` (default `false`; when enabled,
+  emits per-username `phase=link_generation_exported` lines for TT-link export debugging)
 - `TRUSTTUNNEL_LINK_CONFIG_ALLOW_LEGACY_FALLBACK` (`true|false`; when `true`,
   allows TT-link export to use legacy env variables if `tt-link.toml` is
   missing/invalid)
@@ -206,6 +208,10 @@ Diagnostics include contract mode:
   `status`, `error_class` (and `message` for errors).
 - Sidecar sync summary lines expose counters:
   `found/generated/updated/missing/skipped/errors` and `new/stale/deleted`.
+- TT-link export always emits operational summaries:
+  `phase=link_generation_started` and `phase=link_generation_complete`.
+  Per-username `phase=link_generation_exported` lines are disabled by default
+  and can be enabled with `TRUSTTUNNEL_DEBUG_VERBOSE_EXPORT_LOGS=1`.
 - Prometheus endpoint: `GET /metrics` on `AGENT_METRICS_ADDRESS`.
 - Metrics:
   - `classic_agent_reconcile_total{node,revision,status,error_class}`
