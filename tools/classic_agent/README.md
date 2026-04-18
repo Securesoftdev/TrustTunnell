@@ -76,8 +76,14 @@ Executed every `AGENT_APPLY_INTERVAL_SEC`:
 Default mode is selected when `CLASSIC_AGENT_MODE` is unset or set to `db_worker`.
 In this mode sidecar sync and LK bulk writer run without legacy LK HTTP orchestration loops.
 `db_worker` writes only access artifacts (TT-link payloads and active/deactivated records) through
-`lk_bulk_write` contracts. Node lifecycle writes (`register`, `heartbeat`, `sync-report`; node
-metadata/status/revision updates) are unsupported in this mode.
+`lk_bulk_write` contracts. Lifecycle writes (`register` + periodic `heartbeat`) are enabled in
+`db_worker` and use lifecycle base URL derivation:
+
+1. `LK_LIFECYCLE_BASE_URL` (preferred)
+2. `LK_BASE_URL`
+3. Derived from `LK_DB_DSN` when it is an HTTP(S) artifacts endpoint URL
+
+`sync-report` remains part of the `legacy_http` flow only.
 
 ### Legacy mode (`legacy_http`)
 
@@ -113,10 +119,16 @@ Required in all modes:
 - `TRUSTTUNNEL_CONFIG_FILE`
 - `TRUSTTUNNEL_HOSTS_FILE`
 
+Required for lifecycle writes (`register` + `heartbeat`) in both `db_worker` and `legacy_http`:
+
+- `LK_SERVICE_TOKEN`
+- one of:
+  - `LK_LIFECYCLE_BASE_URL` (preferred)
+  - `LK_BASE_URL`
+  - derivation from `LK_DB_DSN` when it is an HTTP(S) artifacts endpoint URL
+
 Required only in `legacy_http`:
 
-- `LK_BASE_URL`
-- `LK_SERVICE_TOKEN`
 - `AGENT_HEARTBEAT_INTERVAL_SEC`
 
 Optional:
@@ -137,6 +149,7 @@ Optional:
   missing/invalid)
 - `LK_DB_TABLE` (Postgres sink table name, default `access_artifacts`)
 - `LK_DB_WRITE_FUNCTION` (Postgres function contract, default `trusttunnel_apply_access_artifacts`)
+- `LK_LIFECYCLE_BASE_URL` (preferred explicit lifecycle API base URL)
 - `LK_DB_WRITE_FUNCTION_VERSION_FUNCTION` (Postgres function contract metadata/version function, default `<LK_DB_WRITE_FUNCTION>_contract_version`)
 - `LK_DB_WRITE_CONTRACT_VERSION` (expected Postgres function contract version, default `v1`)
 - `LK_DB_LEGACY_RAW_TABLE` (must be `1` when `LK_WRITE_CONTRACT=legacy_table`)
@@ -200,10 +213,31 @@ Diagnostics include contract mode:
   - `classic_agent_sidecar_sync_pass_total{node,pass,status}`
   - `classic_agent_sidecar_sync_item_total{node,pass,outcome}`
   - `classic_agent_tt_link_generation_total{node,revision,status,error_class}`
+  - `classic_agent_runtime_health_total{node,revision,status,error_class}`
+  - `classic_agent_runtime_health_status{node}`
+  - `classic_agent_endpoint_process_status{node}`
   - `classic_agent_last_successful_reconcile_timestamp_seconds{node}`
   - `classic_agent_last_failed_reconcile_timestamp_seconds{node}`
   - `classic_agent_apply_duration_milliseconds{node}`
   - `classic_agent_credentials_count{node}`
+
+## Sidecar development log bookkeeping
+
+For incident reviews and future maintenance, keep a deterministic log trail in runtime output:
+
+- Lifecycle events:
+  - `phase=register_sent|register_accepted|heartbeat_sent|heartbeat_accepted`
+- Inventory/artifact delivery:
+  - `phase=inventory_payload_sent|inventory_payload_accepted|inventory_payload_rejected`
+  - `phase=artifacts_payload_sent|artifacts_payload_accepted`
+- Reconcile/apply pipeline:
+  - `phase=reconcile_summary`
+  - `phase=sidecar_sync_apply_success|sidecar_sync_apply_failed`
+- Validation diagnostics:
+  - `phase=credentials_validation_begin|credentials_validation_ok|credentials_validation_failed`
+
+Use stable fields in each line (`node`, `revision`, `request_id`, `idempotency_key`,
+`error_class`) so retries and rollback events can be correlated across runs.
 
 ## Bulk upsert idempotency and stale policy
 

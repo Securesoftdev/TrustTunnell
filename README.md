@@ -543,10 +543,16 @@ Required in all modes:
 - `TRUSTTUNNEL_CONFIG_FILE`
 - `TRUSTTUNNEL_HOSTS_FILE`
 
+Required for lifecycle writes (`register` + `heartbeat`) in both `db_worker` and `legacy_http`:
+
+- `LK_SERVICE_TOKEN`
+- one of:
+  - `LK_LIFECYCLE_BASE_URL` (preferred)
+  - `LK_BASE_URL`
+  - derivation from `LK_DB_DSN` when it is an HTTP(S) artifacts endpoint URL
+
 Required only when `CLASSIC_AGENT_MODE=legacy_http`:
 
-- `LK_BASE_URL`
-- `LK_SERVICE_TOKEN`
 - `AGENT_HEARTBEAT_INTERVAL_SEC`
 
 Optional:
@@ -562,6 +568,7 @@ Optional:
 - `TRUSTTUNNEL_RUNTIME_VERSION` (default `unknown`)
 - `LK_DB_TABLE` (default `access_artifacts` for Postgres sink)
 - `LK_DB_WRITE_FUNCTION` (default `trusttunnel_apply_access_artifacts` for Postgres function sink)
+- `LK_LIFECYCLE_BASE_URL` (preferred explicit lifecycle API base URL)
 - `LK_SYNC_PATH_TEMPLATE` (legacy mode only; default built-in template)
 - `LK_SYNC_REPORT_PATH` (legacy mode only; default built-in path)
 - `TRUSTTUNNEL_RUNTIME_PID_FILE` (legacy mode only; default `<TRUSTTUNNEL_RUNTIME_DIR>/trusttunnel.pid`)
@@ -605,10 +612,21 @@ Classic agent sidecar observability:
   - `classic_agent_sidecar_sync_pass_total{node,pass,status}`
   - `classic_agent_sidecar_sync_item_total{node,pass,outcome}` with outcomes `found/generated/updated/skipped/errors/new/missing/stale/deleted`
   - `classic_agent_tt_link_generation_total{node,revision,status,error_class}`
+  - `classic_agent_runtime_health_total{node,revision,status,error_class}`
+  - `classic_agent_runtime_health_status{node}`
+  - `classic_agent_endpoint_process_status{node}`
   - `classic_agent_last_successful_reconcile_timestamp_seconds{node}`
   - `classic_agent_last_failed_reconcile_timestamp_seconds{node}`
   - `classic_agent_apply_duration_milliseconds{node}`
   - `classic_agent_credentials_count{node}`
+
+Classic agent log bookkeeping guidance:
+
+- Keep `phase=*` records stable across retries and rollbacks (`register_*`, `heartbeat_*`,
+  `inventory_payload_*`, `artifacts_payload_*`, `credentials_validation_*`, `reconcile_*`).
+- Ensure each line includes correlation fields used by LK troubleshooting:
+  `node`, `revision`, `request_id`, `idempotency_key`, and `error_class`.
+- Do not introduce ad-hoc field names for existing events; extend with additive keys only.
 
 Bulk upsert idempotency and stale detection policy:
 
