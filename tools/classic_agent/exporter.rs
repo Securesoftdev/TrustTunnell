@@ -36,7 +36,6 @@ impl EndpointExportOptions {
     }
 }
 
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ExportSummary {
     pub(crate) links: BTreeMap<String, String>,
@@ -109,10 +108,9 @@ impl EndpointLinkExporter {
             let attempts = self.attempts;
             let timeout = self.timeout;
             join_set.spawn(async move {
-                let _permit = semaphore
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| format!("semaphore closed while exporting TT link for {username}"))?;
+                let _permit = semaphore.acquire_owned().await.map_err(|_| {
+                    format!("semaphore closed while exporting TT link for {username}")
+                })?;
                 let tt_link = export_single_link(
                     &endpoint_binary,
                     &settings_path,
@@ -139,7 +137,9 @@ impl EndpointLinkExporter {
                 }
                 Err(err) => {
                     summary.failed += 1;
-                    summary.failures.push(format!("TT link export task failed: {err}"));
+                    summary
+                        .failures
+                        .push(format!("TT link export task failed: {err}"));
                 }
             }
         }
@@ -229,8 +229,6 @@ async fn run_export_command(
         .map_err(|e| format!("endpoint stdout is not valid UTF-8: {e}"))?;
     let stderr = String::from_utf8(output.stderr)
         .map_err(|e| format!("endpoint stderr is not valid UTF-8: {e}"))?;
-    let tt_link = stdout.trim();
-
     if !output.status.success() {
         return Err(format!(
             "endpoint exited with status {} for {username}; stderr={}",
@@ -238,15 +236,54 @@ async fn run_export_command(
             stderr.trim()
         ));
     }
-    if !tt_link.starts_with("tt://") {
-        return Err(format!(
-            "endpoint returned invalid deeplink for {username}: stdout={} stderr={}",
-            stdout.trim(),
-            stderr.trim()
-        ));
+
+    let (tt_link, normalized_stdout) =
+        extract_canonical_tt_link(&stdout, username).map_err(|reason| {
+            format!(
+                "endpoint returned invalid deeplink for {username}: {reason}; stderr={}",
+                stderr.trim()
+            )
+        })?;
+    if normalized_stdout {
+        let non_empty_lines = stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        println!(
+            "phase=export_tt_link_stdout_normalized username={username} non_empty_lines={non_empty_lines}"
+        );
     }
 
-    Ok(tt_link.to_string())
+    Ok(tt_link)
+}
+
+fn extract_canonical_tt_link(stdout: &str, username: &str) -> Result<(String, bool), String> {
+    let mut canonical_link = None;
+    let mut canonical_line_index = 0usize;
+    let mut non_empty_lines = Vec::new();
+
+    for (index, line) in stdout.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        non_empty_lines.push((index, trimmed));
+        if canonical_link.is_none() && trimmed.starts_with("tt://") {
+            canonical_link = Some(trimmed.to_string());
+            canonical_line_index = index;
+        }
+    }
+
+    let tt_link = canonical_link.ok_or_else(|| {
+        format!(
+            "missing canonical tt:// line in stdout for {username}; stdout={}",
+            stdout.trim()
+        )
+    })?;
+
+    let normalized_stdout =
+        non_empty_lines.len() != 1 || non_empty_lines[0].0 != canonical_line_index;
+    Ok((tt_link, normalized_stdout))
 }
 
 #[cfg(test)]
@@ -271,8 +308,10 @@ mod tests {
                     return PathBuf::from(path);
                 }
 
-                let repo_root =
-                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+                let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .unwrap()
+                    .to_path_buf();
                 let bin_path = repo_root.join("target/debug/trusttunnel_endpoint");
                 if !bin_path.exists() {
                     let status = StdCommand::new("cargo")
@@ -469,12 +508,10 @@ mod tests {
         assert_eq!(summary.failed, 1);
         let alice_link = summary.links.get("alice").unwrap();
         assert!(alice_link.starts_with("tt://"));
-        assert!(
-            summary
-                .failures
-                .iter()
-                .any(|failure| failure.contains("endpoint exited with status"))
-        );
+        assert!(summary
+            .failures
+            .iter()
+            .any(|failure| failure.contains("endpoint exited with status")));
     }
 
     #[tokio::test]
@@ -496,6 +533,38 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("timed out"));
+    }
+
+    #[test]
+    fn extract_canonical_tt_link_returns_single_line_unchanged() {
+        let stdout = "tt://alice";
+        let (tt_link, normalized_stdout) = extract_canonical_tt_link(stdout, "alice").unwrap();
+        assert_eq!(tt_link, "tt://alice");
+        assert!(!normalized_stdout);
+    }
+
+    #[test]
+    fn extract_canonical_tt_link_discards_helper_text_and_urls() {
+        let stdout =
+            "tt://alice\n\nTo connect on mobile...\nhttps://trusttunnel.org/qr.html#tt=abc";
+        let (tt_link, normalized_stdout) = extract_canonical_tt_link(stdout, "alice").unwrap();
+        assert_eq!(tt_link, "tt://alice");
+        assert!(normalized_stdout);
+    }
+
+    #[test]
+    fn extract_canonical_tt_link_fails_without_tt_scheme() {
+        let stdout = "To connect on mobile...\nhttps://trusttunnel.org/qr.html#tt=abc";
+        let err = extract_canonical_tt_link(stdout, "alice").unwrap_err();
+        assert!(err.contains("missing canonical tt:// line"));
+    }
+
+    #[test]
+    fn extract_canonical_tt_link_accepts_tt_scheme_after_helper_text() {
+        let stdout = "To connect on mobile...\ntt://alice\nhttps://trusttunnel.org/qr.html#tt=abc";
+        let (tt_link, normalized_stdout) = extract_canonical_tt_link(stdout, "alice").unwrap();
+        assert_eq!(tt_link, "tt://alice");
+        assert!(normalized_stdout);
     }
 
     #[tokio::test]
