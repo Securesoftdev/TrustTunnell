@@ -212,6 +212,11 @@ Diagnostics include contract mode:
   `phase=link_generation_started` and `phase=link_generation_complete`.
   Per-username `phase=link_generation_exported` lines are disabled by default
   and can be enabled with `TRUSTTUNNEL_DEBUG_VERBOSE_EXPORT_LOGS=1`.
+- TT-link normalization diagnostics:
+  `phase=export_tt_link_stdout_normalized` is emitted when endpoint stdout
+  includes extra non-empty lines in addition to the canonical `tt://` deeplink.
+  This indicates helper text/URLs were discarded to keep LK payloads limited
+  to a clean single-line deeplink.
 - Prometheus endpoint: `GET /metrics` on `AGENT_METRICS_ADDRESS`.
 - Metrics:
   - `classic_agent_reconcile_total{node,revision,status,error_class}`
