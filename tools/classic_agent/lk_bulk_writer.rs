@@ -694,13 +694,13 @@ fn build_api_request(records: Vec<LkArtifactRecord>) -> Result<LkBulkApiRequest,
     if artifacts.is_empty() {
         return Err("LK artifacts API payload validation failed: empty artifacts array".to_string());
     }
-    let idempotency_key = build_logical_batch_id(&external_node_id, &artifacts);
-    let import_batch_id = format!("{}:{}", external_node_id, idempotency_key);
     let request_id = format!(
         "req-{}-{}",
         chrono::Utc::now().timestamp_millis(),
         REQUEST_SEQ.fetch_add(1, Ordering::Relaxed)
     );
+    let idempotency_key = build_logical_batch_id(&external_node_id, &artifacts);
+    let import_batch_id = format!("{external_node_id}:{idempotency_key}:{request_id}");
     let import_batch_id = trim_id(import_batch_id, 128);
     let idempotency_key = trim_id(idempotency_key, 128);
     let request_id = trim_id(request_id, 128);
@@ -718,18 +718,39 @@ fn build_api_request(records: Vec<LkArtifactRecord>) -> Result<LkBulkApiRequest,
 fn log_api_payload_shape(endpoint: &str, payload: &LkBulkApiRequest) -> Result<(), String> {
     let diagnostics = render_payload_diagnostics(payload)?;
     let sample_artifact = render_redacted_sample_artifact(payload)?;
+    let payload_revision = summarize_payload_revision(payload);
+    let force_regenerate = false;
     eprintln!(
-        "phase=lk_api_payload_debug endpoint={} external_node_id={} artifacts_count={} import_batch_id={} request_id={} idempotency_key={} diagnostics={} sample_artifact={}",
+        "phase=lk_api_payload_debug endpoint={} external_node_id={} artifacts_count={} import_batch_id={} request_id={} idempotency_key={} payload_revision={} force_regenerate={} diagnostics={} sample_artifact={}",
         endpoint,
         payload.external_node_id,
         payload.artifacts.len(),
         payload.import_batch_id,
         payload.request_id,
         payload.idempotency_key,
+        payload_revision,
+        force_regenerate,
         diagnostics,
         sample_artifact
     );
     Ok(())
+}
+
+fn summarize_payload_revision(payload: &LkBulkApiRequest) -> String {
+    let mut revisions = payload
+        .artifacts
+        .iter()
+        .map(|item| item.link_revision.as_str())
+        .collect::<Vec<_>>();
+    revisions.sort_unstable();
+    revisions.dedup();
+    if revisions.is_empty() {
+        return "none".to_string();
+    }
+    if revisions.len() == 1 {
+        return revisions[0].to_string();
+    }
+    format!("multi:{}", revisions.join("|"))
 }
 
 fn render_payload_diagnostics(payload: &LkBulkApiRequest) -> Result<String, String> {
@@ -1098,10 +1119,10 @@ mod tests {
     }
 
     #[test]
-    fn api_request_reuses_batch_ids_for_same_logical_payload() {
+    fn api_request_reuses_idempotency_key_for_same_logical_payload() {
         let first = build_api_request(vec![test_record("alice")]).unwrap();
         let second = build_api_request(vec![test_record("alice")]).unwrap();
-        assert_eq!(first.import_batch_id, second.import_batch_id);
+        assert_ne!(first.import_batch_id, second.import_batch_id);
         assert_eq!(first.idempotency_key, second.idempotency_key);
         assert_ne!(first.request_id, second.request_id);
     }
@@ -1133,14 +1154,14 @@ mod tests {
     }
 
     #[test]
-    fn api_request_batch_id_is_stable_when_generated_at_differs() {
+    fn api_request_idempotency_key_is_stable_when_generated_at_differs() {
         let mut first_record = test_record("alice");
         first_record.generated_at = Some("2026-04-16T00:00:00Z".to_string());
         let first = build_api_request(vec![first_record]).unwrap();
         let mut second_record = test_record("alice");
         second_record.generated_at = Some("2026-04-16T01:23:45Z".to_string());
         let second = build_api_request(vec![second_record]).unwrap();
-        assert_eq!(first.import_batch_id, second.import_batch_id);
+        assert_ne!(first.import_batch_id, second.import_batch_id);
         assert_eq!(first.idempotency_key, second.idempotency_key);
     }
 
