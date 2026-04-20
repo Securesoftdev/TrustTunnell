@@ -11,6 +11,10 @@
   · <a href="https://agrd.io/android_trusttunnel">Play store</a>
 </p>
 
+> SecureSoft platform-level documentation is maintained in
+> `Securesoftdev/securesoft-docs`. This repository keeps runtime, protocol,
+> configuration, endpoint, and sidecar documentation close to the code.
+
 ---
 
 ## Table of Contents
