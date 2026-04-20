@@ -2,6 +2,7 @@
 
 ## 1.0.28
 
+- [Fix] `classic_agent` now emits startup build provenance diagnostics (`git_sha`, build timestamp, target triple, binary path), enforces v2 `import_batch_id` runtime format (`external_node_id:idempotency_key:request_id`) with fail-fast error reason `unexpected_batch_id_format_runtime`, and logs per-POST LK artifact diagnostics for deterministic export-cycle auditing.
 - [Fix] `classic_agent` LK API mode now enforces strict local v1 payload validation (no silent artifact drops), emits request identifiers in 4xx/5xx diagnostics, uses stable retry idempotency keys, and exports full active snapshots to avoid contract drift and state corruption on failed writes.
 - [Fix] `trusttunnel-classic-agent` image now includes `/usr/local/bin/trusttunnel_endpoint`, and `classic_agent` now performs startup fail-fast endpoint-binary checks with explicit `TRUSTTUNNEL_ENDPOINT_BIN` path resolution for unified runtime validation and TT-link export invocation.
 - [Fix] `classic_agent` sidecar reconcile now falls back to runtime credentials as source inventory when bootstrap source is not configured, preventing false mass-delete plans (`found=0/deleted=N`) and preserving `[[client]]` candidate generation.

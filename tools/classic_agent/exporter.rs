@@ -43,6 +43,7 @@ pub(crate) struct ExportSummary {
     pub(crate) failures: Vec<String>,
 }
 
+#[cfg(test)]
 impl ExportSummary {
     pub(crate) fn exported(&self) -> usize {
         self.links.len()

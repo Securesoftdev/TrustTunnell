@@ -53,9 +53,11 @@ jobs:
           images: ${{ env.PUBLISH_REGISTRY }}/${{ env.PUBLISH_NAMESPACE }}/trusttunnel-endpoint
           tags: |
             type=sha,format=short,prefix=
+            type=raw,value=run-${{ github.run_id }}-${{ github.run_attempt }}
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build endpoint image
+        id: endpoint-build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -71,9 +73,11 @@ jobs:
           images: ${{ env.PUBLISH_REGISTRY }}/${{ env.PUBLISH_NAMESPACE }}/trusttunnel-classic-agent
           tags: |
             type=sha,format=short,prefix=
+            type=raw,value=run-${{ github.run_id }}-${{ github.run_attempt }}
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build classic agent image
+        id: classic-build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -81,3 +85,22 @@ jobs:
           push: true
           tags: ${{ steps.classic-meta.outputs.tags }}
           labels: ${{ steps.classic-meta.outputs.labels }}
+          build-args: |
+            BUILD_GIT_SHA=${{ github.sha }}
+            BUILD_TIMESTAMP=${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Enforce immutable tags and print image digests
+        run: |
+          set -eu
+          endpoint_tags="${{ steps.endpoint-meta.outputs.tags }}"
+          classic_tags="${{ steps.classic-meta.outputs.tags }}"
+          if ! printf '%s\n' "$endpoint_tags" | grep -qv ':latest$'; then
+            echo "endpoint image tags must include immutable non-latest tag" >&2
+            exit 1
+          fi
+          if ! printf '%s\n' "$classic_tags" | grep -qv ':latest$'; then
+            echo "classic-agent image tags must include immutable non-latest tag" >&2
+            exit 1
+          fi
+          echo "endpoint image digest=${{ steps.endpoint-build.outputs.digest }}"
+          echo "classic-agent image digest=${{ steps.classic-build.outputs.digest }}"

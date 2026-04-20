@@ -9,7 +9,10 @@ pub(crate) struct LinkGenerationConfig {
     cert_domain: String,
     #[serde(default)]
     custom_sni: Option<String>,
-    #[serde(default = "default_protocol", deserialize_with = "deserialize_protocol")]
+    #[serde(
+        default = "default_protocol",
+        deserialize_with = "deserialize_protocol"
+    )]
     protocol: DeepLinkProtocol,
     #[serde(default)]
     display_name: Option<String>,
@@ -30,8 +33,12 @@ pub(crate) struct LinkConfigDiagnostics {
 }
 
 impl LinkGenerationConfig {
-    const REQUIRED_FIELDS: [&'static str; 4] =
-        ["node_external_id", "server_address", "cert_domain", "protocol"];
+    const REQUIRED_FIELDS: [&'static str; 4] = [
+        "node_external_id",
+        "server_address",
+        "cert_domain",
+        "protocol",
+    ];
 
     fn expected_shape_hint() -> String {
         format!(
@@ -41,8 +48,12 @@ impl LinkGenerationConfig {
     }
 
     pub(crate) fn load_from_file(path: &Path) -> Result<Self, String> {
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| format!("failed to read link generation config {}: {e}", path.display()))?;
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            format!(
+                "failed to read link generation config {}: {e}",
+                path.display()
+            )
+        })?;
         let parsed = toml::from_str::<Self>(&raw).map_err(|e| {
             format!(
                 "failed to parse link generation config {} as TOML: {e}",
@@ -79,9 +90,12 @@ impl LinkGenerationConfig {
                 Ok((cfg, diagnostics))
             }
             Err(file_err) => {
-                let fallback_allowed = optional_env_nonempty("TRUSTTUNNEL_LINK_CONFIG_ALLOW_LEGACY_FALLBACK")
-                    .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-                    .unwrap_or(false);
+                let fallback_allowed =
+                    optional_env_nonempty("TRUSTTUNNEL_LINK_CONFIG_ALLOW_LEGACY_FALLBACK")
+                        .map(|value| {
+                            matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+                        })
+                        .unwrap_or(false);
                 if !fallback_allowed {
                     return Err(format!(
                         "{file_err}; file-based link config is required at {} (contract_mode=file_required, set TRUSTTUNNEL_LINK_CONFIG_ALLOW_LEGACY_FALLBACK=true to allow legacy env fallback); {}",
@@ -148,13 +162,19 @@ impl LinkGenerationConfig {
 
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.node_external_id.trim().is_empty() {
-            return Err("link generation config validation failed: node_external_id is empty".to_string());
+            return Err(
+                "link generation config validation failed: node_external_id is empty".to_string(),
+            );
         }
         if self.server_address.trim().is_empty() {
-            return Err("link generation config validation failed: server_address is empty".to_string());
+            return Err(
+                "link generation config validation failed: server_address is empty".to_string(),
+            );
         }
         if self.cert_domain.trim().is_empty() {
-            return Err("link generation config validation failed: cert_domain is empty".to_string());
+            return Err(
+                "link generation config validation failed: cert_domain is empty".to_string(),
+            );
         }
         if self
             .dns_servers
@@ -390,7 +410,8 @@ dns_servers = ["8.8.8.8", "1.1.1.1"]
         let path = std::env::temp_dir().join("missing-link-config.toml");
         let err = LinkGenerationConfig::load_from_file_or_legacy_env(&path, "node-a").unwrap_err();
         assert!(err.contains("file-based link config is required"));
-        assert!(err.contains("required fields [node_external_id, server_address, cert_domain, protocol]"));
+        assert!(err
+            .contains("required fields [node_external_id, server_address, cert_domain, protocol]"));
     }
 
     #[test]
@@ -441,7 +462,8 @@ protocol = "http2"
 
         let err = LinkGenerationConfig::load_from_file_or_legacy_env(&path, "node-a").unwrap_err();
         assert!(err.contains("missing field `node_external_id`"));
-        assert!(err.contains("required fields [node_external_id, server_address, cert_domain, protocol]"));
+        assert!(err
+            .contains("required fields [node_external_id, server_address, cert_domain, protocol]"));
     }
 
     #[test]
@@ -452,7 +474,8 @@ protocol = "http2"
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("missing.toml");
 
-        let (_, diagnostics) = LinkGenerationConfig::load_with_diagnostics(&path, "node-a").unwrap();
+        let (_, diagnostics) =
+            LinkGenerationConfig::load_with_diagnostics(&path, "node-a").unwrap();
         assert!(diagnostics.fallback_used);
         assert_eq!(diagnostics.contract_mode, "legacy_fallback");
 

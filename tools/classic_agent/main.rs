@@ -1,27 +1,29 @@
-mod legacy;
-mod exporter;
-mod link_config;
 mod credentials_format;
 mod credentials_inventory;
+mod exporter;
+mod legacy;
+mod link_config;
 mod lk_bulk_writer;
 mod runtime_workspace;
 
+use credentials_format::parse_client_credentials;
+use credentials_inventory::{
+    compute_delta as compute_inventory_delta, load_inventory_snapshot,
+    load_state as load_inventory_state, persist_state as persist_inventory_state,
+    resolve_credentials_path_from_settings, ExportConfig as InventoryExportConfig,
+    InventoryAccount,
+};
+use exporter::{EndpointExportOptions, EndpointLinkExporter};
 use legacy::lk_api::{
     Account, AccountExportPayload, HeartbeatPayload, HeartbeatStats, LkApiClient, NodeMetadata,
-    OnboardingPayload, SyncPayload, SyncReportPayload, SyncResponse, DEFAULT_SYNC_PATH_TEMPLATE,
-    DEFAULT_SYNC_REPORT_PATH, DEFAULT_HEARTBEAT_PATH, DEFAULT_REGISTER_PATH,
+    OnboardingPayload, SyncPayload, SyncReportPayload, SyncResponse, DEFAULT_HEARTBEAT_PATH,
+    DEFAULT_REGISTER_PATH, DEFAULT_SYNC_PATH_TEMPLATE, DEFAULT_SYNC_REPORT_PATH,
 };
-use credentials_inventory::{
-    ExportConfig as InventoryExportConfig, InventoryAccount, compute_delta as compute_inventory_delta,
-    load_inventory_snapshot, load_state as load_inventory_state, persist_state as persist_inventory_state,
-    resolve_credentials_path_from_settings,
-};
-use credentials_format::parse_client_credentials;
-use exporter::{EndpointExportOptions, EndpointLinkExporter};
-use lk_bulk_writer::{LkArtifactRecord, LkBulkWriter, LkWriteContract};
 use link_config::LinkGenerationConfig;
-use runtime_workspace::{ArtifactKind, RuntimeWorkspace};
+use lk_bulk_writer::{LkArtifactRecord, LkBulkWriter, LkWriteContract};
+use prometheus::{Encoder, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder};
 use reqwest::StatusCode;
+use runtime_workspace::{ArtifactKind, RuntimeWorkspace};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::read_dir;
@@ -29,14 +31,13 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
-use tokio::net::TcpListener;
 use tokio::fs::{self, OpenOptions};
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
 use tokio::process::Command;
-use tokio::time::{Instant, MissedTickBehavior, interval};
+use tokio::time::{interval, Instant, MissedTickBehavior};
 use toml_edit::value;
-use prometheus::{Encoder, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder};
 
 const SYNC_REPORT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const SYNC_REPORT_MAX_BACKOFF: Duration = Duration::from_secs(300);
@@ -56,6 +57,7 @@ const DEFAULT_ENDPOINT_BINARY_PATH: &str = "/usr/local/bin/trusttunnel_endpoint"
 const LINK_GENERATION_STARTED_PHASE: &str = "link_generation_started";
 const LINK_GENERATION_COMPLETE_PHASE: &str = "link_generation_complete";
 const LINK_GENERATION_EXPORTED_PHASE: &str = "link_generation_exported";
+const BATCH_ID_FORMAT_VERSION: &str = "v2_node_idempotency_request";
 
 mod sidecar_sync {
     use super::sha256_hex;
@@ -305,15 +307,18 @@ impl Config {
         let trusttunnel_runtime_dir: PathBuf = required_env("TRUSTTUNNEL_RUNTIME_DIR")?.into();
         let trusttunnel_runtime_credentials_file: PathBuf =
             required_env("TRUSTTUNNEL_RUNTIME_CREDENTIALS_FILE")?.into();
-        let trusttunnel_link_config_file: PathBuf = optional_env_nonempty("TRUSTTUNNEL_LINK_CONFIG_FILE")
-            .unwrap_or_else(|| "tt-link.toml".to_string())
-            .into();
+        let trusttunnel_link_config_file: PathBuf =
+            optional_env_nonempty("TRUSTTUNNEL_LINK_CONFIG_FILE")
+                .unwrap_or_else(|| "tt-link.toml".to_string())
+                .into();
         let trusttunnel_config_file: PathBuf = required_env("TRUSTTUNNEL_CONFIG_FILE")?.into();
         let trusttunnel_hosts_file: PathBuf = required_env("TRUSTTUNNEL_HOSTS_FILE")?.into();
         let bootstrap_credentials_source_path =
             optional_env("TRUSTTUNNEL_BOOTSTRAP_CREDENTIALS_FILE").map(PathBuf::from);
-        let runtime_credentials_path =
-            resolve_runtime_path(&trusttunnel_runtime_dir, &trusttunnel_runtime_credentials_file);
+        let runtime_credentials_path = resolve_runtime_path(
+            &trusttunnel_runtime_dir,
+            &trusttunnel_runtime_credentials_file,
+        );
         let runtime_primary_marker_path = trusttunnel_runtime_dir.join(RUNTIME_PRIMARY_MARKER_FILE);
         let agent_state_path = std::env::var("AGENT_STATE_PATH")
             .unwrap_or_else(|_| "agent_state.json".to_string())
@@ -322,55 +327,68 @@ impl Config {
         let reconcile_interval = duration_required_from_env("AGENT_RECONCILE_INTERVAL_SEC")?;
         let apply_interval = duration_required_from_env("AGENT_APPLY_INTERVAL_SEC")?;
 
-        let (lk_base_url, lk_service_token, node_stage, node_cluster, node_namespace, node_rollout_group, heartbeat_interval, sync_path_template, sync_report_path) =
-            if runtime_mode == RuntimeMode::LegacyHttp {
-                (
-                    Some(required_env("LK_BASE_URL")?),
-                    Some(required_env("LK_SERVICE_TOKEN")?),
-                    optional_env_nonempty("NODE_STAGE"),
-                    optional_env_nonempty("NODE_CLUSTER"),
-                    optional_env_nonempty("NODE_NAMESPACE"),
-                    optional_env_nonempty("NODE_ROLLOUT_GROUP"),
-                    duration_required_from_env("AGENT_HEARTBEAT_INTERVAL_SEC")?,
-                    Some(
-                        std::env::var("LK_SYNC_PATH_TEMPLATE")
-                            .unwrap_or_else(|_| DEFAULT_SYNC_PATH_TEMPLATE.to_string()),
-                    ),
-                    Some(
-                        std::env::var("LK_SYNC_REPORT_PATH")
-                            .unwrap_or_else(|_| DEFAULT_SYNC_REPORT_PATH.to_string()),
-                    ),
-                )
-            } else {
-                let lifecycle_base_url = optional_env_nonempty("LK_LIFECYCLE_BASE_URL")
-                    .or_else(|| optional_env_nonempty("LK_BASE_URL"))
-                    .or_else(|| derive_lifecycle_base_url_from_artifacts_endpoint(&lk_db_dsn));
-                let service_token = optional_env_nonempty("LK_SERVICE_TOKEN");
-                let heartbeat_interval = optional_env_nonempty("AGENT_HEARTBEAT_INTERVAL_SEC")
-                    .map(|raw| {
-                        let secs = raw
-                            .parse::<u64>()
-                            .map_err(|e| format!("AGENT_HEARTBEAT_INTERVAL_SEC must be u64 seconds: {e}"))?;
-                        Ok::<Duration, String>(Duration::from_secs(secs))
-                    })
-                    .transpose()?
-                    .unwrap_or(DEFAULT_DB_WORKER_HEARTBEAT_INTERVAL);
-                (
-                    lifecycle_base_url,
-                    service_token,
-                    None,
-                    None,
-                    None,
-                    None,
-                    heartbeat_interval,
-                    None,
-                    None,
-                )
-            };
+        let (
+            lk_base_url,
+            lk_service_token,
+            node_stage,
+            node_cluster,
+            node_namespace,
+            node_rollout_group,
+            heartbeat_interval,
+            sync_path_template,
+            sync_report_path,
+        ) = if runtime_mode == RuntimeMode::LegacyHttp {
+            (
+                Some(required_env("LK_BASE_URL")?),
+                Some(required_env("LK_SERVICE_TOKEN")?),
+                optional_env_nonempty("NODE_STAGE"),
+                optional_env_nonempty("NODE_CLUSTER"),
+                optional_env_nonempty("NODE_NAMESPACE"),
+                optional_env_nonempty("NODE_ROLLOUT_GROUP"),
+                duration_required_from_env("AGENT_HEARTBEAT_INTERVAL_SEC")?,
+                Some(
+                    std::env::var("LK_SYNC_PATH_TEMPLATE")
+                        .unwrap_or_else(|_| DEFAULT_SYNC_PATH_TEMPLATE.to_string()),
+                ),
+                Some(
+                    std::env::var("LK_SYNC_REPORT_PATH")
+                        .unwrap_or_else(|_| DEFAULT_SYNC_REPORT_PATH.to_string()),
+                ),
+            )
+        } else {
+            let lifecycle_base_url = optional_env_nonempty("LK_LIFECYCLE_BASE_URL")
+                .or_else(|| optional_env_nonempty("LK_BASE_URL"))
+                .or_else(|| derive_lifecycle_base_url_from_artifacts_endpoint(&lk_db_dsn));
+            let service_token = optional_env_nonempty("LK_SERVICE_TOKEN");
+            let heartbeat_interval = optional_env_nonempty("AGENT_HEARTBEAT_INTERVAL_SEC")
+                .map(|raw| {
+                    let secs = raw.parse::<u64>().map_err(|e| {
+                        format!("AGENT_HEARTBEAT_INTERVAL_SEC must be u64 seconds: {e}")
+                    })?;
+                    Ok::<Duration, String>(Duration::from_secs(secs))
+                })
+                .transpose()?
+                .unwrap_or(DEFAULT_DB_WORKER_HEARTBEAT_INTERVAL);
+            (
+                lifecycle_base_url,
+                service_token,
+                None,
+                None,
+                None,
+                None,
+                heartbeat_interval,
+                None,
+                None,
+            )
+        };
 
-        let apply_cmd = std::env::var("TRUSTTUNNEL_APPLY_CMD")
-            .ok()
-            .and_then(|x| if x.trim().is_empty() { None } else { Some(x) });
+        let apply_cmd = std::env::var("TRUSTTUNNEL_APPLY_CMD").ok().and_then(|x| {
+            if x.trim().is_empty() {
+                None
+            } else {
+                Some(x)
+            }
+        });
         let runtime_pid_path = if runtime_mode == RuntimeMode::LegacyHttp {
             Some(
                 std::env::var("TRUSTTUNNEL_RUNTIME_PID_FILE")
@@ -390,8 +408,8 @@ impl Config {
         };
         let agent_version = optional_env_nonempty("TRUSTTUNNEL_AGENT_VERSION")
             .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
-        let runtime_version =
-            optional_env_nonempty("TRUSTTUNNEL_RUNTIME_VERSION").unwrap_or_else(|| "unknown".to_string());
+        let runtime_version = optional_env_nonempty("TRUSTTUNNEL_RUNTIME_VERSION")
+            .unwrap_or_else(|| "unknown".to_string());
         let endpoint_binary = resolve_endpoint_binary_from_env();
         let pending_sync_reports_path = if runtime_mode == RuntimeMode::LegacyHttp {
             Some(trusttunnel_runtime_dir.join(SYNC_REPORT_OUTBOX_FILE))
@@ -419,45 +437,42 @@ impl Config {
                 )
             })
             .unwrap_or(false);
-        let syntax_validation_diagnostic_only = optional_env_nonempty(
-            "TRUSTTUNNEL_CANDIDATE_SYNTAX_DIAGNOSTIC_ONLY",
-        )
-        .map(|raw| {
-            matches!(
-                raw.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false);
-        let runtime_validation_min_users = optional_env_nonempty(
-            "TRUSTTUNNEL_RUNTIME_VALIDATION_MIN_USERS",
-        )
-        .map(|raw| {
-            raw.parse::<usize>().map_err(|e| {
-                format!(
+        let syntax_validation_diagnostic_only =
+            optional_env_nonempty("TRUSTTUNNEL_CANDIDATE_SYNTAX_DIAGNOSTIC_ONLY")
+                .map(|raw| {
+                    matches!(
+                        raw.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(false);
+        let runtime_validation_min_users =
+            optional_env_nonempty("TRUSTTUNNEL_RUNTIME_VALIDATION_MIN_USERS")
+                .map(|raw| {
+                    raw.parse::<usize>().map_err(|e| {
+                        format!(
                     "TRUSTTUNNEL_RUNTIME_VALIDATION_MIN_USERS must be a positive integer: {e}"
                 )
-            })
-        })
-        .transpose()?
-        .unwrap_or(DEFAULT_RUNTIME_VALIDATION_MIN_USERS);
+                    })
+                })
+                .transpose()?
+                .unwrap_or(DEFAULT_RUNTIME_VALIDATION_MIN_USERS);
         if runtime_validation_min_users == 0 {
             return Err(
                 "TRUSTTUNNEL_RUNTIME_VALIDATION_MIN_USERS must be greater than zero".to_string(),
             );
         }
-        let runtime_validation_max_users = optional_env_nonempty(
-            "TRUSTTUNNEL_RUNTIME_VALIDATION_MAX_USERS",
-        )
-        .map(|raw| {
-            raw.parse::<usize>().map_err(|e| {
-                format!(
+        let runtime_validation_max_users =
+            optional_env_nonempty("TRUSTTUNNEL_RUNTIME_VALIDATION_MAX_USERS")
+                .map(|raw| {
+                    raw.parse::<usize>().map_err(|e| {
+                        format!(
                     "TRUSTTUNNEL_RUNTIME_VALIDATION_MAX_USERS must be a positive integer: {e}"
                 )
-            })
-        })
-        .transpose()?
-        .unwrap_or(DEFAULT_RUNTIME_VALIDATION_MAX_USERS);
+                    })
+                })
+                .transpose()?
+                .unwrap_or(DEFAULT_RUNTIME_VALIDATION_MAX_USERS);
         if runtime_validation_max_users == 0 {
             return Err(
                 "TRUSTTUNNEL_RUNTIME_VALIDATION_MAX_USERS must be greater than zero".to_string(),
@@ -528,8 +543,11 @@ impl Config {
                 "lifecycle writes are enabled but lifecycle base URL is empty; set LK_LIFECYCLE_BASE_URL (preferred) or LK_BASE_URL".to_string(),
             );
         }
-        let parsed = reqwest::Url::parse(base_url)
-            .map_err(|e| format!("lifecycle writes are enabled but lifecycle base URL is invalid ({base_url}): {e}"))?;
+        let parsed = reqwest::Url::parse(base_url).map_err(|e| {
+            format!(
+                "lifecycle writes are enabled but lifecycle base URL is invalid ({base_url}): {e}"
+            )
+        })?;
         if parsed.host_str().is_none() {
             return Err(format!(
                 "lifecycle writes are enabled but lifecycle base URL has no host: {base_url}"
@@ -562,7 +580,8 @@ impl Config {
             ));
         }
 
-        let config_path = resolve_runtime_path(&self.trusttunnel_runtime_dir, &self.trusttunnel_config_file);
+        let config_path =
+            resolve_runtime_path(&self.trusttunnel_runtime_dir, &self.trusttunnel_config_file);
         if !config_path.exists() {
             return Err(format!(
                 "TRUSTTUNNEL_CONFIG_FILE path not found: {}",
@@ -570,7 +589,8 @@ impl Config {
             ));
         }
 
-        let hosts_path = resolve_runtime_path(&self.trusttunnel_runtime_dir, &self.trusttunnel_hosts_file);
+        let hosts_path =
+            resolve_runtime_path(&self.trusttunnel_runtime_dir, &self.trusttunnel_hosts_file);
         if !hosts_path.exists() {
             return Err(format!(
                 "TRUSTTUNNEL_HOSTS_FILE path not found: {}",
@@ -578,15 +598,12 @@ impl Config {
             ));
         }
 
-        let credentials_parent = self
-            .runtime_credentials_path
-            .parent()
-            .ok_or_else(|| {
-                format!(
-                    "TRUSTTUNNEL_RUNTIME_CREDENTIALS_FILE has no parent directory: {}",
-                    self.runtime_credentials_path.display()
-                )
-            })?;
+        let credentials_parent = self.runtime_credentials_path.parent().ok_or_else(|| {
+            format!(
+                "TRUSTTUNNEL_RUNTIME_CREDENTIALS_FILE has no parent directory: {}",
+                self.runtime_credentials_path.display()
+            )
+        })?;
         if !credentials_parent.exists() {
             return Err(format!(
                 "TRUSTTUNNEL_RUNTIME_CREDENTIALS_FILE parent path not found: {}",
@@ -594,8 +611,10 @@ impl Config {
             ));
         }
 
-        let link_config_path =
-            resolve_runtime_path(&self.trusttunnel_runtime_dir, &self.trusttunnel_link_config_file);
+        let link_config_path = resolve_runtime_path(
+            &self.trusttunnel_runtime_dir,
+            &self.trusttunnel_link_config_file,
+        );
         let link_config_parent = link_config_path.parent().ok_or_else(|| {
             format!(
                 "TRUSTTUNNEL_LINK_CONFIG_FILE has no parent directory: {}",
@@ -697,10 +716,7 @@ impl Agent {
             node_namespace: cfg.node_namespace.clone(),
             node_rollout_group: cfg.node_rollout_group.clone(),
         };
-        let lk_base_url = cfg
-            .lk_base_url
-            .clone()
-            .unwrap_or_default();
+        let lk_base_url = cfg.lk_base_url.clone().unwrap_or_default();
         if cfg.runtime_mode.supports_lifecycle_writes() && lk_base_url.trim().is_empty() {
             return Err(
                 "failed to initialize lifecycle API client: empty lifecycle base URL".to_string(),
@@ -983,16 +999,20 @@ impl Agent {
             "phase=apply_start pass={} changed={} source={}",
             pass,
             plan.changed,
-            if plan.changed { "reconcile_tick" } else { "no_pending_plan" }
+            if plan.changed {
+                "reconcile_tick"
+            } else {
+                "no_pending_plan"
+            }
         );
 
         if plan.changed {
             println!(
                 "phase=apply_plan_summary node={} planned_credentials_count={}",
-                self.cfg.node_external_id,
-                plan.stats.found
+                self.cfg.node_external_id, plan.stats.found
             );
-            let previous_runtime_credentials = fs::read(&self.cfg.runtime_credentials_path).await.ok();
+            let previous_runtime_credentials =
+                fs::read(&self.cfg.runtime_credentials_path).await.ok();
             let tmp_credentials_path = self
                 .write_runtime_credentials_tmp(plan.rendered_credentials.as_bytes())
                 .await?;
@@ -1036,7 +1056,9 @@ impl Agent {
                 plan.stats.errors += 1;
                 self.update_sidecar_sync_metrics(pass, &plan.stats);
                 return match rollback_result {
-                    Ok(()) => Err(format!("sidecar sync apply failed and rollback completed: {apply_err}")),
+                    Ok(()) => Err(format!(
+                        "sidecar sync apply failed and rollback completed: {apply_err}"
+                    )),
                     Err(rollback_err) => Err(format!(
                         "sidecar sync apply failed: {apply_err}; rollback failed: {rollback_err}"
                     )),
@@ -1053,7 +1075,8 @@ impl Agent {
             sidecar_sync::PassKind::Bootstrap => InventoryIngestSource::Bootstrap,
             sidecar_sync::PassKind::Reconcile => InventoryIngestSource::Imported,
         };
-        self.sync_local_inventory_export_sidecar(inventory_source).await?;
+        self.sync_local_inventory_export_sidecar(inventory_source)
+            .await?;
 
         if !plan.changed {
             plan.stats.skipped += plan.stats.missing_credentials;
@@ -1074,7 +1097,11 @@ impl Agent {
             plan.stats.deleted_credentials
         );
         log_event(
-            if plan.stats.errors == 0 { "info" } else { "error" },
+            if plan.stats.errors == 0 {
+                "info"
+            } else {
+                "error"
+            },
             self.state.applied_revision.as_deref().unwrap_or("none"),
             &node,
             "sidecar_sync_pass",
@@ -1094,7 +1121,9 @@ impl Agent {
         Ok(stats)
     }
 
-    async fn load_desired_access_artifacts(&self) -> Result<Vec<sidecar_sync::AccessArtifact>, String> {
+    async fn load_desired_access_artifacts(
+        &self,
+    ) -> Result<Vec<sidecar_sync::AccessArtifact>, String> {
         if let Some(source_path) = self.cfg.bootstrap_credentials_source_path.as_ref() {
             let raw = fs::read_to_string(source_path).await.map_err(|e| {
                 format!(
@@ -1201,14 +1230,19 @@ impl Agent {
         &mut self,
         inventory_source: InventoryIngestSource,
     ) -> Result<(), String> {
-        let settings_path = resolve_runtime_path(&self.cfg.trusttunnel_runtime_dir, &self.cfg.trusttunnel_config_file);
+        let settings_path = resolve_runtime_path(
+            &self.cfg.trusttunnel_runtime_dir,
+            &self.cfg.trusttunnel_config_file,
+        );
         let credentials_path = resolve_credentials_path_from_settings(
             &self.cfg.trusttunnel_runtime_dir,
             &settings_path,
         )?;
 
-        let link_config_path =
-            resolve_runtime_path(&self.cfg.trusttunnel_runtime_dir, &self.cfg.trusttunnel_link_config_file);
+        let link_config_path = resolve_runtime_path(
+            &self.cfg.trusttunnel_runtime_dir,
+            &self.cfg.trusttunnel_link_config_file,
+        );
         let (link_cfg, link_diag) = LinkGenerationConfig::load_with_diagnostics(
             &link_config_path,
             &self.cfg.node_external_id,
@@ -1334,10 +1368,14 @@ impl Agent {
                 usernames.len(),
                 removed_count
             );
-            let settings_path =
-                resolve_runtime_path(&self.cfg.trusttunnel_runtime_dir, &self.cfg.trusttunnel_config_file);
-            let hosts_path =
-                resolve_runtime_path(&self.cfg.trusttunnel_runtime_dir, &self.cfg.trusttunnel_hosts_file);
+            let settings_path = resolve_runtime_path(
+                &self.cfg.trusttunnel_runtime_dir,
+                &self.cfg.trusttunnel_config_file,
+            );
+            let hosts_path = resolve_runtime_path(
+                &self.cfg.trusttunnel_runtime_dir,
+                &self.cfg.trusttunnel_hosts_file,
+            );
             let exporter = EndpointLinkExporter::new(
                 self.cfg.endpoint_binary.clone(),
                 settings_path,
@@ -1371,7 +1409,9 @@ impl Agent {
                     println!(
                         "phase={} node={} endpoint_bin_path={} username={}",
                         LINK_GENERATION_EXPORTED_PHASE,
-                        self.cfg.node_external_id, self.cfg.endpoint_binary, username
+                        self.cfg.node_external_id,
+                        self.cfg.endpoint_binary,
+                        username
                     );
                 }
             }
@@ -1403,28 +1443,35 @@ impl Agent {
             })
             .collect::<Vec<_>>();
         if !use_full_snapshot_for_export {
-            records.extend(delta.removed.iter().map(|username| LkArtifactRecord {
-                username: username.clone(),
-                external_node_id: self.cfg.node_external_id.clone(),
-                external_account_id: None,
-                access_bundle_id: None,
-                tt_link: None,
-                config_hash: Some(snapshot.export_config_hash.clone()),
-                active: false,
-                credential_external_id: None,
-                generated_at: Some(
-                    chrono::DateTime::from_timestamp(snapshot.generated_at_unix_sec, 0)
-                        .unwrap_or_else(chrono::Utc::now)
-                        .to_rfc3339(),
-                ),
-                source: Some("classic_agent".to_string()),
-                display_name: link_cfg.display_name(),
-                source_key: Some(username.clone()),
-                link_hash: None,
+            records.extend(delta.removed.iter().map(|username| {
+                LkArtifactRecord {
+                    username: username.clone(),
+                    external_node_id: self.cfg.node_external_id.clone(),
+                    external_account_id: None,
+                    access_bundle_id: None,
+                    tt_link: None,
+                    config_hash: Some(snapshot.export_config_hash.clone()),
+                    active: false,
+                    credential_external_id: None,
+                    generated_at: Some(
+                        chrono::DateTime::from_timestamp(snapshot.generated_at_unix_sec, 0)
+                            .unwrap_or_else(chrono::Utc::now)
+                            .to_rfc3339(),
+                    ),
+                    source: Some("classic_agent".to_string()),
+                    display_name: link_cfg.display_name(),
+                    source_key: Some(username.clone()),
+                    link_hash: None,
+                }
             }));
         }
         let records_count = records.len();
         let endpoint = writer.selected_endpoint().unwrap_or("n/a");
+        println!(
+            "phase=lk_writer_route_resolved node={} contract={} writer_path=tools/classic_agent/lk_bulk_writer.rs route=build_api_request",
+            self.cfg.node_external_id,
+            writer.active_contract()
+        );
         println!(
             "phase=lk_api_write_begin contract={} endpoint={} external_node_id={} records_count={}",
             writer.active_contract(),
@@ -1540,7 +1587,9 @@ impl Agent {
                 .map(str::trim)
                 .filter(|item| !item.is_empty())
             {
-                request = request.bearer_auth(token).header("X-Internal-Agent-Token", token);
+                request = request
+                    .bearer_auth(token)
+                    .header("X-Internal-Agent-Token", token);
             }
             let response = request.send().await;
             match response {
@@ -1617,7 +1666,6 @@ impl Agent {
         }
         Err("inventory ingest retry loop exhausted".to_string())
     }
-
 
     async fn run_legacy_http_loop(&mut self) {
         self.bootstrap_register().await;
@@ -1734,7 +1782,12 @@ impl Agent {
                 .await?;
             self.metrics
                 .reconcile_total
-                .with_label_values(&[&node, &snapshot.version, "skipped", "reconcile_not_required"])
+                .with_label_values(&[
+                    &node,
+                    &snapshot.version,
+                    "skipped",
+                    "reconcile_not_required",
+                ])
                 .inc();
             log_event(
                 "info",
@@ -1788,7 +1841,13 @@ impl Agent {
                 .reconcile_total
                 .with_label_values(&[&node, &snapshot.version, "unchanged", "none"])
                 .inc();
-            log_event("info", &snapshot.version, &node, "reconcile_unchanged", "none");
+            log_event(
+                "info",
+                &snapshot.version,
+                &node,
+                "reconcile_unchanged",
+                "none",
+            );
             return Ok(());
         }
 
@@ -1815,12 +1874,8 @@ impl Agent {
             Ok(files) => files,
             Err(err) => return Err(err),
         };
-        if let Err(err) = self
-            .cleanup_validation_files(&validation_files, self.cfg.debug_preserve_temp_files, false)
-            .await
-        {
-            return Err(err);
-        }
+        self.cleanup_validation_files(&validation_files, self.cfg.debug_preserve_temp_files, false)
+            .await?;
         self.promote_runtime_credentials(&validation_files.candidate_credentials_path)
             .await?;
         println!(
@@ -1845,24 +1900,31 @@ impl Agent {
                 let rollback_result = self.rollback_runtime(previous_runtime_credentials).await;
                 match rollback_result {
                     Ok(()) => format!("runtime apply failed and rollback completed: {e}"),
-                    Err(rollback_err) => format!(
-                        "runtime apply failed: {e}; rollback failed: {rollback_err}"
-                    ),
+                    Err(rollback_err) => {
+                        format!("runtime apply failed: {e}; rollback failed: {rollback_err}")
+                    }
                 }
             }
         };
         self.last_apply_status = if apply_ok { "ok" } else { "error" }.to_string();
-        self.metrics.apply_total.with_label_values(&[
-            &node,
-            &snapshot.version,
-            if apply_ok { "success" } else { "failed" },
-            if apply_ok { "none" } else { "apply_or_verify" },
-        ]).inc();
+        self.metrics
+            .apply_total
+            .with_label_values(&[
+                &node,
+                &snapshot.version,
+                if apply_ok { "success" } else { "failed" },
+                if apply_ok { "none" } else { "apply_or_verify" },
+            ])
+            .inc();
         log_event(
             if apply_ok { "info" } else { "error" },
             &snapshot.version,
             &node,
-            if apply_ok { "apply_success" } else { "apply_failed" },
+            if apply_ok {
+                "apply_success"
+            } else {
+                "apply_failed"
+            },
             if apply_ok { "none" } else { "apply_or_verify" },
         );
 
@@ -1875,7 +1937,13 @@ impl Agent {
                 .last_failed_reconcile
                 .with_label_values(&[&node])
                 .set(chrono::Utc::now().timestamp());
-            log_event("error", &snapshot.version, &node, "reconcile_failed", "apply");
+            log_event(
+                "error",
+                &snapshot.version,
+                &node,
+                "reconcile_failed",
+                "apply",
+            );
             self.send_sync_report(&snapshot.version, "error", Some(&apply_details), None)
                 .await?;
             return Err(apply_details);
@@ -1926,7 +1994,13 @@ impl Agent {
             .last_successful_reconcile
             .with_label_values(&[&node])
             .set(chrono::Utc::now().timestamp());
-        log_event("info", &snapshot.version, &node, "reconcile_success", "none");
+        log_event(
+            "info",
+            &snapshot.version,
+            &node,
+            "reconcile_success",
+            "none",
+        );
 
         Ok(())
     }
@@ -1956,9 +2030,7 @@ impl Agent {
                 .await
                 .unwrap_or(false)
             {
-                println!(
-                    "runtime credentials already marked as primary, bootstrap source ignored"
-                );
+                println!("runtime credentials already marked as primary, bootstrap source ignored");
             }
             return Ok(());
         }
@@ -2006,7 +2078,11 @@ impl Agent {
             return Ok(());
         }
 
-        atomic_write(&self.cfg.runtime_primary_marker_path, b"runtime_credentials_primary\n").await
+        atomic_write(
+            &self.cfg.runtime_primary_marker_path,
+            b"runtime_credentials_primary\n",
+        )
+        .await
     }
 
     async fn fetch_accounts_by_node(&self) -> Result<Option<(SyncPayload, Vec<u8>)>, String> {
@@ -2054,10 +2130,9 @@ impl Agent {
         if let Err(err) = self.send_sync_report_payload(&report).await {
             eprintln!("sync-report failed: {err}; queued for retry");
             append_pending_sync_report(
-                self.cfg
-                    .pending_sync_reports_path
-                    .as_ref()
-                    .ok_or_else(|| "sync-report outbox is disabled in db_worker mode".to_string())?,
+                self.cfg.pending_sync_reports_path.as_ref().ok_or_else(|| {
+                    "sync-report outbox is disabled in db_worker mode".to_string()
+                })?,
                 &report.to_owned_payload(),
             )
             .await?;
@@ -2135,11 +2210,8 @@ impl Agent {
             let report = item.as_payload();
             if let Err(err) = self.send_sync_report_payload(&report).await {
                 eprintln!("sync-report retry failed: {err}");
-                if let Err(persist_err) = persist_pending_sync_reports(
-                    outbox_path,
-                    &pending[idx..],
-                )
-                .await
+                if let Err(persist_err) =
+                    persist_pending_sync_reports(outbox_path, &pending[idx..]).await
                 {
                     eprintln!("failed to persist sync-report outbox: {persist_err}");
                 }
@@ -2158,8 +2230,10 @@ impl Agent {
 
     fn increase_sync_report_backoff(&mut self) {
         self.sync_report_next_retry_at = Instant::now() + self.sync_report_backoff;
-        self.sync_report_backoff =
-            std::cmp::min(self.sync_report_backoff.saturating_mul(2), SYNC_REPORT_MAX_BACKOFF);
+        self.sync_report_backoff = std::cmp::min(
+            self.sync_report_backoff.saturating_mul(2),
+            SYNC_REPORT_MAX_BACKOFF,
+        );
     }
 
     fn reset_sync_report_backoff(&mut self) {
@@ -2212,7 +2286,9 @@ impl Agent {
 
     async fn send_heartbeat(&self) -> Result<(), HeartbeatFailure> {
         let runtime_status = match self.cfg.runtime_mode {
-            RuntimeMode::DbWorker => RuntimeStatus::collect_db_worker(&self.cfg.runtime_credentials_path),
+            RuntimeMode::DbWorker => {
+                RuntimeStatus::collect_db_worker(&self.cfg.runtime_credentials_path)
+            }
             RuntimeMode::LegacyHttp => RuntimeStatus::collect(
                 self.cfg
                     .runtime_pid_path
@@ -2259,29 +2335,32 @@ impl Agent {
         println!(
             "phase=heartbeat_sent node={} revision={} health={}",
             self.cfg.node_external_id,
-            normalized_payload.current_revision.as_deref().unwrap_or("none"),
+            normalized_payload
+                .current_revision
+                .as_deref()
+                .unwrap_or("none"),
             normalized_payload.health_status
         );
-        self.lk_api
-            .heartbeat(&payload)
-            .await
-            .map_err(|err| {
-                if let Some(metric) = &self.metrics.runtime_health_total {
-                    metric
-                        .with_label_values(&[
-                            &self.cfg.node_external_id,
-                            self.state.applied_revision.as_deref().unwrap_or("none"),
-                            "failed",
-                            err.kind(),
-                        ])
-                        .inc();
-                }
-                HeartbeatFailure::Api(err)
-            })?;
+        self.lk_api.heartbeat(&payload).await.map_err(|err| {
+            if let Some(metric) = &self.metrics.runtime_health_total {
+                metric
+                    .with_label_values(&[
+                        &self.cfg.node_external_id,
+                        self.state.applied_revision.as_deref().unwrap_or("none"),
+                        "failed",
+                        err.kind(),
+                    ])
+                    .inc();
+            }
+            HeartbeatFailure::Api(err)
+        })?;
         println!(
             "phase=heartbeat_accepted node={} revision={} health={}",
             self.cfg.node_external_id,
-            normalized_payload.current_revision.as_deref().unwrap_or("none"),
+            normalized_payload
+                .current_revision
+                .as_deref()
+                .unwrap_or("none"),
             normalized_payload.health_status
         );
         if let Some(metric) = &self.metrics.runtime_health_total {
@@ -2400,9 +2479,12 @@ impl Agent {
                 .and_then(|x| x.to_str())
                 .unwrap_or("credentials"),
         );
-        fs::write(&tmp_path, data)
-            .await
-            .map_err(|e| format!("failed to write candidate credentials {}: {e}", tmp_path.display()))?;
+        fs::write(&tmp_path, data).await.map_err(|e| {
+            format!(
+                "failed to write candidate credentials {}: {e}",
+                tmp_path.display()
+            )
+        })?;
         let candidate_raw = String::from_utf8_lossy(data);
         let candidate_written_count = parse_access_artifacts(&candidate_raw)
             .map(|artifacts| artifacts.len())
@@ -2429,12 +2511,14 @@ impl Agent {
                 settings_path.display()
             )
         })?;
-        let mut settings_doc = settings_content.parse::<toml_edit::Document>().map_err(|e| {
-            format!(
-                "failed to parse endpoint settings {}: {e}",
-                settings_path.display()
-            )
-        })?;
+        let mut settings_doc = settings_content
+            .parse::<toml_edit::Document>()
+            .map_err(|e| {
+                format!(
+                    "failed to parse endpoint settings {}: {e}",
+                    settings_path.display()
+                )
+            })?;
         let candidate_path_str = path_to_string(candidate_path)?.to_string();
         settings_doc["credentials_file"] = value(candidate_path_str);
 
@@ -2484,12 +2568,14 @@ impl Agent {
                 temp_config_path.display()
             )
         })?;
-        let parsed_doc = settings_content.parse::<toml_edit::Document>().map_err(|e| {
-            format!(
-                "failed to parse temp endpoint settings document {}: {e}",
-                temp_config_path.display()
-            )
-        })?;
+        let parsed_doc = settings_content
+            .parse::<toml_edit::Document>()
+            .map_err(|e| {
+                format!(
+                    "failed to parse temp endpoint settings document {}: {e}",
+                    temp_config_path.display()
+                )
+            })?;
         let configured_credentials = parsed_doc
             .get("credentials_file")
             .and_then(toml_edit::Item::as_str)
@@ -2545,8 +2631,10 @@ impl Agent {
                 candidate_path.display()
             )
         })?;
-        let hosts_path =
-            resolve_runtime_path(&self.cfg.trusttunnel_runtime_dir, &self.cfg.trusttunnel_hosts_file);
+        let hosts_path = resolve_runtime_path(
+            &self.cfg.trusttunnel_runtime_dir,
+            &self.cfg.trusttunnel_hosts_file,
+        );
         if selected_usernames.limited {
             println!(
                 "phase=runtime_validation_user_limit_applied node={} strategy=sorted_take_first total_usernames={} selected_usernames={} min_users={} max_users={} candidate_path={}",
@@ -2664,24 +2752,23 @@ impl Agent {
             );
             return Ok(());
         }
-        if fs::try_exists(&files.temp_config_path)
-            .await
-            .map_err(|e| {
-                format!(
-                    "failed to check temp endpoint settings {}: {e}",
-                    files.temp_config_path.display()
-                )
-            })?
-        {
-            fs::remove_file(&files.temp_config_path).await.map_err(|e| {
-                format!(
-                    "failed to remove temp endpoint settings {}: {e}",
-                    files.temp_config_path.display()
-                )
-            })?;
+        if fs::try_exists(&files.temp_config_path).await.map_err(|e| {
+            format!(
+                "failed to check temp endpoint settings {}: {e}",
+                files.temp_config_path.display()
+            )
+        })? {
+            fs::remove_file(&files.temp_config_path)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "failed to remove temp endpoint settings {}: {e}",
+                        files.temp_config_path.display()
+                    )
+                })?;
         }
-        if remove_candidate {
-            if fs::try_exists(&files.candidate_credentials_path)
+        if remove_candidate
+            && fs::try_exists(&files.candidate_credentials_path)
                 .await
                 .map_err(|e| {
                     format!(
@@ -2689,16 +2776,15 @@ impl Agent {
                         files.candidate_credentials_path.display()
                     )
                 })?
-            {
-                fs::remove_file(&files.candidate_credentials_path)
-                    .await
-                    .map_err(|e| {
-                        format!(
-                            "failed to remove candidate credentials {}: {e}",
-                            files.candidate_credentials_path.display()
-                        )
-                    })?;
-            }
+        {
+            fs::remove_file(&files.candidate_credentials_path)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "failed to remove candidate credentials {}: {e}",
+                        files.candidate_credentials_path.display()
+                    )
+                })?;
         }
         Ok(())
     }
@@ -2758,7 +2844,13 @@ impl Agent {
         let temp_config_path = self
             .write_temp_endpoint_config_for_candidate(&candidate_path)
             .await
-            .map_err(|e| format!("phase=temp_config_invalid node={} candidate_path={}: {e}", self.cfg.node_external_id, candidate_path.display()))?;
+            .map_err(|e| {
+                format!(
+                    "phase=temp_config_invalid node={} candidate_path={}: {e}",
+                    self.cfg.node_external_id,
+                    candidate_path.display()
+                )
+            })?;
         println!(
             "phase=temp_config_rendered node={} temp_config_path={} candidate_path={}",
             self.cfg.node_external_id,
@@ -2869,14 +2961,15 @@ impl Agent {
     }
 
     async fn verify_runtime_post_apply(&self, expected_revision: &str) -> Result<(), String> {
-        let actual_credentials = fs::read(&self.cfg.runtime_credentials_path)
-            .await
-            .map_err(|e| {
-                format!(
-                    "failed to read runtime credentials {}: {e}",
-                    self.cfg.runtime_credentials_path.display()
-                )
-            })?;
+        let actual_credentials =
+            fs::read(&self.cfg.runtime_credentials_path)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "failed to read runtime credentials {}: {e}",
+                        self.cfg.runtime_credentials_path.display()
+                    )
+                })?;
         let actual_revision = sha256_hex(&actual_credentials);
         if actual_revision != expected_revision {
             return Err(format!(
@@ -2887,7 +2980,10 @@ impl Agent {
         Ok(())
     }
 
-    async fn rollback_runtime(&self, previous_runtime_credentials: Option<Vec<u8>>) -> Result<(), String> {
+    async fn rollback_runtime(
+        &self,
+        previous_runtime_credentials: Option<Vec<u8>>,
+    ) -> Result<(), String> {
         match previous_runtime_credentials {
             Some(data) => {
                 atomic_write(&self.cfg.runtime_credentials_path, &data).await?;
@@ -3025,7 +3121,10 @@ impl AgentMetrics {
     fn new(node: &str) -> Result<Self, String> {
         let registry = Registry::new();
         let reconcile_total = IntCounterVec::new(
-            Opts::new("classic_agent_reconcile_total", "Total sync attempts by status"),
+            Opts::new(
+                "classic_agent_reconcile_total",
+                "Total sync attempts by status",
+            ),
             &["node", "revision", "status", "error_class"],
         )
         .map_err(|e| format!("failed to create reconcile_total metric: {e}"))?;
@@ -3062,7 +3161,10 @@ impl AgentMetrics {
         )
         .map_err(|e| format!("failed to create tt_link_generation_total metric: {e}"))?;
         let apply_total = IntCounterVec::new(
-            Opts::new("classic_agent_apply_total", "Total apply attempts by status"),
+            Opts::new(
+                "classic_agent_apply_total",
+                "Total apply attempts by status",
+            ),
             &["node", "revision", "status", "error_class"],
         )
         .map_err(|e| format!("failed to create apply_total metric: {e}"))?;
@@ -3376,7 +3478,13 @@ async fn serve_metrics(metrics: Arc<AgentMetrics>, address: SocketAddr) -> Resul
     let listener = TcpListener::bind(address)
         .await
         .map_err(|e| format!("failed to bind metrics listener {address}: {e}"))?;
-    log_event("info", "metrics_listener_started", "unknown", "started", "none");
+    log_event(
+        "info",
+        "metrics_listener_started",
+        "unknown",
+        "started",
+        "none",
+    );
     loop {
         let (mut stream, _) = listener
             .accept()
@@ -3441,6 +3549,26 @@ fn log_error(revision: &str, node: &str, status: &str, error_class: &str, error:
     eprintln!("{payload}");
 }
 
+fn log_runtime_build_diagnostics() {
+    let binary_path = std::env::current_exe()
+        .ok()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let git_sha = option_env!("TRUSTTUNNEL_BUILD_GIT_SHA").unwrap_or("unknown");
+    let build_timestamp = env!("TRUSTTUNNEL_BUILD_TIMESTAMP");
+    let cargo_pkg_version = env!("CARGO_PKG_VERSION");
+    let rust_target_triple = option_env!("TARGET").unwrap_or("unknown");
+    println!(
+        "phase=classic_agent_build_diagnostics git_sha={} build_timestamp={} cargo_pkg_version={} batch_id_format_version={} binary_path={} rust_target_triple={}",
+        git_sha,
+        build_timestamp,
+        cargo_pkg_version,
+        BATCH_ID_FORMAT_VERSION,
+        binary_path,
+        rust_target_triple
+    );
+}
+
 #[tokio::main]
 async fn main() {
     let cfg = match Config::from_env() {
@@ -3458,6 +3586,7 @@ async fn main() {
         "classic_agent_started",
         "none",
     );
+    log_runtime_build_diagnostics();
 
     let mut agent = match Agent::new(cfg).await {
         Ok(agent) => agent,
@@ -3510,18 +3639,18 @@ fn parse_candidate_credentials_for_validation(
     Ok(parsed)
 }
 
+fn runtime_validation_usernames_from_raw_toml(
+    raw_credentials: &str,
+) -> Result<Vec<String>, String> {
+    let parsed = parse_candidate_credentials_for_validation(raw_credentials)?;
+    Ok(parsed.into_iter().map(|item| item.username).collect())
+}
+
+#[cfg(test)]
 fn runtime_validation_sample_username(
     credentials: &[sidecar_sync::AccessArtifact],
 ) -> Option<&str> {
-    credentials
-        .iter()
-        .map(|item| item.username.as_str())
-        .min()
-}
-
-fn runtime_validation_usernames_from_raw_toml(raw_credentials: &str) -> Result<Vec<String>, String> {
-    let parsed = parse_candidate_credentials_for_validation(raw_credentials)?;
-    Ok(parsed.into_iter().map(|item| item.username).collect())
+    credentials.iter().map(|item| item.username.as_str()).min()
 }
 
 #[derive(Debug)]
@@ -3588,11 +3717,13 @@ fn checksum_candidates(snapshot: &SyncPayload, raw_body: &[u8]) -> Vec<String> {
     let mut stable_accounts = snapshot
         .accounts
         .iter()
-        .map(|x| serde_json::json!({
-            "enabled": x.enabled,
-            "password": x.password,
-            "username": x.username,
-        }))
+        .map(|x| {
+            serde_json::json!({
+                "enabled": x.enabled,
+                "password": x.password,
+                "username": x.username,
+            })
+        })
         .collect::<Vec<_>>();
     stable_accounts.sort_by(|a, b| a["username"].as_str().cmp(&b["username"].as_str()));
 
@@ -3637,9 +3768,13 @@ async fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
     fs::write(&tmp_path, data)
         .await
         .map_err(|e| format!("failed to write tmp file {}: {e}", tmp_path.display()))?;
-    fs::rename(&tmp_path, path)
-        .await
-        .map_err(|e| format!("failed to atomically rename {} -> {}: {e}", tmp_path.display(), path.display()))?;
+    fs::rename(&tmp_path, path).await.map_err(|e| {
+        format!(
+            "failed to atomically rename {} -> {}: {e}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
 
     Ok(())
 }
@@ -3660,7 +3795,12 @@ async fn append_pending_sync_report(
         .append(true)
         .open(outbox_path)
         .await
-        .map_err(|e| format!("failed to open sync-report outbox {}: {e}", outbox_path.display()))?;
+        .map_err(|e| {
+            format!(
+                "failed to open sync-report outbox {}: {e}",
+                outbox_path.display()
+            )
+        })?;
     let encoded = serde_json::to_vec(report)
         .map_err(|e| format!("failed to serialize sync-report outbox row: {e}"))?;
     outbox
@@ -3689,8 +3829,12 @@ async fn load_pending_sync_reports(path: &Path) -> Result<Vec<PendingSyncReportO
             ));
         }
     };
-    let content = std::str::from_utf8(&raw)
-        .map_err(|e| format!("sync-report outbox is not valid UTF-8 {}: {e}", path.display()))?;
+    let content = std::str::from_utf8(&raw).map_err(|e| {
+        format!(
+            "sync-report outbox is not valid UTF-8 {}: {e}",
+            path.display()
+        )
+    })?;
 
     let mut reports = Vec::new();
     for (idx, line) in content.lines().enumerate() {
@@ -3746,8 +3890,10 @@ async fn build_account_exports(
     cfg: &Config,
     snapshot: &SyncPayload,
 ) -> Result<(Vec<AccountExportOwned>, TtLinkReconcileStats), String> {
-    let link_config_path =
-        resolve_runtime_path(&cfg.trusttunnel_runtime_dir, &cfg.trusttunnel_link_config_file);
+    let link_config_path = resolve_runtime_path(
+        &cfg.trusttunnel_runtime_dir,
+        &cfg.trusttunnel_link_config_file,
+    );
     let link_cfg = LinkGenerationConfig::load_from_file_or_legacy_env(
         &link_config_path,
         &cfg.node_external_id,
@@ -3769,8 +3915,10 @@ async fn build_account_exports(
 
     let mut stats = TtLinkReconcileStats::default();
     let mut exports = Vec::new();
-    let settings_path = resolve_runtime_path(&cfg.trusttunnel_runtime_dir, &cfg.trusttunnel_config_file);
-    let hosts_path = resolve_runtime_path(&cfg.trusttunnel_runtime_dir, &cfg.trusttunnel_hosts_file);
+    let settings_path =
+        resolve_runtime_path(&cfg.trusttunnel_runtime_dir, &cfg.trusttunnel_config_file);
+    let hosts_path =
+        resolve_runtime_path(&cfg.trusttunnel_runtime_dir, &cfg.trusttunnel_hosts_file);
     let exporter = EndpointLinkExporter::new(
         cfg.endpoint_binary.clone(),
         settings_path,
@@ -3804,7 +3952,9 @@ async fn build_account_exports(
             let tt_link = regenerated_links
                 .links
                 .get(account.username.as_str())
-                .ok_or_else(|| format!("missing generated TT link for account {}", account.username))?
+                .ok_or_else(|| {
+                    format!("missing generated TT link for account {}", account.username)
+                })?
                 .clone();
             stats.updated_total += 1;
             if account.tt_link.trim().is_empty() {
@@ -3989,13 +4139,34 @@ mod runtime_status_tests {
 
     #[test]
     fn normalize_health_status_maps_legacy_values_to_lk_contract() {
-        assert_eq!(normalize_health_status("healthy", RuntimeMode::LegacyHttp), "ok");
-        assert_eq!(normalize_health_status("alive", RuntimeMode::LegacyHttp), "ok");
-        assert_eq!(normalize_health_status("ready", RuntimeMode::LegacyHttp), "ok");
-        assert_eq!(normalize_health_status("warning", RuntimeMode::LegacyHttp), "degraded");
-        assert_eq!(normalize_health_status("limited", RuntimeMode::LegacyHttp), "degraded");
-        assert_eq!(normalize_health_status("offline", RuntimeMode::LegacyHttp), "disabled");
-        assert_eq!(normalize_health_status("failed", RuntimeMode::LegacyHttp), "disabled");
+        assert_eq!(
+            normalize_health_status("healthy", RuntimeMode::LegacyHttp),
+            "ok"
+        );
+        assert_eq!(
+            normalize_health_status("alive", RuntimeMode::LegacyHttp),
+            "ok"
+        );
+        assert_eq!(
+            normalize_health_status("ready", RuntimeMode::LegacyHttp),
+            "ok"
+        );
+        assert_eq!(
+            normalize_health_status("warning", RuntimeMode::LegacyHttp),
+            "degraded"
+        );
+        assert_eq!(
+            normalize_health_status("limited", RuntimeMode::LegacyHttp),
+            "degraded"
+        );
+        assert_eq!(
+            normalize_health_status("offline", RuntimeMode::LegacyHttp),
+            "disabled"
+        );
+        assert_eq!(
+            normalize_health_status("failed", RuntimeMode::LegacyHttp),
+            "disabled"
+        );
     }
 
     #[test]
@@ -4008,10 +4179,22 @@ mod runtime_status_tests {
 
     #[test]
     fn normalize_health_status_in_db_worker_does_not_force_disabled_for_dead_process_checks() {
-        assert_eq!(normalize_health_status("dead", RuntimeMode::DbWorker), "degraded");
-        assert_eq!(normalize_health_status("offline", RuntimeMode::DbWorker), "degraded");
-        assert_eq!(normalize_health_status("failed", RuntimeMode::DbWorker), "degraded");
-        assert_eq!(normalize_health_status("disabled", RuntimeMode::DbWorker), "disabled");
+        assert_eq!(
+            normalize_health_status("dead", RuntimeMode::DbWorker),
+            "degraded"
+        );
+        assert_eq!(
+            normalize_health_status("offline", RuntimeMode::DbWorker),
+            "degraded"
+        );
+        assert_eq!(
+            normalize_health_status("failed", RuntimeMode::DbWorker),
+            "degraded"
+        );
+        assert_eq!(
+            normalize_health_status("disabled", RuntimeMode::DbWorker),
+            "disabled"
+        );
     }
 
     #[test]
@@ -4081,7 +4264,9 @@ fn is_executable_file(path: &Path) -> bool {
 
 #[cfg(not(unix))]
 fn is_executable_file(path: &Path) -> bool {
-    std::fs::metadata(path).map(|meta| meta.is_file()).unwrap_or(false)
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file())
+        .unwrap_or(false)
 }
 
 async fn is_command_available_in_path(command: &str) -> bool {
@@ -4201,10 +4386,15 @@ fn derive_lifecycle_base_url_from_artifacts_endpoint(artifacts_endpoint: &str) -
     Some(base_url)
 }
 
-fn derive_inventory_endpoint(artifacts_endpoint: &str, external_node_id: &str) -> Result<String, String> {
+fn derive_inventory_endpoint(
+    artifacts_endpoint: &str,
+    external_node_id: &str,
+) -> Result<String, String> {
     let resolved = artifacts_endpoint.replace("{externalNodeId}", external_node_id);
     if resolved.trim().is_empty() {
-        return Err("inventory endpoint resolution failed: artifacts endpoint is empty".to_string());
+        return Err(
+            "inventory endpoint resolution failed: artifacts endpoint is empty".to_string(),
+        );
     }
     if let Some(prefix) = resolved.strip_suffix("/artifacts") {
         return Ok(format!("{prefix}/inventory"));
@@ -4327,7 +4517,6 @@ fn log_sync_skip(snapshot: &SyncPayload, reason: &str) {
         snapshot.sync_required
     );
 }
-
 
 #[derive(Debug)]
 enum RegisterAttemptOutcome {
@@ -4602,11 +4791,7 @@ mod tests {
     }
 
     #[cfg(feature = "legacy-lk-http")]
-    async fn make_agent(
-        temp_dir: &TempDir,
-        base_url: &str,
-        apply_cmd: Option<&str>,
-    ) -> Agent {
+    async fn make_agent(temp_dir: &TempDir, base_url: &str, apply_cmd: Option<&str>) -> Agent {
         let runtime_dir = temp_dir.path().join("runtime");
         fs::create_dir_all(&runtime_dir).await.unwrap();
         let config_file = runtime_dir.join("vpn.toml");
@@ -5501,9 +5686,12 @@ upload_buffer_size = 32768
     async fn persist_pending_sync_report_outbox_clears_file_on_empty_batch() {
         let tmp_dir = TempDir::new().unwrap();
         let path = tmp_dir.path().join("pending_sync_reports.jsonl");
-        fs::write(&path, b"{\"applied_revision\":\"1\",\"status\":\"ok\",\"error\":null}\n")
-            .await
-            .unwrap();
+        fs::write(
+            &path,
+            b"{\"applied_revision\":\"1\",\"status\":\"ok\",\"error\":null}\n",
+        )
+        .await
+        .unwrap();
 
         persist_pending_sync_reports(&path, &[]).await.unwrap();
         assert!(!fs::try_exists(&path).await.unwrap());
@@ -5520,31 +5708,24 @@ upload_buffer_size = 32768
             .collect::<Vec<_>>();
 
         assert!(!names.is_empty());
-        assert!(names.contains(
-            &"classic_agent_last_successful_reconcile_timestamp_seconds".to_string()
-        ));
-        assert!(names.contains(
-            &"classic_agent_last_failed_reconcile_timestamp_seconds".to_string()
-        ));
+        assert!(names
+            .contains(&"classic_agent_last_successful_reconcile_timestamp_seconds".to_string()));
+        assert!(
+            names.contains(&"classic_agent_last_failed_reconcile_timestamp_seconds".to_string())
+        );
         assert!(names.contains(&"classic_agent_apply_duration_milliseconds".to_string()));
         assert!(names.contains(&"classic_agent_credentials_count".to_string()));
-        assert!(
-            names
-                .iter()
-                .any(|name| name.starts_with("classic_agent_runtime_health"))
-        );
+        assert!(names
+            .iter()
+            .any(|name| name.starts_with("classic_agent_runtime_health")));
         assert!(names.contains(&"classic_agent_runtime_health_status".to_string()));
         assert!(names.contains(&"classic_agent_endpoint_process_status".to_string()));
-        assert!(
-            names
-                .iter()
-                .any(|name| name.starts_with("classic_agent_sidecar_sync_pass"))
-        );
-        assert!(
-            names
-                .iter()
-                .any(|name| name.starts_with("classic_agent_sidecar_sync_item"))
-        );
+        assert!(names
+            .iter()
+            .any(|name| name.starts_with("classic_agent_sidecar_sync_pass")));
+        assert!(names
+            .iter()
+            .any(|name| name.starts_with("classic_agent_sidecar_sync_item")));
     }
 
     #[test]
@@ -5648,12 +5829,16 @@ password = "second"
         .unwrap();
         assert_eq!(selection.total, 3);
         assert!(selection.limited);
-        assert_eq!(selection.selected, vec!["alice".to_string(), "bob".to_string()]);
+        assert_eq!(
+            selection.selected,
+            vec!["alice".to_string(), "bob".to_string()]
+        );
     }
 
     #[test]
     fn runtime_validation_selection_enforces_minimum_users() {
-        let err = select_runtime_validation_usernames(vec!["alice".to_string()], 2, 10).unwrap_err();
+        let err =
+            select_runtime_validation_usernames(vec!["alice".to_string()], 2, 10).unwrap_err();
         assert!(err.contains("below required minimum"));
     }
 
@@ -5682,7 +5867,10 @@ password = "second"
             candidate.display().to_string()
         );
         assert_eq!(candidate.parent().unwrap(), runtime_dir.as_path());
-        assert_eq!(files.temp_config_path.parent().unwrap(), runtime_dir.as_path());
+        assert_eq!(
+            files.temp_config_path.parent().unwrap(),
+            runtime_dir.as_path()
+        );
         assert!(!temp_config.contains("[[client]]"));
         agent
             .cleanup_validation_files(&files, false, false)
@@ -5735,7 +5923,10 @@ password = "second"
             .display()
             .to_string();
 
-        let err = agent.resolve_and_validate_endpoint_binary().await.unwrap_err();
+        let err = agent
+            .resolve_and_validate_endpoint_binary()
+            .await
+            .unwrap_err();
         assert!(err.contains("trusttunnel_endpoint binary not found at"));
         assert!(err.contains("set TRUSTTUNNEL_ENDPOINT_BIN"));
     }
@@ -5836,7 +6027,11 @@ password = "second"
             make_db_worker_agent_for_validation_tests_with_strict(&tmp_dir, false, true).await;
         let runtime_dir = agent.cfg.trusttunnel_runtime_dir.clone();
         let failing_endpoint = runtime_dir.join("fake_endpoint_fail.sh");
-        std::fs::write(&failing_endpoint, "#!/bin/sh\necho \"runtime failed\" 1>&2\nexit 1\n").unwrap();
+        std::fs::write(
+            &failing_endpoint,
+            "#!/bin/sh\necho \"runtime failed\" 1>&2\nexit 1\n",
+        )
+        .unwrap();
         let mut perms = std::fs::metadata(&failing_endpoint).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
         std::fs::set_permissions(&failing_endpoint, perms).unwrap();
@@ -5972,7 +6167,10 @@ upload_buffer_size = 32768
             .unwrap();
 
         assert_eq!(candidate.parent().unwrap(), runtime_dir.as_path());
-        assert_eq!(files.temp_config_path.parent().unwrap(), runtime_dir.as_path());
+        assert_eq!(
+            files.temp_config_path.parent().unwrap(),
+            runtime_dir.as_path()
+        );
         agent
             .cleanup_validation_files(&files, false, false)
             .await
@@ -6061,10 +6259,7 @@ upload_buffer_size = 32768
         persist_inventory_state(&agent.workspace.inventory_state_path(), &prior_snapshot).unwrap();
 
         let (endpoint, request_handle) = run_multi_request_server(vec![
-            (
-                200,
-                r#"{"accepted":true}"#.to_string(),
-            ),
+            (200, r#"{"accepted":true}"#.to_string()),
             (
                 200,
                 r#"{"summary":{"created":1,"updated":0,"unchanged":0,"deactivated":1,"failed":0}}"#
@@ -6109,14 +6304,8 @@ upload_buffer_size = 32768
         }
 
         let (endpoint, _request_handle) = run_multi_request_server(vec![
-            (
-                200,
-                r#"{"accepted":true}"#.to_string(),
-            ),
-            (
-                500,
-                r#"{"error":"downstream unavailable"}"#.to_string(),
-            ),
+            (200, r#"{"accepted":true}"#.to_string()),
+            (500, r#"{"error":"downstream unavailable"}"#.to_string()),
         ])
         .await;
         agent.cfg.lk_write_contract = LkWriteContract::Api;
@@ -6167,9 +6356,12 @@ upload_buffer_size = 32768
         let server = MockHttpServer::start().await;
         let tmp_dir = TempDir::new().unwrap();
         let mut agent = make_agent(&tmp_dir, &server.base_url, Some("true")).await;
-        fs::write(&agent.cfg.runtime_credentials_path, b"[[client]]\nusername=\"old\"\npassword=\"old\"\n")
-            .await
-            .unwrap();
+        fs::write(
+            &agent.cfg.runtime_credentials_path,
+            b"[[client]]\nusername=\"old\"\npassword=\"old\"\n",
+        )
+        .await
+        .unwrap();
         let body = snapshot_json(
             "v1",
             "active",
@@ -6364,9 +6556,10 @@ upload_buffer_size = 32768
                 .await
                 .unwrap()
         );
-        let queued = load_pending_sync_reports(agent.cfg.pending_sync_reports_path.as_ref().unwrap())
-            .await
-            .unwrap();
+        let queued =
+            load_pending_sync_reports(agent.cfg.pending_sync_reports_path.as_ref().unwrap())
+                .await
+                .unwrap();
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].status, "error");
     }
@@ -6402,8 +6595,7 @@ upload_buffer_size = 32768
         let worker = tokio::spawn(async move {
             agent.run_db_worker_loop().await;
         });
-        let requests =
-            wait_for_captured_requests(&server, 2, Duration::from_secs(2)).await;
+        let requests = wait_for_captured_requests(&server, 2, Duration::from_secs(2)).await;
         worker.abort();
 
         let register = requests
@@ -6453,8 +6645,7 @@ upload_buffer_size = 32768
         let worker = tokio::spawn(async move {
             agent.run_db_worker_loop().await;
         });
-        let requests =
-            wait_for_captured_requests(&server, 4, Duration::from_secs(2)).await;
+        let requests = wait_for_captured_requests(&server, 4, Duration::from_secs(2)).await;
         worker.abort();
 
         let heartbeats: Vec<&CapturedRequest> = requests
@@ -6629,9 +6820,8 @@ upload_buffer_size = 32768
         .await
         .unwrap();
         agent.cfg.lk_write_contract = LkWriteContract::Api;
-        agent.cfg.lk_db_dsn = format!(
-            "http://{address}/internal/trusttunnel/v1/nodes/{{externalNodeId}}/artifacts"
-        );
+        agent.cfg.lk_db_dsn =
+            format!("http://{address}/internal/trusttunnel/v1/nodes/{{externalNodeId}}/artifacts");
         agent.cfg.lk_service_token = Some("token".to_string());
 
         agent
@@ -6755,7 +6945,12 @@ upload_buffer_size = 32768
             )
             .await;
         server
-            .enqueue(Method::POST, DEFAULT_HEARTBEAT_PATH, HyperStatusCode::OK, "")
+            .enqueue(
+                Method::POST,
+                DEFAULT_HEARTBEAT_PATH,
+                HyperStatusCode::OK,
+                "",
+            )
             .await;
 
         agent.send_heartbeat_with_retry().await;
@@ -6776,7 +6971,12 @@ upload_buffer_size = 32768
         agent.state.applied_revision = None;
         agent.last_apply_status = "".to_string();
         server
-            .enqueue(Method::POST, DEFAULT_HEARTBEAT_PATH, HyperStatusCode::OK, "")
+            .enqueue(
+                Method::POST,
+                DEFAULT_HEARTBEAT_PATH,
+                HyperStatusCode::OK,
+                "",
+            )
             .await;
 
         agent.send_heartbeat().await.unwrap();
@@ -6846,7 +7046,12 @@ upload_buffer_size = 32768
         let tmp_dir = TempDir::new().unwrap();
         let mut agent = make_agent(&tmp_dir, &server.base_url, Some("true")).await;
         server
-            .enqueue(Method::GET, "/sync/node-1", HyperStatusCode::CONFLICT, "onboarding_not_ready")
+            .enqueue(
+                Method::GET,
+                "/sync/node-1",
+                HyperStatusCode::CONFLICT,
+                "onboarding_not_ready",
+            )
             .await;
 
         assert!(agent.reconcile_once().await.is_ok());
@@ -6985,8 +7190,14 @@ upload_buffer_size = 32768
         assert!(value["revision"].is_i64());
         assert_eq!(value["revision"], 1_710_000_000_i64);
         assert!(value["exported_at"].as_str().unwrap().contains('T'));
-        assert!(value["idempotency_key"].as_str().unwrap().starts_with("inventory-v1-"));
-        assert!(value["request_id"].as_str().unwrap().starts_with("inventory-req-"));
+        assert!(value["idempotency_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("inventory-v1-"));
+        assert!(value["request_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("inventory-req-"));
         assert_eq!(value["credentials"][0]["username"], "alice");
         assert_eq!(value["credentials"][0]["password"], "secret");
     }
