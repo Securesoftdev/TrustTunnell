@@ -47,7 +47,10 @@ impl LkArtifactRecord {
             .map(str::trim)
             .filter(|item| !item.is_empty())
         {
-            return format!("node_credential:{}:{credential_external_id}", self.external_node_id);
+            return format!(
+                "node_credential:{}:{credential_external_id}",
+                self.external_node_id
+            );
         }
         format!("node_user:{}:{}", self.external_node_id, self.username)
     }
@@ -139,6 +142,8 @@ struct LkBulkApiArtifactRequest {
     link_hash: String,
 }
 
+const BATCH_ID_FORMAT_RUNTIME_REASON: &str = "unexpected_batch_id_format_runtime";
+
 impl LkBulkWriter {
     pub(crate) fn from_contract(
         write_contract: LkWriteContract,
@@ -192,7 +197,7 @@ impl LkBulkWriter {
                     != Some("1")
                 {
                     return Err(
-                        "legacy table contract requires LK_DB_LEGACY_RAW_TABLE=1".to_string(),
+                        "legacy table contract requires LK_DB_LEGACY_RAW_TABLE=1".to_string()
                     );
                 }
                 if std::env::var("LK_ALLOW_DEPRECATED_LEGACY_TABLE")
@@ -335,8 +340,9 @@ async fn write_via_api(
         .text()
         .await
         .map_err(|e| format!("failed to read LK bulk API response body: {e}"))?;
-    parse_api_response_contract(&raw_payload)
-        .map_err(|e| format!("failed to parse LK artifacts API response contract: {e}; raw={raw_payload}"))
+    parse_api_response_contract(&raw_payload).map_err(|e| {
+        format!("failed to parse LK artifacts API response contract: {e}; raw={raw_payload}")
+    })
 }
 
 async fn write_via_postgres_function(
@@ -346,9 +352,7 @@ async fn write_via_postgres_function(
 ) -> Result<LkBatchWriteResult, String> {
     let payload = serde_json::to_string(&records)
         .map_err(|e| format!("failed to serialize LK artifact payload: {e}"))?;
-    let query = format!(
-        "SELECT {function_name}($${payload}$$::jsonb)::text"
-    );
+    let query = format!("SELECT {function_name}($${payload}$$::jsonb)::text");
     let raw = exec_psql(dsn, &query).await.map_err(|e| {
         format!(
             "failed to execute LK write function {function_name}: {e}. \
@@ -387,9 +391,10 @@ async fn write_via_legacy_postgres_table(
             Ok(raw) => raw,
             Err(e) => {
                 summary.failed += 1;
-                summary
-                    .failures
-                    .push(format!("{}: failed to query existing artifact: {e}", record.username));
+                summary.failures.push(format!(
+                    "{}: failed to query existing artifact: {e}",
+                    record.username
+                ));
                 continue;
             }
         };
@@ -397,12 +402,15 @@ async fn write_via_legacy_postgres_table(
 
         let changed = existing
             .as_ref()
-            .map(|(existing_active, existing_tt_link, existing_config_hash)| {
-                *existing_active != record.active
-                    || existing_tt_link.as_str() != record.tt_link.as_deref().unwrap_or_default()
-                    || existing_config_hash.as_str()
-                        != record.config_hash.as_deref().unwrap_or_default()
-            })
+            .map(
+                |(existing_active, existing_tt_link, existing_config_hash)| {
+                    *existing_active != record.active
+                        || existing_tt_link.as_str()
+                            != record.tt_link.as_deref().unwrap_or_default()
+                        || existing_config_hash.as_str()
+                            != record.config_hash.as_deref().unwrap_or_default()
+                },
+            )
             .unwrap_or(true);
 
         let upsert_query = format!(
@@ -429,9 +437,10 @@ async fn write_via_legacy_postgres_table(
         );
         if let Err(e) = exec_psql(dsn, &upsert_query).await {
             summary.failed += 1;
-            summary
-                .failures
-                .push(format!("{}: failed to upsert artifact: {e}", record.username));
+            summary.failures.push(format!(
+                "{}: failed to upsert artifact: {e}",
+                record.username
+            ));
             continue;
         }
 
@@ -547,7 +556,9 @@ async fn ensure_postgres_function_contract_compatibility(
 
 fn ensure_legacy_table_contract_compatibility(table_name: &str) -> Result<(), String> {
     if table_name.trim().is_empty() {
-        return Err("legacy table contract compatibility check failed: table name is empty".to_string());
+        return Err(
+            "legacy table contract compatibility check failed: table name is empty".to_string(),
+        );
     }
     Ok(())
 }
@@ -564,7 +575,14 @@ fn validate_contract_response_shape(raw: &str, contract: &str, source: &str) -> 
             "contract compatibility check failed for {contract} ({source}): expected JSON object response"
         )
     })?;
-    for field in ["created", "updated", "unchanged", "deactivated", "failed", "failures"] {
+    for field in [
+        "created",
+        "updated",
+        "unchanged",
+        "deactivated",
+        "failed",
+        "failures",
+    ] {
         if !object.contains_key(field) {
             return Err(format!(
                 "contract compatibility check failed for {contract} ({source}): missing required field `{field}`"
@@ -584,7 +602,9 @@ fn build_api_request(records: Vec<LkArtifactRecord>) -> Result<LkBulkApiRequest,
         .iter()
         .any(|item| item.external_node_id != external_node_id)
     {
-        return Err("LK artifacts API payload must contain exactly one external_node_id".to_string());
+        return Err(
+            "LK artifacts API payload must contain exactly one external_node_id".to_string(),
+        );
     }
     let mut validation_errors = Vec::new();
     let mut artifacts = records
@@ -609,7 +629,8 @@ fn build_api_request(records: Vec<LkArtifactRecord>) -> Result<LkBulkApiRequest,
                 .as_deref()
                 .map(str::trim)
                 .map(ToString::to_string)
-                .filter(|item| !item.is_empty()) else {
+                .filter(|item| !item.is_empty())
+            else {
                 validation_errors.push(format!(
                     "artifact source_key={} is missing required non-empty link",
                     record.source_key.as_deref().unwrap_or("-")
@@ -621,7 +642,8 @@ fn build_api_request(records: Vec<LkArtifactRecord>) -> Result<LkBulkApiRequest,
                 .as_deref()
                 .map(str::trim)
                 .map(ToString::to_string)
-                .filter(|item| !item.is_empty()) else {
+                .filter(|item| !item.is_empty())
+            else {
                 validation_errors.push(format!(
                     "artifact source_key={} is missing required non-empty link_revision",
                     record.source_key.as_deref().unwrap_or("-")
@@ -635,7 +657,8 @@ fn build_api_request(records: Vec<LkArtifactRecord>) -> Result<LkBulkApiRequest,
                 .map(ToString::to_string)
                 .filter(|item| !item.is_empty())
                 .or_else(|| username.clone())
-                .or_else(|| credential_external_id.clone()) else {
+                .or_else(|| credential_external_id.clone())
+            else {
                 validation_errors.push(format!(
                     "artifact username={} has no source_key/username/credential_external_id",
                     record.username
@@ -648,7 +671,8 @@ fn build_api_request(records: Vec<LkArtifactRecord>) -> Result<LkBulkApiRequest,
                 .map(str::trim)
                 .map(ToString::to_string)
                 .filter(|item| !item.is_empty())
-                .or_else(|| Some(link_revision.clone())) else {
+                .or_else(|| Some(link_revision.clone()))
+            else {
                 validation_errors.push(format!(
                     "artifact source_key={} is missing required link_hash",
                     source_key
@@ -662,7 +686,8 @@ fn build_api_request(records: Vec<LkArtifactRecord>) -> Result<LkBulkApiRequest,
                 .map(ToString::to_string)
                 .filter(|item| !item.is_empty())
                 .or_else(|| username.clone())
-                .or_else(|| credential_external_id.clone()) else {
+                .or_else(|| credential_external_id.clone())
+            else {
                 validation_errors.push(format!(
                     "artifact source_key={} is missing required display_name",
                     source_key
@@ -675,8 +700,12 @@ fn build_api_request(records: Vec<LkArtifactRecord>) -> Result<LkBulkApiRequest,
                 link,
                 link_revision,
                 is_current: record.active,
-                generated_at: record.generated_at.unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
-                source: record.source.unwrap_or_else(|| "trusttunnel_classic_agent".to_string()),
+                generated_at: record
+                    .generated_at
+                    .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+                source: record
+                    .source
+                    .unwrap_or_else(|| "trusttunnel_classic_agent".to_string()),
                 display_name,
                 source_key,
                 link_hash,
@@ -692,7 +721,9 @@ fn build_api_request(records: Vec<LkArtifactRecord>) -> Result<LkBulkApiRequest,
         ));
     }
     if artifacts.is_empty() {
-        return Err("LK artifacts API payload validation failed: empty artifacts array".to_string());
+        return Err(
+            "LK artifacts API payload validation failed: empty artifacts array".to_string(),
+        );
     }
     let request_id = format!(
         "req-{}-{}",
@@ -716,10 +747,22 @@ fn build_api_request(records: Vec<LkArtifactRecord>) -> Result<LkBulkApiRequest,
 }
 
 fn log_api_payload_shape(endpoint: &str, payload: &LkBulkApiRequest) -> Result<(), String> {
+    let import_batch_id_contains_request_id = validate_import_batch_id_format(payload).is_ok();
     let diagnostics = render_payload_diagnostics(payload)?;
     let sample_artifact = render_redacted_sample_artifact(payload)?;
     let payload_revision = summarize_payload_revision(payload);
     let force_regenerate = false;
+    eprintln!(
+        "phase=lk_artifacts_post_diagnostics endpoint={} external_node_id={} request_id={} idempotency_key={} import_batch_id={} import_batch_id_contains_request_id={} payload_revision={} artifacts_count={}",
+        endpoint,
+        payload.external_node_id,
+        payload.request_id,
+        payload.idempotency_key,
+        payload.import_batch_id,
+        import_batch_id_contains_request_id,
+        payload_revision,
+        payload.artifacts.len()
+    );
     eprintln!(
         "phase=lk_api_payload_debug endpoint={} external_node_id={} artifacts_count={} import_batch_id={} request_id={} idempotency_key={} payload_revision={} force_regenerate={} diagnostics={} sample_artifact={}",
         endpoint,
@@ -783,6 +826,7 @@ fn validate_api_payload_contract(payload: &LkBulkApiRequest) -> Result<(), Strin
     if payload.request_id.trim().is_empty() {
         return Err("missing request_id".to_string());
     }
+    validate_import_batch_id_format(payload)?;
     if payload.artifacts.is_empty() {
         return Err("empty artifacts array when write was expected".to_string());
     }
@@ -810,7 +854,34 @@ fn validate_api_payload_contract(payload: &LkBulkApiRequest) -> Result<(), Strin
     Ok(())
 }
 
-fn build_logical_batch_id(external_node_id: &str, artifacts: &[LkBulkApiArtifactRequest]) -> String {
+fn validate_import_batch_id_format(payload: &LkBulkApiRequest) -> Result<(), String> {
+    let expected_suffix = format!(":{}", payload.request_id);
+    let expected_full = format!(
+        "{}:{}:{}",
+        payload.external_node_id, payload.idempotency_key, payload.request_id
+    );
+    let contains_request_id = payload.import_batch_id.ends_with(&expected_suffix);
+    if contains_request_id {
+        return Ok(());
+    }
+    let message = format!(
+        "reason={} external_node_id={} request_id={} idempotency_key={} import_batch_id={} expected_format={} import_batch_id_contains_request_id={}",
+        BATCH_ID_FORMAT_RUNTIME_REASON,
+        payload.external_node_id,
+        payload.request_id,
+        payload.idempotency_key,
+        payload.import_batch_id,
+        expected_full,
+        contains_request_id
+    );
+    eprintln!("phase=lk_api_payload_invalid {message}");
+    Err(message)
+}
+
+fn build_logical_batch_id(
+    external_node_id: &str,
+    artifacts: &[LkBulkApiArtifactRequest],
+) -> String {
     let mut seed = external_node_id.to_string();
     for artifact in artifacts {
         seed.push('|');
@@ -840,12 +911,13 @@ fn render_redacted_sample_artifact(payload: &LkBulkApiRequest) -> Result<String,
             *value = serde_json::Value::String("[redacted]".to_string());
         }
     }
-    serde_json::to_string(&sample).map_err(|e| format!("failed to stringify payload sample artifact: {e}"))
+    serde_json::to_string(&sample)
+        .map_err(|e| format!("failed to stringify payload sample artifact: {e}"))
 }
 
 fn parse_api_response_contract(raw: &str) -> Result<LkBatchWriteResult, String> {
-    let parsed: serde_json::Value = serde_json::from_str(raw.trim())
-        .map_err(|e| format!("response is not valid JSON: {e}"))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw.trim()).map_err(|e| format!("response is not valid JSON: {e}"))?;
     let object = parsed
         .as_object()
         .ok_or_else(|| "response is not a JSON object".to_string())?;
@@ -867,7 +939,10 @@ fn parse_api_response_contract(raw: &str) -> Result<LkBatchWriteResult, String> 
     })
 }
 
-fn resolve_counter(root: &serde_json::Map<String, serde_json::Value>, aliases: &[&str]) -> Option<usize> {
+fn resolve_counter(
+    root: &serde_json::Map<String, serde_json::Value>,
+    aliases: &[&str],
+) -> Option<usize> {
     for alias in aliases {
         if let Some(value) = root.get(*alias).and_then(|item| item.as_u64()) {
             return Some(value as usize);
@@ -1128,6 +1203,24 @@ mod tests {
     }
 
     #[test]
+    fn api_request_import_batch_id_contains_request_id_suffix() {
+        let payload = build_api_request(vec![test_record("alice")]).unwrap();
+        assert!(payload
+            .import_batch_id
+            .ends_with(format!(":{}", payload.request_id).as_str()));
+    }
+
+    #[test]
+    fn api_request_validation_fails_for_legacy_import_batch_id_format() {
+        let mut payload = build_api_request(vec![test_record("alice")]).unwrap();
+        payload.import_batch_id =
+            format!("{}:{}", payload.external_node_id, payload.idempotency_key);
+        let err = validate_api_payload_contract(&payload).unwrap_err();
+        assert!(err.contains(BATCH_ID_FORMAT_RUNTIME_REASON));
+        assert!(err.contains("import_batch_id_contains_request_id=false"));
+    }
+
+    #[test]
     fn api_request_new_batch_gets_new_import_batch_id() {
         let first = build_api_request(vec![test_record("alice")]).unwrap();
         let mut changed = test_record("alice");
@@ -1178,7 +1271,10 @@ mod tests {
         );
     }
 
-    async fn run_single_request_server(status: u16, body: &str) -> (String, tokio::task::JoinHandle<String>) {
+    async fn run_single_request_server(
+        status: u16,
+        body: &str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let body = body.to_string();
@@ -1196,16 +1292,25 @@ mod tests {
             stream.write_all(response.as_bytes()).await.unwrap();
             request
         });
-        (format!("http://{addr}/internal/trusttunnel/v1/nodes/node-1/artifacts"), handle)
+        (
+            format!("http://{addr}/internal/trusttunnel/v1/nodes/node-1/artifacts"),
+            handle,
+        )
     }
 
     #[tokio::test]
     async fn api_write_route_accepts_valid_payload() {
-        let (endpoint, request_handle) =
-            run_single_request_server(200, r#"{"summary":{"created":1,"updated":0,"unchanged":0,"deactivated":0,"failed":0}}"#).await;
-        let writer = LkBulkWriter::from_contract(LkWriteContract::Api, &endpoint, "node-1", None)
+        let (endpoint, request_handle) = run_single_request_server(
+            200,
+            r#"{"summary":{"created":1,"updated":0,"unchanged":0,"deactivated":0,"failed":0}}"#,
+        )
+        .await;
+        let writer =
+            LkBulkWriter::from_contract(LkWriteContract::Api, &endpoint, "node-1", None).unwrap();
+        let result = writer
+            .write_batch(vec![test_record("alice")])
+            .await
             .unwrap();
-        let result = writer.write_batch(vec![test_record("alice")]).await.unwrap();
         assert_eq!(result.created, 1);
 
         let request = request_handle.await.unwrap();
@@ -1225,9 +1330,12 @@ mod tests {
             r#"{"error":"invalid_input","details":"missing import_batch_id"}"#,
         )
         .await;
-        let writer = LkBulkWriter::from_contract(LkWriteContract::Api, &endpoint, "node-1", None)
-            .unwrap();
-        let err = writer.write_batch(vec![test_record("alice")]).await.unwrap_err();
+        let writer =
+            LkBulkWriter::from_contract(LkWriteContract::Api, &endpoint, "node-1", None).unwrap();
+        let err = writer
+            .write_batch(vec![test_record("alice")])
+            .await
+            .unwrap_err();
         assert!(err.contains("HTTP 400"));
         assert!(err.contains("invalid_input"));
         assert!(err.contains("request_id="));
@@ -1239,29 +1347,30 @@ mod tests {
 
     #[tokio::test]
     async fn api_write_route_is_idempotent_for_repeated_payload() {
-        let (endpoint_first, request_first) =
-            run_single_request_server(200, r#"{"summary":{"created":1,"updated":0,"unchanged":0,"deactivated":0,"failed":0}}"#).await;
-        let first = LkBulkWriter::from_contract(
-            LkWriteContract::Api,
-            &endpoint_first,
-            "node-1",
-            None,
+        let (endpoint_first, request_first) = run_single_request_server(
+            200,
+            r#"{"summary":{"created":1,"updated":0,"unchanged":0,"deactivated":0,"failed":0}}"#,
         )
-        .unwrap();
+        .await;
+        let first =
+            LkBulkWriter::from_contract(LkWriteContract::Api, &endpoint_first, "node-1", None)
+                .unwrap();
         let first_result = first.write_batch(vec![test_record("alice")]).await.unwrap();
         assert_eq!(first_result.created, 1);
         let _ = request_first.await.unwrap();
 
-        let (endpoint_second, request_second) =
-            run_single_request_server(200, r#"{"summary":{"created":0,"updated":0,"unchanged":1,"deactivated":0,"failed":0}}"#).await;
-        let second = LkBulkWriter::from_contract(
-            LkWriteContract::Api,
-            &endpoint_second,
-            "node-1",
-            None,
+        let (endpoint_second, request_second) = run_single_request_server(
+            200,
+            r#"{"summary":{"created":0,"updated":0,"unchanged":1,"deactivated":0,"failed":0}}"#,
         )
-        .unwrap();
-        let second_result = second.write_batch(vec![test_record("alice")]).await.unwrap();
+        .await;
+        let second =
+            LkBulkWriter::from_contract(LkWriteContract::Api, &endpoint_second, "node-1", None)
+                .unwrap();
+        let second_result = second
+            .write_batch(vec![test_record("alice")])
+            .await
+            .unwrap();
         assert_eq!(second_result.unchanged, 1);
         let _ = request_second.await.unwrap();
     }
@@ -1284,11 +1393,9 @@ mod tests {
         assert!(invalid_error.contains("payload_top_level_keys="));
         assert!(invalid_error.contains("first_artifact_keys="));
 
-        let (not_found_endpoint, _) = run_single_request_server(
-            404,
-            r#"{"error":"node not found or credential not found"}"#,
-        )
-        .await;
+        let (not_found_endpoint, _) =
+            run_single_request_server(404, r#"{"error":"node not found or credential not found"}"#)
+                .await;
         let not_found_writer =
             LkBulkWriter::from_contract(LkWriteContract::Api, &not_found_endpoint, "node-1", None)
                 .unwrap();

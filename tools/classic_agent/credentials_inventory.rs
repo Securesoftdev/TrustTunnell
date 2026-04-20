@@ -180,8 +180,12 @@ pub(crate) fn persist_state(state_path: &Path, snapshot: &InventorySnapshot) -> 
             state_path.display()
         )
     })?;
-    std::fs::create_dir_all(parent)
-        .map_err(|e| format!("failed to create inventory state directory {}: {e}", parent.display()))?;
+    std::fs::create_dir_all(parent).map_err(|e| {
+        format!(
+            "failed to create inventory state directory {}: {e}",
+            parent.display()
+        )
+    })?;
     let encoded = serde_json::to_vec_pretty(&state)
         .map_err(|e| format!("failed to serialize inventory state: {e}"))?;
     std::fs::write(state_path, encoded).map_err(|e| {
@@ -192,7 +196,10 @@ pub(crate) fn persist_state(state_path: &Path, snapshot: &InventorySnapshot) -> 
     })
 }
 
-pub(crate) fn compute_delta(snapshot: &InventorySnapshot, previous: Option<&InventoryState>) -> InventoryDelta {
+pub(crate) fn compute_delta(
+    snapshot: &InventorySnapshot,
+    previous: Option<&InventoryState>,
+) -> InventoryDelta {
     let mut delta = InventoryDelta::default();
     let previous_credentials = previous
         .map(|state| {

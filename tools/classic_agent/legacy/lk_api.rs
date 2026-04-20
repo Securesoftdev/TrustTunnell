@@ -45,8 +45,9 @@ impl LkApiClient {
         payload: &OnboardingPayload<'_>,
     ) -> Result<reqwest::Response, RegisterRequestError> {
         let endpoint = self.endpoint(&self.register_path);
-        let payload_value = serde_json::to_value(payload)
-            .map_err(|e| RegisterRequestError::Network(format!("register payload serialization failed: {e}")))?;
+        let payload_value = serde_json::to_value(payload).map_err(|e| {
+            RegisterRequestError::Network(format!("register payload serialization failed: {e}"))
+        })?;
         self.client
             .post(endpoint)
             .header("Authorization", format!("Bearer {}", self.service_token))
@@ -321,14 +322,12 @@ impl<'a> OnboardingPayload<'a> {
         }
         if self.hostname.trim().is_empty() {
             return Err(
-                "onboarding payload compatibility check failed: hostname is empty"
-                    .to_string(),
+                "onboarding payload compatibility check failed: hostname is empty".to_string(),
             );
         }
         if self.agent_version.trim().is_empty() {
             return Err(
-                "onboarding payload compatibility check failed: agent_version is empty"
-                    .to_string(),
+                "onboarding payload compatibility check failed: agent_version is empty".to_string(),
             );
         }
         if self.runtime_version.trim().is_empty() {

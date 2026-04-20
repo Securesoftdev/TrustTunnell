@@ -8,7 +8,10 @@ pub(crate) struct ParsedCredential {
     pub(crate) max_http3_conns: Option<u32>,
 }
 
-pub(crate) fn parse_client_credentials(raw: &str, source_name: &str) -> Result<Vec<ParsedCredential>, String> {
+pub(crate) fn parse_client_credentials(
+    raw: &str,
+    source_name: &str,
+) -> Result<Vec<ParsedCredential>, String> {
     if raw.trim().is_empty() {
         return Ok(Vec::new());
     }

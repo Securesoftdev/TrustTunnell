@@ -3,6 +3,7 @@ name = "trusttunnel_endpoint_tools"
 version = "0.1.0"
 authors = ["Sergei Gunchenko <s.gunchenko@adguard.com>"]
 edition = "2021"
+build = "build.rs"
 
 [features]
 default = []

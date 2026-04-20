@@ -259,6 +259,38 @@ For LK artifact imports, treat `import_batch_id` as an export-cycle identifier:
 - Operational actions that start a fresh cycle (`clear`, `hard reset`, `reissue`, forced regeneration)
   must never reuse a previous `import_batch_id`.
 
+### Runtime build and export-cycle audit checklist
+
+Use this checklist when runtime logs do not match current source code:
+
+1. Verify startup build diagnostics from pod logs (`phase=classic_agent_build_diagnostics`):
+   - `git_sha`
+   - `build_timestamp`
+   - `cargo_pkg_version`
+   - `batch_id_format_version=v2_node_idempotency_request`
+   - `binary_path`
+   - `rust_target_triple`
+2. Verify each LK artifacts POST diagnostics (`phase=lk_artifacts_post_diagnostics`):
+   - `external_node_id`
+   - `request_id`
+   - `idempotency_key`
+   - `import_batch_id`
+   - `import_batch_id_contains_request_id`
+   - `payload_revision`
+   - `artifacts_count`
+3. Treat `phase=lk_api_payload_invalid reason=unexpected_batch_id_format_runtime` as hard-fail:
+   - request must not be considered successful;
+   - investigate runtime image/build mismatch before retries.
+
+Deployment pipeline requirements for deterministic runtime provenance:
+
+- Every build must publish immutable tags (for example `sha-*` or `run-*-*`) in
+  addition to optional `latest`.
+- Deployment logs must include pushed image digest.
+- Runtime deployment should pin image digest (`image@sha256:...`) instead of plain `latest`.
+- After updating the deployment image, run explicit rollout restart.
+- After rollout, check pod startup logs and confirm `git_sha` matches the expected commit.
+
 ## Bulk upsert idempotency and stale policy
 
 - Primary deployment contract is `LK_WRITE_CONTRACT=api`.

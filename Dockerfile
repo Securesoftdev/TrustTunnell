@@ -26,6 +26,8 @@ RUN cargo build --release --bin trusttunnel_endpoint --bin setup_wizard
 
 FROM rust:1.85-bookworm AS build-classic-agent
 ARG ENDPOINT_DIR_NAME="TrustTunnel"
+ARG BUILD_GIT_SHA="unknown"
+ARG BUILD_TIMESTAMP="unknown"
 WORKDIR /home/${ENDPOINT_DIR_NAME}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -45,7 +47,9 @@ COPY lib ./lib
 COPY macros ./macros
 COPY tools ./tools
 
-RUN cargo build --release --bin classic_agent
+RUN TRUSTTUNNEL_BUILD_GIT_SHA="${BUILD_GIT_SHA}" \
+    TRUSTTUNNEL_BUILD_TIMESTAMP="${BUILD_TIMESTAMP}" \
+    cargo build --release --bin classic_agent
 
 FROM debian:bookworm-slim AS trusttunnel-endpoint
 RUN apt-get update && apt-get install -y --no-install-recommends \
