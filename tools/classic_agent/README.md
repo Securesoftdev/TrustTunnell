@@ -250,6 +250,15 @@ For incident reviews and future maintenance, keep a deterministic log trail in r
 Use stable fields in each line (`node`, `revision`, `request_id`, `idempotency_key`,
 `error_class`) so retries and rollback events can be correlated across runs.
 
+For LK artifact imports, treat `import_batch_id` as an export-cycle identifier:
+
+- A new export cycle must emit a new `import_batch_id` even when payload content is unchanged.
+- Retries of the exact same HTTP request must keep the same `import_batch_id` and `idempotency_key`.
+- Runtime logs for `phase=lk_api_payload_debug` must include:
+  `import_batch_id`, `idempotency_key`, `payload_revision`, and `force_regenerate`.
+- Operational actions that start a fresh cycle (`clear`, `hard reset`, `reissue`, forced regeneration)
+  must never reuse a previous `import_batch_id`.
+
 ## Bulk upsert idempotency and stale policy
 
 - Primary deployment contract is `LK_WRITE_CONTRACT=api`.
