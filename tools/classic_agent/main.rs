@@ -1260,7 +1260,8 @@ impl Agent {
             link_diag.recognized_server_address.as_deref().unwrap_or("unknown")
         );
 
-        let (address, port) = split_host_port(link_cfg.server_address())?;
+        let server_address = link_cfg.server_address();
+        let (address, port) = split_host_port(&server_address)?;
         let export_config_hash = InventoryExportConfig {
             address,
             domain: link_cfg.cert_domain().to_string(),
@@ -1381,7 +1382,7 @@ impl Agent {
                 settings_path,
                 hosts_path,
                 EndpointExportOptions::new(
-                    link_cfg.server_address().to_string(),
+                    link_cfg.server_address(),
                     link_cfg.custom_sni(),
                     link_cfg.display_name(),
                     link_cfg.dns_servers(),
@@ -3905,7 +3906,7 @@ async fn build_account_exports(
             link_cfg.node_external_id()
         ));
     }
-    let server_address = link_cfg.server_address().to_string();
+    let server_address = link_cfg.server_address();
     let cert_domain = link_cfg.cert_domain().to_string();
     let custom_sni = link_cfg.custom_sni();
     let display_name = link_cfg.display_name();

@@ -238,22 +238,13 @@ async fn run_export_command(
         ));
     }
 
-    let (tt_link, normalized_stdout) =
+    let (tt_link, _normalized_stdout) =
         extract_canonical_tt_link(&stdout, username).map_err(|reason| {
             format!(
                 "endpoint returned invalid deeplink for {username}: {reason}; stderr={}",
                 stderr.trim()
             )
         })?;
-    if normalized_stdout {
-        let non_empty_lines = stdout
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .count();
-        println!(
-            "phase=export_tt_link_stdout_normalized username={username} non_empty_lines={non_empty_lines}"
-        );
-    }
 
     Ok(tt_link)
 }

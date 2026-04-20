@@ -1,11 +1,18 @@
 use serde::Deserialize;
+use std::net::IpAddr;
 use std::path::Path;
+use std::str::FromStr;
 use trusttunnel_deeplink::Protocol as DeepLinkProtocol;
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct LinkGenerationConfig {
     node_external_id: String,
-    server_address: String,
+    #[serde(default)]
+    server_address: Option<String>,
+    #[serde(default, alias = "host")]
+    address_host: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
     cert_domain: String,
     #[serde(default)]
     custom_sni: Option<String>,
@@ -33,16 +40,17 @@ pub(crate) struct LinkConfigDiagnostics {
 }
 
 impl LinkGenerationConfig {
-    const REQUIRED_FIELDS: [&'static str; 4] = [
+    const REQUIRED_FIELDS: [&'static str; 5] = [
         "node_external_id",
-        "server_address",
+        "address_host",
+        "port",
         "cert_domain",
         "protocol",
     ];
 
     fn expected_shape_hint() -> String {
         format!(
-            "expected TOML shape with required fields [{}]: node_external_id=\"...\", server_address=\"host:port\", cert_domain=\"...\", protocol=\"http2|http3\"",
+            "expected TOML shape with required fields [{}]: node_external_id=\"...\", address_host=\"host\", port=443, cert_domain=\"...\", protocol=\"http2|http3\"; legacy server_address=\"host:port\" is still accepted",
             Self::REQUIRED_FIELDS.join(", ")
         )
     }
@@ -149,7 +157,9 @@ impl LinkGenerationConfig {
 
         let cfg = Self {
             node_external_id: node_external_id.trim().to_string(),
-            server_address: format!("{}:{}", host.trim(), port),
+            server_address: None,
+            address_host: Some(host.trim().to_string()),
+            port: Some(port),
             cert_domain,
             custom_sni,
             protocol,
@@ -166,14 +176,26 @@ impl LinkGenerationConfig {
                 "link generation config validation failed: node_external_id is empty".to_string(),
             );
         }
-        if self.server_address.trim().is_empty() {
+        if self.address_host().is_empty() {
             return Err(
-                "link generation config validation failed: server_address is empty".to_string(),
+                "link generation config validation failed: address_host/server_address is empty"
+                    .to_string(),
+            );
+        }
+        if self.port().is_none() {
+            return Err(
+                "link generation config validation failed: port is missing or invalid".to_string(),
             );
         }
         if self.cert_domain.trim().is_empty() {
             return Err(
                 "link generation config validation failed: cert_domain is empty".to_string(),
+            );
+        }
+        if is_ip_literal(&self.address_host()) && self.custom_sni().is_none() {
+            return Err(
+                "link generation config validation failed: address_host is IP, custom_sni is required"
+                    .to_string(),
             );
         }
         if self
@@ -192,7 +214,7 @@ impl LinkGenerationConfig {
     pub(crate) fn config_hash(&self) -> String {
         let canonical = CanonicalLinkGenerationConfig {
             node_external_id: self.node_external_id().to_string(),
-            server_address: self.server_address().to_string(),
+            server_address: self.server_address(),
             cert_domain: self.cert_domain().to_string(),
             custom_sni: self.custom_sni(),
             protocol: self.protocol.to_string(),
@@ -208,8 +230,41 @@ impl LinkGenerationConfig {
         self.node_external_id.trim()
     }
 
-    pub(crate) fn server_address(&self) -> &str {
-        self.server_address.trim()
+    pub(crate) fn server_address(&self) -> String {
+        if let (host, Some(port)) = (self.address_host(), self.port()) {
+            if !host.is_empty() {
+                return format!("{host}:{port}");
+            }
+        }
+        self.server_address
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    pub(crate) fn address_host(&self) -> String {
+        self.address_host
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| {
+                self.server_address
+                    .as_deref()
+                    .and_then(split_server_address)
+                    .map(|(host, _)| host)
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn port(&self) -> Option<u16> {
+        self.port.or_else(|| {
+            self.server_address
+                .as_deref()
+                .and_then(split_server_address)
+                .and_then(|(_, port)| port)
+        })
     }
 
     pub(crate) fn cert_domain(&self) -> &str {
@@ -279,6 +334,26 @@ fn parse_protocol(raw: &str) -> Result<DeepLinkProtocol, String> {
     }
 }
 
+fn split_server_address(raw: &str) -> Option<(String, Option<u16>)> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Some(rest) = value.strip_prefix('[') {
+        let (host, suffix) = rest.split_once(']')?;
+        let port = suffix
+            .strip_prefix(':')
+            .and_then(|raw_port| raw_port.parse::<u16>().ok());
+        return Some((host.to_string(), port));
+    }
+    let (host, port) = value.rsplit_once(':')?;
+    Some((host.trim().to_string(), port.trim().parse::<u16>().ok()))
+}
+
+fn is_ip_literal(host: &str) -> bool {
+    IpAddr::from_str(host.trim_matches(&['[', ']'][..])).is_ok()
+}
+
 fn optional_env_nonempty(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -303,7 +378,8 @@ mod tests {
     fn parses_and_validates_config_toml() {
         let raw = r#"
 node_external_id = "node-a"
-server_address = "89.110.100.165:443"
+address_host = "89.110.100.165"
+port = 443
 cert_domain = "cdn.securesoft.dev"
 custom_sni = "sni.securesoft.dev"
 protocol = "http3"
@@ -314,6 +390,8 @@ dns_servers = ["8.8.8.8", "1.1.1.1"]
 
         assert_eq!(cfg.node_external_id(), "node-a");
         assert_eq!(cfg.server_address(), "89.110.100.165:443");
+        assert_eq!(cfg.address_host(), "89.110.100.165");
+        assert_eq!(cfg.port(), Some(443));
         assert_eq!(cfg.cert_domain(), "cdn.securesoft.dev");
         assert_eq!(cfg.custom_sni(), Some("sni.securesoft.dev".to_string()));
         assert_eq!(cfg.protocol(), DeepLinkProtocol::Http3);
@@ -343,6 +421,62 @@ protocol = "quic"
 
         assert!(invalid_server_address.validate().is_err());
         assert!(invalid_protocol.is_err());
+    }
+
+    #[test]
+    fn accepts_legacy_server_address_alias() {
+        let cfg = toml::from_str::<LinkGenerationConfig>(
+            r#"
+node_external_id = "node-a"
+server_address = "edge.example.com:443"
+cert_domain = "edge.example.com"
+protocol = "http2"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.address_host(), "edge.example.com");
+        assert_eq!(cfg.port(), Some(443));
+        assert_eq!(cfg.server_address(), "edge.example.com:443");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_ip_host_without_custom_sni() {
+        let cfg = toml::from_str::<LinkGenerationConfig>(
+            r#"
+node_external_id = "node-a"
+address_host = "89.110.100.165"
+port = 443
+cert_domain = "cdn.securesoft.dev"
+protocol = "http2"
+"#,
+        )
+        .unwrap();
+
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("address_host is IP, custom_sni is required"));
+    }
+
+    #[test]
+    fn accepts_ip_host_with_custom_sni_and_cert_domain() {
+        let cfg = toml::from_str::<LinkGenerationConfig>(
+            r#"
+node_external_id = "node-a"
+address_host = "89.110.100.165"
+port = 443
+custom_sni = "edge.example.com"
+cert_domain = "edge.example.com"
+protocol = "http2"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.address_host(), "89.110.100.165");
+        assert_eq!(cfg.port(), Some(443));
+        assert_eq!(cfg.custom_sni(), Some("edge.example.com".to_string()));
+        assert_eq!(cfg.cert_domain(), "edge.example.com");
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
@@ -411,7 +545,7 @@ dns_servers = ["8.8.8.8", "1.1.1.1"]
         let err = LinkGenerationConfig::load_from_file_or_legacy_env(&path, "node-a").unwrap_err();
         assert!(err.contains("file-based link config is required"));
         assert!(err
-            .contains("required fields [node_external_id, server_address, cert_domain, protocol]"));
+            .contains("required fields [node_external_id, address_host, port, cert_domain, protocol]"));
     }
 
     #[test]
@@ -463,7 +597,7 @@ protocol = "http2"
         let err = LinkGenerationConfig::load_from_file_or_legacy_env(&path, "node-a").unwrap_err();
         assert!(err.contains("missing field `node_external_id`"));
         assert!(err
-            .contains("required fields [node_external_id, server_address, cert_domain, protocol]"));
+            .contains("required fields [node_external_id, address_host, port, cert_domain, protocol]"));
     }
 
     #[test]

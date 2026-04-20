@@ -33,6 +33,19 @@ display_name = "SecureSoft node A"
 dns_servers = ["1.1.1.1", "8.8.8.8"]
 ```
 
+IP endpoint with domain TLS routing:
+
+```toml
+node_external_id = "tt-worker2"
+address_host = "89.110.100.165"
+port = 443
+protocol = "http2"
+custom_sni = "edge.example.com"
+cert_domain = "edge.example.com"
+display_name = "tt-worker2"
+dns_servers = ["1.1.1.1", "8.8.8.8"]
+```
+
 Field semantics:
 
 | Field | Required | Meaning |

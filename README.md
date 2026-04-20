@@ -589,6 +589,22 @@ TT-link legacy fallback env vars (used only when `TRUSTTUNNEL_LINK_CONFIG_FILE` 
 - `TRUSTTUNNEL_TT_LINK_CERT_DOMAIN` (defaults to host)
 - `TRUSTTUNNEL_TT_LINK_DNS_SERVERS` (comma-separated)
 
+Prefer mounting a file-based `tt-link.toml` through a ConfigMap:
+
+```toml
+node_external_id = "tt-worker2"
+address_host = "89.110.100.165"
+port = 443
+cert_domain = "edge.example.com"
+protocol = "http2"
+custom_sni = "edge.example.com"
+display_name = "tt-worker2"
+dns_servers = ["1.1.1.1", "8.8.8.8"]
+```
+
+If `address_host` is an IP address, `custom_sni` and `cert_domain` must point
+to the public certificate domain; otherwise TT-link export is invalid.
+
 Classic agent runtime credentials migration and restart recovery:
 
 - Startup bootstrap pass: if `TRUSTTUNNEL_BOOTSTRAP_CREDENTIALS_FILE` is set, runtime credentials are absent, and runtime has not yet been marked as primary, the agent imports bootstrap credentials once.

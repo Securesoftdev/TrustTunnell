@@ -198,17 +198,39 @@ Example:
 
 ```toml
 node_external_id = "node-a"
-address_host = "edge.example.com"
+address_host = "89.110.100.165"
 port = 443
 cert_domain = "edge.example.com"
 protocol = "http2"
-custom_sni = "sni.example.com"
+custom_sni = "edge.example.com"
 display_name = "Main node"
 dns_servers = ["1.1.1.1", "8.8.8.8"]
 ```
 
 `server_address = "host:port"` is a legacy alias only. New configs and docs
 must use `address_host + port`.
+
+Kubernetes ConfigMap example:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trusttunnel-link-config
+data:
+  tt-link.toml: |
+    node_external_id = "tt-worker2"
+    address_host = "89.110.100.165"
+    port = 443
+    cert_domain = "edge.example.com"
+    protocol = "http2"
+    custom_sni = "edge.example.com"
+    display_name = "tt-worker2"
+    dns_servers = ["1.1.1.1", "8.8.8.8"]
+```
+
+Mount the file into `TRUSTTUNNEL_RUNTIME_DIR` or set
+`TRUSTTUNNEL_LINK_CONFIG_FILE` to the mounted absolute path.
 
 Hard validation rule:
 
@@ -237,11 +259,8 @@ Diagnostics include contract mode:
   lines must include `username`, `exported_address_host`, `exported_port`,
   `exported_custom_sni`, `exported_cert_domain`, `used_fallback_config`, and
   `link_validation_result`.
-- TT-link normalization diagnostics:
-  `phase=export_tt_link_stdout_normalized` is emitted when endpoint stdout
-  includes extra non-empty lines in addition to the canonical `tt://` deeplink.
-  This indicates helper text/URLs were discarded to keep LK payloads limited
-  to a clean single-line deeplink.
+- TT-link normalization silently discards helper text/URLs from endpoint stdout
+  and keeps LK payloads limited to a clean single-line `tt://` deeplink.
 - Prometheus endpoint: `GET /metrics` on `AGENT_METRICS_ADDRESS`.
 - Metrics:
   - `classic_agent_reconcile_total{node,revision,status,error_class}`
