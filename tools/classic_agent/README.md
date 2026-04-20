@@ -136,6 +136,13 @@ Optional:
 - `CLASSIC_AGENT_MODE` (`db_worker` default)
 - `AGENT_STATE_PATH`
 - `AGENT_METRICS_ADDRESS`
+- `AGENT_METRICS_PUSH_ENABLED` (default `true`)
+- `AGENT_METRICS_PUSH_INTERVAL_SEC` (default `30`)
+- `AGENT_TELEMETRY_PUSH_ENABLED` (default `true`)
+- `AGENT_TELEMETRY_PUSH_INTERVAL_SEC` (default `60`)
+- `LK_METRICS_PATH` (default `/internal/trusttunnel/metrics`)
+- `LK_TELEMETRY_SNAPSHOTS_PATH` (default `/internal/telemetry/snapshots`)
+- `TRUSTTUNNEL_ENDPOINT_METRICS_URL` (optional override for scraping endpoint Prometheus metrics)
 - `TRUSTTUNNEL_BOOTSTRAP_CREDENTIALS_FILE`
 - `TRUSTTUNNEL_APPLY_CMD`
 - `TRUSTTUNNEL_ENDPOINT_BINARY`
@@ -262,6 +269,7 @@ Diagnostics include contract mode:
 - TT-link normalization silently discards helper text/URLs from endpoint stdout
   and keeps LK payloads limited to a clean single-line `tt://` deeplink.
 - Prometheus endpoint: `GET /metrics` on `AGENT_METRICS_ADDRESS`.
+- LK metric delivery: periodic `POST /internal/trusttunnel/metrics` and `POST /internal/telemetry/snapshots`, keyed by `external_node_id`, with optional endpoint Prometheus scraping for active sessions and bandwidth.
 - Metrics:
   - `classic_agent_reconcile_total{node,revision,status,error_class}`
   - `classic_agent_apply_total{node,revision,status,error_class}`

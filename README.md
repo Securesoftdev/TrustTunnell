@@ -564,6 +564,13 @@ Optional:
 - `CLASSIC_AGENT_MODE` (`db_worker` by default; `legacy_http` requires build feature `legacy-lk-http`)
 - `AGENT_STATE_PATH` (default `agent_state.json`)
 - `AGENT_METRICS_ADDRESS` (default `127.0.0.1:9901`, Prometheus endpoint exposed as `GET /metrics`)
+- `AGENT_METRICS_PUSH_ENABLED` (default `true`; enables periodic LK node metrics push)
+- `AGENT_METRICS_PUSH_INTERVAL_SEC` (default `30`)
+- `AGENT_TELEMETRY_PUSH_ENABLED` (default `true`; enables periodic LK telemetry snapshot push)
+- `AGENT_TELEMETRY_PUSH_INTERVAL_SEC` (default `60`)
+- `LK_METRICS_PATH` (default `/internal/trusttunnel/metrics`)
+- `LK_TELEMETRY_SNAPSHOTS_PATH` (default `/internal/telemetry/snapshots`)
+- `TRUSTTUNNEL_ENDPOINT_METRICS_URL` (optional override for scraping endpoint Prometheus metrics; otherwise derived from `[metrics].address` in `vpn.toml`)
 - `TRUSTTUNNEL_BOOTSTRAP_CREDENTIALS_FILE` (read-only bootstrap credentials source)
 - `TRUSTTUNNEL_APPLY_CMD` (command executed after runtime credentials update)
 - `TRUSTTUNNEL_ENDPOINT_BIN` (default `/usr/local/bin/trusttunnel_endpoint`; falls back to `trusttunnel_endpoint` from `PATH` only when default path is unavailable)
@@ -626,6 +633,7 @@ Classic agent sidecar observability:
 - Structured JSON logs include `ts`, `level`, `revision`, `node`, `status`, and `error_class` (plus `message` for errors).
 - Sidecar sync pass summaries include stable counters: `found`, `generated`, `updated`, `missing`, `skipped`, `errors` (plus `new`, `stale`, `deleted`).
 - Internal Prometheus endpoint is exposed on `AGENT_METRICS_ADDRESS` via `GET /metrics`.
+- `classic_agent` can also push LK-facing node metrics and telemetry snapshots on a schedule, keyed by `external_node_id`; endpoint traffic counters are scraped from `TRUSTTUNNEL_ENDPOINT_METRICS_URL` or derived from `[metrics].address` in `vpn.toml`.
 - Metrics include:
   - `classic_agent_reconcile_total{node,revision,status,error_class}`
   - `classic_agent_apply_total{node,revision,status,error_class}`

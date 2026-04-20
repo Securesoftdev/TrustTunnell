@@ -7,6 +7,8 @@ pub const DEFAULT_SYNC_PATH_TEMPLATE: &str = "/internal/trusttunnel/v1/nodes/{ex
 pub const DEFAULT_SYNC_REPORT_PATH: &str = "/internal/trusttunnel/v1/nodes/sync-report";
 pub const DEFAULT_HEARTBEAT_PATH: &str = "/internal/trusttunnel/v1/nodes/heartbeat";
 pub const DEFAULT_REGISTER_PATH: &str = "/internal/trusttunnel/v1/nodes/register";
+pub const DEFAULT_NODE_METRICS_PATH: &str = "/internal/trusttunnel/metrics";
+pub const DEFAULT_TELEMETRY_SNAPSHOTS_PATH: &str = "/internal/telemetry/snapshots";
 
 #[derive(Clone)]
 pub struct LkApiClient {
@@ -17,6 +19,8 @@ pub struct LkApiClient {
     heartbeat_path: String,
     sync_report_path: String,
     sync_path_template: String,
+    node_metrics_path: String,
+    telemetry_snapshots_path: String,
 }
 
 impl LkApiClient {
@@ -28,6 +32,8 @@ impl LkApiClient {
         heartbeat_path: String,
         sync_report_path: String,
         sync_path_template: String,
+        node_metrics_path: String,
+        telemetry_snapshots_path: String,
     ) -> Self {
         Self {
             client,
@@ -37,6 +43,8 @@ impl LkApiClient {
             heartbeat_path,
             sync_report_path,
             sync_path_template,
+            node_metrics_path,
+            telemetry_snapshots_path,
         }
     }
 
@@ -147,6 +155,66 @@ impl LkApiClient {
             "sync-report push failed with HTTP {}",
             response.status()
         ))
+    }
+
+    pub async fn push_node_metrics(
+        &self,
+        payload: &NodeMetricsPayload<'_>,
+    ) -> Result<(), MetricsPushError> {
+        let response = self
+            .client
+            .post(self.endpoint(&self.node_metrics_path))
+            .header("Authorization", format!("Bearer {}", self.service_token))
+            .header("X-Internal-Agent-Token", &self.service_token)
+            .json(payload)
+            .send()
+            .await
+            .map_err(|e| MetricsPushError::Network(format!("node metrics push failed: {e}")))?;
+
+        if response.status().is_success() {
+            return Ok(());
+        }
+
+        let status = response.status();
+        if status.is_server_error() {
+            return Err(MetricsPushError::ServerHttp(status));
+        }
+        if status.is_client_error() {
+            return Err(MetricsPushError::ClientHttp(status));
+        }
+
+        Err(MetricsPushError::UnexpectedStatus(status))
+    }
+
+    pub async fn push_telemetry_snapshot(
+        &self,
+        payload: &TelemetrySnapshotPayload<'_>,
+    ) -> Result<(), MetricsPushError> {
+        let response = self
+            .client
+            .post(self.endpoint(&self.telemetry_snapshots_path))
+            .header("Authorization", format!("Bearer {}", self.service_token))
+            .header("X-Internal-Agent-Token", &self.service_token)
+            .json(payload)
+            .send()
+            .await
+            .map_err(|e| {
+                MetricsPushError::Network(format!("telemetry snapshot push failed: {e}"))
+            })?;
+
+        if response.status().is_success() {
+            return Ok(());
+        }
+
+        let status = response.status();
+        if status.is_server_error() {
+            return Err(MetricsPushError::ServerHttp(status));
+        }
+        if status.is_client_error() {
+            return Err(MetricsPushError::ClientHttp(status));
+        }
+
+        Err(MetricsPushError::UnexpectedStatus(status))
     }
 
     fn endpoint(&self, path: &str) -> String {
@@ -287,6 +355,44 @@ pub struct HeartbeatStats<'a> {
     pub last_apply_status: &'a str,
 }
 
+#[derive(Serialize)]
+pub struct NodeMetricsPayload<'a> {
+    pub external_node_id: &'a str,
+    pub active_connections: u64,
+    pub avg_rtt_ms: u64,
+    pub cpu_usage_percent: u64,
+    pub memory_usage_percent: u64,
+    pub bandwidth_mbps: u64,
+    pub tunnel_establish_rate: u64,
+    pub error_rate: u64,
+    pub collected_at: &'a str,
+}
+
+#[derive(Serialize)]
+pub struct TelemetrySnapshotPayload<'a> {
+    pub source: &'static str,
+    pub snapshot_at: &'a str,
+    pub node_telemetry: Vec<TelemetryNodePayload<'a>>,
+}
+
+#[derive(Serialize)]
+pub struct TelemetryNodePayload<'a> {
+    pub external_node_id: &'a str,
+    pub collected_at: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub infra: Option<TelemetryInfraPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw: Option<Value>,
+}
+
+#[derive(Serialize)]
+pub struct TelemetryInfraPayload {
+    pub cpu_usage_percent: u64,
+    pub memory_usage_percent: u64,
+    pub bandwidth_mbps: u64,
+    pub active_connections: u64,
+}
+
 impl<'a> OnboardingPayload<'a> {
     pub fn from_metadata(
         metadata: &'a NodeMetadata,
@@ -337,6 +443,36 @@ impl<'a> OnboardingPayload<'a> {
             );
         }
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub enum MetricsPushError {
+    Network(String),
+    ClientHttp(StatusCode),
+    ServerHttp(StatusCode),
+    UnexpectedStatus(StatusCode),
+}
+
+impl MetricsPushError {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Network(_) => "network",
+            Self::ClientHttp(_) => "client_http",
+            Self::ServerHttp(_) => "server_http",
+            Self::UnexpectedStatus(_) => "unexpected_status",
+        }
+    }
+}
+
+impl fmt::Display for MetricsPushError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Network(detail) => write!(f, "{detail}"),
+            Self::ClientHttp(status) => write!(f, "client HTTP {status}"),
+            Self::ServerHttp(status) => write!(f, "server HTTP {status}"),
+            Self::UnexpectedStatus(status) => write!(f, "unexpected HTTP {status}"),
+        }
     }
 }
 

@@ -2,6 +2,7 @@
 
 ## 1.0.28
 
+- [Feature] `classic_agent` can now push node metrics and telemetry snapshots into LK on a schedule, using `external_node_id` resolution plus optional endpoint Prometheus scraping for active sessions and throughput analytics.
 - [Fix] `classic_agent` no longer emits per-account `phase=export_tt_link_stdout_normalized` diagnostics, keeping export logs readable while still normalizing endpoint stdout internally.
 - [Fix] `classic_agent` now accepts canonical `tt-link.toml` fields `address_host` and `port` while retaining legacy `server_address`, so Kubernetes ConfigMaps can follow the documented link export contract.
 - [Fix] `classic_agent` now emits startup build provenance diagnostics (`git_sha`, build timestamp, target triple, binary path), enforces v2 `import_batch_id` runtime format (`external_node_id:idempotency_key:request_id`) with fail-fast error reason `unexpected_batch_id_format_runtime`, and logs per-POST LK artifact diagnostics for deterministic export-cycle auditing.

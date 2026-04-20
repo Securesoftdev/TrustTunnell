@@ -15,9 +15,11 @@ use credentials_inventory::{
 };
 use exporter::{EndpointExportOptions, EndpointLinkExporter};
 use legacy::lk_api::{
-    Account, AccountExportPayload, HeartbeatPayload, HeartbeatStats, LkApiClient, NodeMetadata,
-    OnboardingPayload, SyncPayload, SyncReportPayload, SyncResponse, DEFAULT_HEARTBEAT_PATH,
-    DEFAULT_REGISTER_PATH, DEFAULT_SYNC_PATH_TEMPLATE, DEFAULT_SYNC_REPORT_PATH,
+    Account, AccountExportPayload, HeartbeatPayload, HeartbeatStats, LkApiClient,
+    NodeMetricsPayload, NodeMetadata, OnboardingPayload, SyncPayload, SyncReportPayload,
+    SyncResponse, TelemetryInfraPayload, TelemetryNodePayload, TelemetrySnapshotPayload,
+    DEFAULT_HEARTBEAT_PATH, DEFAULT_NODE_METRICS_PATH, DEFAULT_REGISTER_PATH,
+    DEFAULT_SYNC_PATH_TEMPLATE, DEFAULT_SYNC_REPORT_PATH, DEFAULT_TELEMETRY_SNAPSHOTS_PATH,
 };
 use link_config::LinkGenerationConfig;
 use lk_bulk_writer::{LkArtifactRecord, LkBulkWriter, LkWriteContract};
@@ -47,6 +49,8 @@ const HEARTBEAT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const HEARTBEAT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const HEARTBEAT_MAX_ATTEMPTS: usize = 3;
 const DEFAULT_DB_WORKER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const DEFAULT_METRICS_PUSH_INTERVAL: Duration = Duration::from_secs(30);
+const DEFAULT_TELEMETRY_PUSH_INTERVAL: Duration = Duration::from_secs(60);
 const INVENTORY_INGEST_ATTEMPTS: usize = 3;
 const INVENTORY_INGEST_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const SYNC_REPORT_OUTBOX_FILE: &str = "pending_sync_reports.jsonl";
@@ -217,6 +221,13 @@ struct Config {
     runtime_version: String,
     pending_sync_reports_path: Option<PathBuf>,
     metrics_address: SocketAddr,
+    metrics_push_enabled: bool,
+    telemetry_push_enabled: bool,
+    metrics_push_interval: Duration,
+    telemetry_push_interval: Duration,
+    lk_metrics_path: String,
+    lk_telemetry_snapshots_path: String,
+    endpoint_metrics_url: Option<String>,
     debug_preserve_temp_files: bool,
     debug_verbose_export_logs: bool,
     validation_strict_mode: bool,
@@ -289,6 +300,13 @@ impl RuntimeMode {
 
     fn supports_lifecycle_writes(self) -> bool {
         matches!(self, Self::DbWorker | Self::LegacyHttp)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DbWorker => "db_worker",
+            Self::LegacyHttp => "legacy_http",
+        }
     }
 }
 
@@ -420,6 +438,51 @@ impl Config {
             .unwrap_or_else(|_| "127.0.0.1:9901".to_string())
             .parse::<SocketAddr>()
             .map_err(|e| format!("AGENT_METRICS_ADDRESS must be socket address host:port: {e}"))?;
+        let metrics_push_enabled = optional_env_nonempty("AGENT_METRICS_PUSH_ENABLED")
+            .map(|raw| {
+                matches!(
+                    raw.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(true);
+        let telemetry_push_enabled = optional_env_nonempty("AGENT_TELEMETRY_PUSH_ENABLED")
+            .map(|raw| {
+                matches!(
+                    raw.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(true);
+        let metrics_push_interval = optional_env_nonempty("AGENT_METRICS_PUSH_INTERVAL_SEC")
+            .map(|raw| {
+                let secs = raw.parse::<u64>().map_err(|e| {
+                    format!("AGENT_METRICS_PUSH_INTERVAL_SEC must be u64 seconds: {e}")
+                })?;
+                Ok::<Duration, String>(Duration::from_secs(secs))
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_METRICS_PUSH_INTERVAL);
+        let telemetry_push_interval = optional_env_nonempty("AGENT_TELEMETRY_PUSH_INTERVAL_SEC")
+            .map(|raw| {
+                let secs = raw.parse::<u64>().map_err(|e| {
+                    format!("AGENT_TELEMETRY_PUSH_INTERVAL_SEC must be u64 seconds: {e}")
+                })?;
+                Ok::<Duration, String>(Duration::from_secs(secs))
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_TELEMETRY_PUSH_INTERVAL);
+        if metrics_push_interval.is_zero() {
+            return Err("AGENT_METRICS_PUSH_INTERVAL_SEC must be greater than zero".to_string());
+        }
+        if telemetry_push_interval.is_zero() {
+            return Err("AGENT_TELEMETRY_PUSH_INTERVAL_SEC must be greater than zero".to_string());
+        }
+        let lk_metrics_path = optional_env_nonempty("LK_METRICS_PATH")
+            .unwrap_or_else(|| DEFAULT_NODE_METRICS_PATH.to_string());
+        let lk_telemetry_snapshots_path = optional_env_nonempty("LK_TELEMETRY_SNAPSHOTS_PATH")
+            .unwrap_or_else(|| DEFAULT_TELEMETRY_SNAPSHOTS_PATH.to_string());
+        let endpoint_metrics_url = optional_env_nonempty("TRUSTTUNNEL_ENDPOINT_METRICS_URL");
         let debug_preserve_temp_files = optional_env_nonempty("TRUSTTUNNEL_DEBUG_KEEP_TEMP_FILES")
             .map(|raw| {
                 matches!(
@@ -517,6 +580,13 @@ impl Config {
             runtime_version,
             pending_sync_reports_path,
             metrics_address,
+            metrics_push_enabled,
+            telemetry_push_enabled,
+            metrics_push_interval,
+            telemetry_push_interval,
+            lk_metrics_path,
+            lk_telemetry_snapshots_path,
+            endpoint_metrics_url,
             debug_preserve_temp_files,
             debug_verbose_export_logs,
             validation_strict_mode,
@@ -643,14 +713,57 @@ struct AgentState {
 struct Agent {
     cfg: Config,
     workspace: RuntimeWorkspace,
+    http_client: reqwest::Client,
     lk_api: LkApiClient,
     state: AgentState,
     node_metadata: NodeMetadata,
     last_apply_status: String,
     db_worker_health: DbWorkerHealthState,
     metrics: Arc<AgentMetrics>,
+    observability_state: ObservabilityState,
     sync_report_backoff: Duration,
     sync_report_next_retry_at: Instant,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ObservabilityState {
+    last_endpoint_traffic: Option<EndpointTrafficSample>,
+    last_error_total: Option<ErrorTotalSample>,
+}
+
+#[derive(Clone, Debug)]
+struct EndpointTrafficSample {
+    total_bytes: u64,
+    active_connections: u64,
+    collected_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct ErrorTotalSample {
+    total: u64,
+    collected_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct EndpointMetricsSnapshot {
+    active_connections: Option<u64>,
+    inbound_bytes: Option<u64>,
+    outbound_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct ObservabilitySample {
+    collected_at: chrono::DateTime<chrono::Utc>,
+    active_connections: u64,
+    cpu_percent: f64,
+    memory_percent: f64,
+    bandwidth_mbps: u64,
+    tunnel_establish_rate: u64,
+    error_rate: u64,
+    endpoint_metrics_available: bool,
+    endpoint_metrics_url: Option<String>,
+    endpoint_inbound_bytes: Option<u64>,
+    endpoint_outbound_bytes: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -723,13 +836,15 @@ impl Agent {
             );
         }
         let lk_api = LkApiClient::new(
-            client,
+            client.clone(),
             lk_base_url,
             cfg.lk_service_token.clone().unwrap_or_default(),
             DEFAULT_REGISTER_PATH.to_string(),
             DEFAULT_HEARTBEAT_PATH.to_string(),
             cfg.sync_report_path.clone().unwrap_or_default(),
             cfg.sync_path_template.clone().unwrap_or_default(),
+            cfg.lk_metrics_path.clone(),
+            cfg.lk_telemetry_snapshots_path.clone(),
         );
 
         let metrics = Arc::new(AgentMetrics::new(&node_metadata.node_external_id)?);
@@ -741,12 +856,14 @@ impl Agent {
         Ok(Self {
             cfg,
             workspace,
+            http_client: client,
             lk_api,
             state,
             node_metadata,
             last_apply_status: "pending".to_string(),
             db_worker_health: DbWorkerHealthState::default(),
             metrics,
+            observability_state: ObservabilityState::default(),
             sync_report_backoff: SYNC_REPORT_INITIAL_BACKOFF,
             sync_report_next_retry_at: Instant::now(),
         })
@@ -888,6 +1005,10 @@ impl Agent {
         apply_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut heartbeat_tick = interval(heartbeat_interval);
         heartbeat_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut metrics_push_tick = interval(self.cfg.metrics_push_interval);
+        metrics_push_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut telemetry_push_tick = interval(self.cfg.telemetry_push_interval);
+        telemetry_push_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut backoff = Duration::from_secs(1);
         let mut pending_plan: Option<sidecar_sync::ReconcilePlan> = None;
         loop {
@@ -896,6 +1017,14 @@ impl Agent {
                 _ = apply_tick.tick() => DbWorkerTickKind::Apply,
                 _ = heartbeat_tick.tick() => {
                     self.send_heartbeat_with_retry().await;
+                    continue;
+                }
+                _ = metrics_push_tick.tick(), if self.cfg.metrics_push_enabled => {
+                    self.push_node_metrics_snapshot().await;
+                    continue;
+                }
+                _ = telemetry_push_tick.tick(), if self.cfg.telemetry_push_enabled => {
+                    self.push_telemetry_snapshot().await;
                     continue;
                 }
             };
@@ -1676,6 +1805,10 @@ impl Agent {
         poll_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut heartbeat_tick = interval(heartbeat_interval);
         heartbeat_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut metrics_push_tick = interval(self.cfg.metrics_push_interval);
+        metrics_push_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut telemetry_push_tick = interval(self.cfg.telemetry_push_interval);
+        telemetry_push_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut sync_report_tick = interval(Duration::from_secs(1));
         sync_report_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -1701,6 +1834,12 @@ impl Agent {
                 }
                 _ = heartbeat_tick.tick() => {
                     self.send_heartbeat_with_retry().await;
+                }
+                _ = metrics_push_tick.tick(), if self.cfg.metrics_push_enabled => {
+                    self.push_node_metrics_snapshot().await;
+                }
+                _ = telemetry_push_tick.tick(), if self.cfg.telemetry_push_enabled => {
+                    self.push_telemetry_snapshot().await;
                 }
                 _ = sync_report_tick.tick() => {
                     self.flush_pending_sync_reports().await;
@@ -2286,22 +2425,7 @@ impl Agent {
     }
 
     async fn send_heartbeat(&self) -> Result<(), HeartbeatFailure> {
-        let runtime_status = match self.cfg.runtime_mode {
-            RuntimeMode::DbWorker => {
-                RuntimeStatus::collect_db_worker(&self.cfg.runtime_credentials_path)
-            }
-            RuntimeMode::LegacyHttp => RuntimeStatus::collect(
-                self.cfg
-                    .runtime_pid_path
-                    .as_deref()
-                    .unwrap_or_else(|| Path::new("trusttunnel.pid")),
-                self.cfg
-                    .runtime_process_name
-                    .as_deref()
-                    .unwrap_or("trusttunnel_endpoint"),
-                &self.cfg.runtime_credentials_path,
-            ),
-        };
+        let runtime_status = self.collect_runtime_status();
         let raw_health_status = match self.cfg.runtime_mode {
             RuntimeMode::DbWorker => self.db_worker_health.health_status(),
             RuntimeMode::LegacyHttp => runtime_status.health_status(),
@@ -2387,6 +2511,244 @@ impl Agent {
             self.cfg.node_external_id
         );
         Ok(())
+    }
+
+    fn collect_runtime_status(&self) -> RuntimeStatus {
+        match self.cfg.runtime_mode {
+            RuntimeMode::DbWorker => RuntimeStatus::collect_db_worker(&self.cfg.runtime_credentials_path),
+            RuntimeMode::LegacyHttp => RuntimeStatus::collect(
+                self.cfg
+                    .runtime_pid_path
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new("trusttunnel.pid")),
+                self.cfg
+                    .runtime_process_name
+                    .as_deref()
+                    .unwrap_or("trusttunnel_endpoint"),
+                &self.cfg.runtime_credentials_path,
+            ),
+        }
+    }
+
+    async fn push_node_metrics_snapshot(&mut self) {
+        let sample = self.collect_observability_sample().await;
+        let collected_at = sample.collected_at.to_rfc3339();
+        let payload = NodeMetricsPayload {
+            external_node_id: &self.cfg.node_external_id,
+            active_connections: sample.active_connections,
+            avg_rtt_ms: 0,
+            cpu_usage_percent: round_metric(sample.cpu_percent),
+            memory_usage_percent: round_metric(sample.memory_percent),
+            bandwidth_mbps: sample.bandwidth_mbps,
+            tunnel_establish_rate: sample.tunnel_establish_rate,
+            error_rate: sample.error_rate,
+            collected_at: &collected_at,
+        };
+        println!(
+            "phase=node_metrics_push_sent node={} active_connections={} cpu_percent={} memory_percent={} bandwidth_mbps={} establish_rate={} error_rate={}",
+            self.cfg.node_external_id,
+            payload.active_connections,
+            payload.cpu_usage_percent,
+            payload.memory_usage_percent,
+            payload.bandwidth_mbps,
+            payload.tunnel_establish_rate,
+            payload.error_rate
+        );
+        match self.lk_api.push_node_metrics(&payload).await {
+            Ok(()) => {
+                println!(
+                    "phase=node_metrics_push_accepted node={} active_connections={} bandwidth_mbps={}",
+                    self.cfg.node_external_id, payload.active_connections, payload.bandwidth_mbps
+                );
+            }
+            Err(err) => {
+                log_error(
+                    self.state.applied_revision.as_deref().unwrap_or("none"),
+                    &self.cfg.node_external_id,
+                    "node_metrics_push_failed",
+                    err.kind(),
+                    &err.to_string(),
+                );
+            }
+        }
+    }
+
+    async fn push_telemetry_snapshot(&mut self) {
+        let sample = self.collect_observability_sample().await;
+        let snapshot_at = sample.collected_at.to_rfc3339();
+        let raw_payload = serde_json::json!({
+            "agent_version": self.cfg.agent_version.clone(),
+            "runtime_version": self.cfg.runtime_version.clone(),
+            "runtime_mode": self.cfg.runtime_mode.as_str(),
+            "applied_revision": self.state.applied_revision.clone(),
+            "target_revision": self.state.last_target_revision.clone(),
+            "last_apply_status": self.last_apply_status.clone(),
+            "health_status": match self.cfg.runtime_mode {
+                RuntimeMode::DbWorker => self.db_worker_health.health_status(),
+                RuntimeMode::LegacyHttp => self.collect_runtime_status().health_status(),
+            },
+            "endpoint_metrics_available": sample.endpoint_metrics_available,
+            "endpoint_metrics_url": sample.endpoint_metrics_url.clone(),
+            "endpoint_metrics": {
+                "inbound_bytes": sample.endpoint_inbound_bytes,
+                "outbound_bytes": sample.endpoint_outbound_bytes,
+            },
+            "agent_metrics": collect_agent_metric_snapshot(&self.metrics.registry),
+        });
+        let payload = TelemetrySnapshotPayload {
+            source: "external",
+            snapshot_at: &snapshot_at,
+            node_telemetry: vec![TelemetryNodePayload {
+                external_node_id: &self.cfg.node_external_id,
+                collected_at: &snapshot_at,
+                infra: Some(TelemetryInfraPayload {
+                    cpu_usage_percent: round_metric(sample.cpu_percent),
+                    memory_usage_percent: round_metric(sample.memory_percent),
+                    bandwidth_mbps: sample.bandwidth_mbps,
+                    active_connections: sample.active_connections,
+                }),
+                raw: Some(raw_payload),
+            }],
+        };
+        println!(
+            "phase=telemetry_snapshot_sent node={} source=external active_connections={} bandwidth_mbps={}",
+            self.cfg.node_external_id, sample.active_connections, sample.bandwidth_mbps
+        );
+        match self.lk_api.push_telemetry_snapshot(&payload).await {
+            Ok(()) => {
+                println!(
+                    "phase=telemetry_snapshot_accepted node={} source=external",
+                    self.cfg.node_external_id
+                );
+            }
+            Err(err) => {
+                log_error(
+                    self.state.applied_revision.as_deref().unwrap_or("none"),
+                    &self.cfg.node_external_id,
+                    "telemetry_snapshot_push_failed",
+                    err.kind(),
+                    &err.to_string(),
+                );
+            }
+        }
+    }
+
+    async fn collect_observability_sample(&mut self) -> ObservabilitySample {
+        let runtime_status = self.collect_runtime_status();
+        let collected_at = chrono::Utc::now();
+        let endpoint_metrics_url = self.resolve_endpoint_metrics_url().await;
+        let endpoint_metrics = if let Some(url) = endpoint_metrics_url.as_deref() {
+            self.scrape_endpoint_metrics(url).await.ok()
+        } else {
+            None
+        };
+        let active_connections = endpoint_metrics
+            .as_ref()
+            .and_then(|item| item.active_connections)
+            .unwrap_or(runtime_status.active_clients);
+        let total_bytes = endpoint_metrics
+            .as_ref()
+            .and_then(|item| item.inbound_bytes.zip(item.outbound_bytes))
+            .map(|(inbound, outbound)| inbound.saturating_add(outbound));
+        let now_instant = Instant::now();
+        let (bandwidth_mbps, tunnel_establish_rate) = if let Some(total_bytes) = total_bytes {
+            let previous = self.observability_state.last_endpoint_traffic.clone();
+            self.observability_state.last_endpoint_traffic = Some(EndpointTrafficSample {
+                total_bytes,
+                active_connections,
+                collected_at: now_instant,
+            });
+            if let Some(previous) = previous {
+                let elapsed = now_instant
+                    .saturating_duration_since(previous.collected_at)
+                    .as_secs_f64();
+                if elapsed > 0.0 {
+                    let bytes_delta = total_bytes.saturating_sub(previous.total_bytes) as f64;
+                    let bandwidth_mbps =
+                        ((bytes_delta * 8.0) / elapsed / 1_000_000.0).round().max(0.0) as u64;
+                    let active_delta =
+                        active_connections.saturating_sub(previous.active_connections) as f64;
+                    let establish_rate = (active_delta / elapsed).round().max(0.0) as u64;
+                    (bandwidth_mbps, establish_rate)
+                } else {
+                    (0, 0)
+                }
+            } else {
+                (0, 0)
+            }
+        } else {
+            (0, 0)
+        };
+        let current_error_total = collect_failed_error_total(&self.metrics.registry);
+        let error_rate = if let Some(previous) = self.observability_state.last_error_total.clone() {
+            let elapsed = now_instant
+                .saturating_duration_since(previous.collected_at)
+                .as_secs_f64();
+            if elapsed > 0.0 {
+                ((current_error_total.saturating_sub(previous.total) as f64) / elapsed)
+                    .round()
+                    .max(0.0) as u64
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        self.observability_state.last_error_total = Some(ErrorTotalSample {
+            total: current_error_total,
+            collected_at: now_instant,
+        });
+
+        ObservabilitySample {
+            collected_at,
+            active_connections,
+            cpu_percent: runtime_status.cpu_percent,
+            memory_percent: runtime_status.memory_percent,
+            bandwidth_mbps,
+            tunnel_establish_rate,
+            error_rate,
+            endpoint_metrics_available: endpoint_metrics.is_some(),
+            endpoint_metrics_url,
+            endpoint_inbound_bytes: endpoint_metrics.as_ref().and_then(|item| item.inbound_bytes),
+            endpoint_outbound_bytes: endpoint_metrics
+                .as_ref()
+                .and_then(|item| item.outbound_bytes),
+        }
+    }
+
+    async fn resolve_endpoint_metrics_url(&self) -> Option<String> {
+        if let Some(url) = self.cfg.endpoint_metrics_url.as_ref() {
+            return Some(url.clone());
+        }
+        let config_path = resolve_runtime_path(
+            &self.cfg.trusttunnel_runtime_dir,
+            &self.cfg.trusttunnel_config_file,
+        );
+        derive_endpoint_metrics_url_from_config(&config_path).await
+    }
+
+    async fn scrape_endpoint_metrics(&self, url: &str) -> Result<EndpointMetricsSnapshot, String> {
+        let response = self
+            .http_client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| format!("endpoint metrics scrape failed: {e}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "endpoint metrics scrape returned HTTP {}",
+                response.status()
+            ));
+        }
+        let body = response
+            .text()
+            .await
+            .map_err(|e| format!("failed to read endpoint metrics body: {e}"))?;
+        Ok(EndpointMetricsSnapshot {
+            active_connections: parse_prometheus_sum_metric(&body, "client_sessions"),
+            inbound_bytes: parse_prometheus_sum_metric(&body, "inbound_traffic_bytes"),
+            outbound_bytes: parse_prometheus_sum_metric(&body, "outbound_traffic_bytes"),
+        })
     }
 
     async fn send_register_once(&self) -> Result<RegisterAttemptOutcome, RegisterError> {
@@ -3525,6 +3887,124 @@ async fn serve_metrics(metrics: Arc<AgentMetrics>, address: SocketAddr) -> Resul
     }
 }
 
+fn round_metric(value: f64) -> u64 {
+    if !value.is_finite() {
+        return 0;
+    }
+    value.round().max(0.0) as u64
+}
+
+fn parse_prometheus_sum_metric(body: &str, metric_name: &str) -> Option<u64> {
+    let mut total = 0.0_f64;
+    let mut found = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || !trimmed.starts_with(metric_name) {
+            continue;
+        }
+        let Some((_, value_part)) = trimmed.rsplit_once(' ') else {
+            continue;
+        };
+        let Ok(value) = value_part.trim().parse::<f64>() else {
+            continue;
+        };
+        total += value;
+        found = true;
+    }
+    if found {
+        Some(total.round().max(0.0) as u64)
+    } else {
+        None
+    }
+}
+
+async fn derive_endpoint_metrics_url_from_config(config_path: &Path) -> Option<String> {
+    let raw = fs::read_to_string(config_path).await.ok()?;
+    let doc = raw.parse::<toml_edit::Document>().ok()?;
+    let metrics = doc.get("metrics")?;
+    let address = metrics.get("address")?.as_str()?.trim();
+    if address.is_empty() {
+        return None;
+    }
+    let base = if address.starts_with("http://") || address.starts_with("https://") {
+        address.to_string()
+    } else {
+        format!("http://{address}")
+    };
+    Some(format!("{}/metrics", base.trim_end_matches('/')))
+}
+
+fn collect_failed_error_total(registry: &Registry) -> u64 {
+    let families = registry.gather();
+    [
+        ("classic_agent_reconcile_total", "status", "failed"),
+        ("classic_agent_apply_total", "status", "failed"),
+        ("classic_agent_runtime_health_total", "status", "failed"),
+    ]
+    .into_iter()
+    .map(|(family, label, expected)| {
+        sum_counter_family_by_label(&families, family, label, expected)
+    })
+    .sum()
+}
+
+fn collect_agent_metric_snapshot(registry: &Registry) -> serde_json::Value {
+    let families = registry.gather();
+    serde_json::json!({
+        "reconcile_total_failed": sum_counter_family_by_label(&families, "classic_agent_reconcile_total", "status", "failed"),
+        "reconcile_total_success": sum_counter_family_by_label(&families, "classic_agent_reconcile_total", "status", "success"),
+        "apply_total_failed": sum_counter_family_by_label(&families, "classic_agent_apply_total", "status", "failed"),
+        "apply_total_success": sum_counter_family_by_label(&families, "classic_agent_apply_total", "status", "success"),
+        "runtime_health_total_failed": sum_counter_family_by_label(&families, "classic_agent_runtime_health_total", "status", "failed"),
+        "runtime_health_total_success": sum_counter_family_by_label(&families, "classic_agent_runtime_health_total", "status", "success"),
+        "sidecar_sync_pass_ok": sum_counter_family_by_label(&families, "classic_agent_sidecar_sync_pass_total", "status", "ok"),
+        "sidecar_sync_pass_failed": sum_counter_family_by_label(&families, "classic_agent_sidecar_sync_pass_total", "status", "failed"),
+        "tt_link_generation_total": sum_counter_family_by_label(&families, "classic_agent_tt_link_generation_total", "status", "success"),
+        "apply_duration_ms": sum_gauge_family(&families, "classic_agent_apply_duration_milliseconds"),
+        "credentials_count": sum_gauge_family(&families, "classic_agent_credentials_count"),
+        "runtime_health_status": sum_gauge_family(&families, "classic_agent_runtime_health_status"),
+        "endpoint_process_status": sum_gauge_family(&families, "classic_agent_endpoint_process_status"),
+    })
+}
+
+fn sum_counter_family_by_label(
+    families: &[prometheus::proto::MetricFamily],
+    family_name: &str,
+    label_name: &str,
+    expected_value: &str,
+) -> u64 {
+    families
+        .iter()
+        .find(|family| family.get_name() == family_name)
+        .map(|family| {
+            family
+                .get_metric()
+                .iter()
+                .filter(|metric| {
+                    metric.get_label().iter().any(|label| {
+                        label.get_name() == label_name && label.get_value() == expected_value
+                    })
+                })
+                .map(|metric| metric.get_counter().get_value().round().max(0.0) as u64)
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+fn sum_gauge_family(families: &[prometheus::proto::MetricFamily], family_name: &str) -> i64 {
+    families
+        .iter()
+        .find(|family| family.get_name() == family_name)
+        .map(|family| {
+            family
+                .get_metric()
+                .iter()
+                .map(|metric| metric.get_gauge().get_value().round() as i64)
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
 fn log_event(level: &str, revision: &str, node: &str, status: &str, error_class: &str) {
     let payload = serde_json::json!({
         "ts": chrono::Utc::now().to_rfc3339(),
@@ -4222,6 +4702,39 @@ mod runtime_status_tests {
         assert!(from_hyphen.contains(&"trusttunnel-endpoint".to_string()));
         assert!(from_hyphen.contains(&"trusttunnel_endpoint".to_string()));
     }
+
+    #[test]
+    fn parse_prometheus_sum_metric_sums_labeled_series() {
+        let body = r#"
+# HELP client_sessions Number of active client sessions
+client_sessions{protocol_type="http1"} 2
+client_sessions{protocol_type="http2"} 3
+inbound_traffic_bytes{protocol_type="http2"} 128
+"#;
+
+        assert_eq!(parse_prometheus_sum_metric(body, "client_sessions"), Some(5));
+        assert_eq!(parse_prometheus_sum_metric(body, "inbound_traffic_bytes"), Some(128));
+        assert_eq!(parse_prometheus_sum_metric(body, "outbound_traffic_bytes"), None);
+    }
+
+    #[tokio::test]
+    async fn derive_endpoint_metrics_url_from_config_reads_metrics_listener() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("vpn.toml");
+        fs::write(
+            &config_path,
+            r#"
+[metrics]
+address = "127.0.0.1:9910"
+"#,
+        )
+        .await
+        .unwrap();
+
+        let actual = derive_endpoint_metrics_url_from_config(&config_path).await;
+
+        assert_eq!(actual.as_deref(), Some("http://127.0.0.1:9910/metrics"));
+    }
 }
 
 fn optional_env(name: &str) -> Option<String> {
@@ -4901,6 +5414,13 @@ message_queue_capacity = 4096
             runtime_version: "test".to_string(),
             pending_sync_reports_path: Some(runtime_dir.join(SYNC_REPORT_OUTBOX_FILE)),
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
+            metrics_push_enabled: true,
+            telemetry_push_enabled: true,
+            metrics_push_interval: DEFAULT_METRICS_PUSH_INTERVAL,
+            telemetry_push_interval: DEFAULT_TELEMETRY_PUSH_INTERVAL,
+            lk_metrics_path: DEFAULT_NODE_METRICS_PATH.to_string(),
+            lk_telemetry_snapshots_path: DEFAULT_TELEMETRY_SNAPSHOTS_PATH.to_string(),
+            endpoint_metrics_url: None,
             debug_preserve_temp_files: false,
             debug_verbose_export_logs: false,
             validation_strict_mode: false,
@@ -5018,6 +5538,13 @@ upload_buffer_size = 32768
             runtime_version: "test".to_string(),
             pending_sync_reports_path: None,
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
+            metrics_push_enabled: true,
+            telemetry_push_enabled: true,
+            metrics_push_interval: DEFAULT_METRICS_PUSH_INTERVAL,
+            telemetry_push_interval: DEFAULT_TELEMETRY_PUSH_INTERVAL,
+            lk_metrics_path: DEFAULT_NODE_METRICS_PATH.to_string(),
+            lk_telemetry_snapshots_path: DEFAULT_TELEMETRY_SNAPSHOTS_PATH.to_string(),
+            endpoint_metrics_url: None,
             debug_preserve_temp_files,
             debug_verbose_export_logs: false,
             validation_strict_mode,
@@ -5266,6 +5793,13 @@ upload_buffer_size = 32768
             runtime_version: "test".to_string(),
             pending_sync_reports_path: Some(PathBuf::from("pending_sync_reports.jsonl")),
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
+            metrics_push_enabled: true,
+            telemetry_push_enabled: true,
+            metrics_push_interval: DEFAULT_METRICS_PUSH_INTERVAL,
+            telemetry_push_interval: DEFAULT_TELEMETRY_PUSH_INTERVAL,
+            lk_metrics_path: DEFAULT_NODE_METRICS_PATH.to_string(),
+            lk_telemetry_snapshots_path: DEFAULT_TELEMETRY_SNAPSHOTS_PATH.to_string(),
+            endpoint_metrics_url: None,
             debug_preserve_temp_files: false,
             debug_verbose_export_logs: false,
             validation_strict_mode: false,
@@ -5366,6 +5900,13 @@ upload_buffer_size = 32768
             runtime_version: "test".to_string(),
             pending_sync_reports_path: Some(PathBuf::from("pending_sync_reports.jsonl")),
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
+            metrics_push_enabled: true,
+            telemetry_push_enabled: true,
+            metrics_push_interval: DEFAULT_METRICS_PUSH_INTERVAL,
+            telemetry_push_interval: DEFAULT_TELEMETRY_PUSH_INTERVAL,
+            lk_metrics_path: DEFAULT_NODE_METRICS_PATH.to_string(),
+            lk_telemetry_snapshots_path: DEFAULT_TELEMETRY_SNAPSHOTS_PATH.to_string(),
+            endpoint_metrics_url: None,
             debug_preserve_temp_files: false,
             debug_verbose_export_logs: false,
             validation_strict_mode: false,
@@ -5450,6 +5991,13 @@ upload_buffer_size = 32768
             runtime_version: "test".to_string(),
             pending_sync_reports_path: Some(PathBuf::from("pending_sync_reports.jsonl")),
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
+            metrics_push_enabled: true,
+            telemetry_push_enabled: true,
+            metrics_push_interval: DEFAULT_METRICS_PUSH_INTERVAL,
+            telemetry_push_interval: DEFAULT_TELEMETRY_PUSH_INTERVAL,
+            lk_metrics_path: DEFAULT_NODE_METRICS_PATH.to_string(),
+            lk_telemetry_snapshots_path: DEFAULT_TELEMETRY_SNAPSHOTS_PATH.to_string(),
+            endpoint_metrics_url: None,
             debug_preserve_temp_files: false,
             debug_verbose_export_logs: false,
             validation_strict_mode: false,
@@ -5647,6 +6195,13 @@ upload_buffer_size = 32768
             runtime_version: "test".to_string(),
             pending_sync_reports_path: None,
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
+            metrics_push_enabled: true,
+            telemetry_push_enabled: true,
+            metrics_push_interval: DEFAULT_METRICS_PUSH_INTERVAL,
+            telemetry_push_interval: DEFAULT_TELEMETRY_PUSH_INTERVAL,
+            lk_metrics_path: DEFAULT_NODE_METRICS_PATH.to_string(),
+            lk_telemetry_snapshots_path: DEFAULT_TELEMETRY_SNAPSHOTS_PATH.to_string(),
+            endpoint_metrics_url: None,
             debug_preserve_temp_files: false,
             debug_verbose_export_logs: false,
             validation_strict_mode: false,
@@ -6149,6 +6704,13 @@ upload_buffer_size = 32768
             runtime_version: "test".to_string(),
             pending_sync_reports_path: None,
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
+            metrics_push_enabled: true,
+            telemetry_push_enabled: true,
+            metrics_push_interval: DEFAULT_METRICS_PUSH_INTERVAL,
+            telemetry_push_interval: DEFAULT_TELEMETRY_PUSH_INTERVAL,
+            lk_metrics_path: DEFAULT_NODE_METRICS_PATH.to_string(),
+            lk_telemetry_snapshots_path: DEFAULT_TELEMETRY_SNAPSHOTS_PATH.to_string(),
+            endpoint_metrics_url: None,
             debug_preserve_temp_files: false,
             debug_verbose_export_logs: false,
             validation_strict_mode: false,
@@ -6998,6 +7560,60 @@ upload_buffer_size = 32768
 
     #[cfg(feature = "legacy-lk-http")]
     #[tokio::test]
+    async fn node_metrics_push_uses_external_node_id_payload() {
+        let server = MockHttpServer::start().await;
+        let tmp_dir = TempDir::new().unwrap();
+        let mut agent = make_agent(&tmp_dir, &server.base_url, None).await;
+        agent.cfg.endpoint_metrics_url = None;
+        server
+            .enqueue(Method::POST, DEFAULT_NODE_METRICS_PATH, HyperStatusCode::CREATED, "")
+            .await;
+
+        agent.push_node_metrics_snapshot().await;
+
+        let requests = server.captured().await;
+        let metrics_request = requests
+            .iter()
+            .find(|x| x.method == Method::POST && x.path == DEFAULT_NODE_METRICS_PATH)
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&metrics_request.body).unwrap();
+        assert_eq!(body["external_node_id"], "node-1");
+        assert!(body["active_connections"].as_u64().is_some());
+        assert!(body["collected_at"].as_str().unwrap().contains('T'));
+    }
+
+    #[cfg(feature = "legacy-lk-http")]
+    #[tokio::test]
+    async fn telemetry_snapshot_push_contains_node_telemetry_raw_metadata() {
+        let server = MockHttpServer::start().await;
+        let tmp_dir = TempDir::new().unwrap();
+        let mut agent = make_agent(&tmp_dir, &server.base_url, None).await;
+        agent.state.applied_revision = Some("rev-7".to_string());
+        server
+            .enqueue(
+                Method::POST,
+                DEFAULT_TELEMETRY_SNAPSHOTS_PATH,
+                HyperStatusCode::OK,
+                r#"{"ok":true}"#,
+            )
+            .await;
+
+        agent.push_telemetry_snapshot().await;
+
+        let requests = server.captured().await;
+        let telemetry_request = requests
+            .iter()
+            .find(|x| x.method == Method::POST && x.path == DEFAULT_TELEMETRY_SNAPSHOTS_PATH)
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&telemetry_request.body).unwrap();
+        assert_eq!(body["source"], "external");
+        assert_eq!(body["node_telemetry"][0]["external_node_id"], "node-1");
+        assert_eq!(body["node_telemetry"][0]["raw"]["applied_revision"], "rev-7");
+        assert!(body["node_telemetry"][0]["infra"]["active_connections"].as_u64().is_some());
+    }
+
+    #[cfg(feature = "legacy-lk-http")]
+    #[tokio::test]
     async fn temporary_lk_sync_failure_does_not_break_subsequent_sync() {
         let server = MockHttpServer::start().await;
         let tmp_dir = TempDir::new().unwrap();
@@ -7261,6 +7877,13 @@ upload_buffer_size = 32768
             runtime_version: "test".to_string(),
             pending_sync_reports_path: None,
             metrics_address: "127.0.0.1:9901".parse().unwrap(),
+            metrics_push_enabled: true,
+            telemetry_push_enabled: true,
+            metrics_push_interval: DEFAULT_METRICS_PUSH_INTERVAL,
+            telemetry_push_interval: DEFAULT_TELEMETRY_PUSH_INTERVAL,
+            lk_metrics_path: DEFAULT_NODE_METRICS_PATH.to_string(),
+            lk_telemetry_snapshots_path: DEFAULT_TELEMETRY_SNAPSHOTS_PATH.to_string(),
+            endpoint_metrics_url: None,
             debug_preserve_temp_files: false,
             debug_verbose_export_logs: false,
             validation_strict_mode: false,
