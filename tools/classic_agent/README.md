@@ -172,16 +172,25 @@ Legacy TT-link env fallback (used only when link config file cannot be loaded):
 
 ## `tt-link.toml` contract (file mode)
 
-Current exporter contract expects a file with required fields:
+Canonical exporter behavior is defined in
+[`TT_LINK_EXPORT_CONTRACT.md`](TT_LINK_EXPORT_CONTRACT.md). The short form:
+new configs should use normalized host/port fields and must produce links that
+are both importable and connectable.
+
+Canonical required fields:
 
 - `node_external_id`
-- `server_address`
-- `cert_domain`
+- `address_host`
+- `port`
 - `protocol` (`http2` or `http3`)
+
+Conditional fields:
+
+- `custom_sni`
+- `cert_domain`
 
 Optional fields:
 
-- `custom_sni`
 - `display_name`
 - `dns_servers` (string array)
 
@@ -189,13 +198,26 @@ Example:
 
 ```toml
 node_external_id = "node-a"
-server_address = "edge.example.com:443"
+address_host = "edge.example.com"
+port = 443
 cert_domain = "edge.example.com"
 protocol = "http2"
 custom_sni = "sni.example.com"
 display_name = "Main node"
 dns_servers = ["1.1.1.1", "8.8.8.8"]
 ```
+
+`server_address = "host:port"` is a legacy alias only. New configs and docs
+must use `address_host + port`.
+
+Hard validation rule:
+
+- if `address_host` is a public DNS name with a matching public TLS certificate,
+  export with that DNS name;
+- if `address_host` is an IP address, both `custom_sni` and `cert_domain` are
+  required;
+- an IP export without both TLS routing fields is invalid and must not be sent
+  to LK as a successful link export.
 
 Diagnostics include contract mode:
 
@@ -211,7 +233,10 @@ Diagnostics include contract mode:
 - TT-link export always emits operational summaries:
   `phase=link_generation_started` and `phase=link_generation_complete`.
   Per-username `phase=link_generation_exported` lines are disabled by default
-  and can be enabled with `TRUSTTUNNEL_DEBUG_VERBOSE_EXPORT_LOGS=1`.
+  and can be enabled with `TRUSTTUNNEL_DEBUG_VERBOSE_EXPORT_LOGS=1`. Export
+  lines must include `username`, `exported_address_host`, `exported_port`,
+  `exported_custom_sni`, `exported_cert_domain`, `used_fallback_config`, and
+  `link_validation_result`.
 - TT-link normalization diagnostics:
   `phase=export_tt_link_stdout_normalized` is emitted when endpoint stdout
   includes extra non-empty lines in addition to the canonical `tt://` deeplink.
