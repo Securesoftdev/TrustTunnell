@@ -2,6 +2,8 @@
 
 ## 1.0.28
 
+- [Feature] `classic_agent` now supports env-driven periodic speedtest probes and attaches last/average/peak throughput snapshots to LK telemetry.
+- [Fix] `classic_agent` register failures now log a compact `response_preview` instead of dumping full HTML upstream error pages during temporary LK `503` incidents.
 - [Feature] `classic_agent` can now push node metrics and telemetry snapshots into LK on a schedule, using `external_node_id` resolution plus optional endpoint Prometheus scraping for active sessions and throughput analytics.
 - [Fix] `classic_agent` no longer emits per-account `phase=export_tt_link_stdout_normalized` diagnostics, keeping export logs readable while still normalizing endpoint stdout internally.
 - [Fix] `classic_agent` now accepts canonical `tt-link.toml` fields `address_host` and `port` while retaining legacy `server_address`, so Kubernetes ConfigMaps can follow the documented link export contract.

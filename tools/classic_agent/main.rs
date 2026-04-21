@@ -27,17 +27,19 @@ use prometheus::{Encoder, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncode
 use reqwest::StatusCode;
 use runtime_workspace::{ArtifactKind, RuntimeWorkspace};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::read_dir;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpListener;
+use tokio::net::{lookup_host, TcpListener};
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use tokio::time::{interval, Instant, MissedTickBehavior};
 use toml_edit::value;
 
@@ -51,6 +53,11 @@ const HEARTBEAT_MAX_ATTEMPTS: usize = 3;
 const DEFAULT_DB_WORKER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_METRICS_PUSH_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_TELEMETRY_PUSH_INTERVAL: Duration = Duration::from_secs(60);
+const DEFAULT_SPEEDTEST_INTERVAL: Duration = Duration::from_secs(300);
+const DEFAULT_SPEEDTEST_DOWNLOAD_MB: u32 = 25;
+const DEFAULT_SPEEDTEST_UPLOAD_MB: u32 = 10;
+const DEFAULT_SPEEDTEST_TIMEOUT: Duration = Duration::from_secs(20);
+const DEFAULT_SPEEDTEST_HISTORY_LIMIT: usize = 24;
 const INVENTORY_INGEST_ATTEMPTS: usize = 3;
 const INVENTORY_INGEST_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const SYNC_REPORT_OUTBOX_FILE: &str = "pending_sync_reports.jsonl";
@@ -223,11 +230,18 @@ struct Config {
     metrics_address: SocketAddr,
     metrics_push_enabled: bool,
     telemetry_push_enabled: bool,
+    speedtest_enabled: bool,
     metrics_push_interval: Duration,
     telemetry_push_interval: Duration,
+    speedtest_interval: Duration,
     lk_metrics_path: String,
     lk_telemetry_snapshots_path: String,
     endpoint_metrics_url: Option<String>,
+    speedtest_url: Option<String>,
+    speedtest_download_mb: u32,
+    speedtest_upload_mb: u32,
+    speedtest_timeout: Duration,
+    speedtest_history_limit: usize,
     debug_preserve_temp_files: bool,
     debug_verbose_export_logs: bool,
     validation_strict_mode: bool,
@@ -454,6 +468,14 @@ impl Config {
                 )
             })
             .unwrap_or(true);
+        let speedtest_enabled = optional_env_nonempty("AGENT_SPEEDTEST_ENABLED")
+            .map(|raw| {
+                matches!(
+                    raw.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
         let metrics_push_interval = optional_env_nonempty("AGENT_METRICS_PUSH_INTERVAL_SEC")
             .map(|raw| {
                 let secs = raw.parse::<u64>().map_err(|e| {
@@ -472,17 +494,77 @@ impl Config {
             })
             .transpose()?
             .unwrap_or(DEFAULT_TELEMETRY_PUSH_INTERVAL);
+        let speedtest_interval = optional_env_nonempty("AGENT_SPEEDTEST_INTERVAL_SEC")
+            .map(|raw| {
+                let secs = raw.parse::<u64>().map_err(|e| {
+                    format!("AGENT_SPEEDTEST_INTERVAL_SEC must be u64 seconds: {e}")
+                })?;
+                Ok::<Duration, String>(Duration::from_secs(secs))
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_SPEEDTEST_INTERVAL);
         if metrics_push_interval.is_zero() {
             return Err("AGENT_METRICS_PUSH_INTERVAL_SEC must be greater than zero".to_string());
         }
         if telemetry_push_interval.is_zero() {
             return Err("AGENT_TELEMETRY_PUSH_INTERVAL_SEC must be greater than zero".to_string());
         }
+        if speedtest_enabled && speedtest_interval.is_zero() {
+            return Err("AGENT_SPEEDTEST_INTERVAL_SEC must be greater than zero".to_string());
+        }
         let lk_metrics_path = optional_env_nonempty("LK_METRICS_PATH")
             .unwrap_or_else(|| DEFAULT_NODE_METRICS_PATH.to_string());
         let lk_telemetry_snapshots_path = optional_env_nonempty("LK_TELEMETRY_SNAPSHOTS_PATH")
             .unwrap_or_else(|| DEFAULT_TELEMETRY_SNAPSHOTS_PATH.to_string());
         let endpoint_metrics_url = optional_env_nonempty("TRUSTTUNNEL_ENDPOINT_METRICS_URL");
+        let speedtest_url = optional_env_nonempty("TRUSTTUNNEL_SPEEDTEST_URL");
+        let speedtest_download_mb = optional_env_nonempty("AGENT_SPEEDTEST_DOWNLOAD_MB")
+            .map(|raw| {
+                raw.parse::<u32>().map_err(|e| {
+                    format!("AGENT_SPEEDTEST_DOWNLOAD_MB must be an integer from 1 to 100: {e}")
+                })
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_SPEEDTEST_DOWNLOAD_MB);
+        if !(1..=100).contains(&speedtest_download_mb) {
+            return Err(
+                "AGENT_SPEEDTEST_DOWNLOAD_MB must be in range 1..=100".to_string(),
+            );
+        }
+        let speedtest_upload_mb = optional_env_nonempty("AGENT_SPEEDTEST_UPLOAD_MB")
+            .map(|raw| {
+                raw.parse::<u32>().map_err(|e| {
+                    format!("AGENT_SPEEDTEST_UPLOAD_MB must be an integer from 1 to 120: {e}")
+                })
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_SPEEDTEST_UPLOAD_MB);
+        if !(1..=120).contains(&speedtest_upload_mb) {
+            return Err("AGENT_SPEEDTEST_UPLOAD_MB must be in range 1..=120".to_string());
+        }
+        let speedtest_timeout = optional_env_nonempty("AGENT_SPEEDTEST_TIMEOUT_SEC")
+            .map(|raw| {
+                let secs = raw.parse::<u64>().map_err(|e| {
+                    format!("AGENT_SPEEDTEST_TIMEOUT_SEC must be u64 seconds: {e}")
+                })?;
+                Ok::<Duration, String>(Duration::from_secs(secs))
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_SPEEDTEST_TIMEOUT);
+        if speedtest_enabled && speedtest_timeout.is_zero() {
+            return Err("AGENT_SPEEDTEST_TIMEOUT_SEC must be greater than zero".to_string());
+        }
+        let speedtest_history_limit = optional_env_nonempty("AGENT_SPEEDTEST_HISTORY_LIMIT")
+            .map(|raw| {
+                raw.parse::<usize>().map_err(|e| {
+                    format!("AGENT_SPEEDTEST_HISTORY_LIMIT must be a positive integer: {e}")
+                })
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_SPEEDTEST_HISTORY_LIMIT);
+        if speedtest_enabled && speedtest_history_limit == 0 {
+            return Err("AGENT_SPEEDTEST_HISTORY_LIMIT must be greater than zero".to_string());
+        }
         let debug_preserve_temp_files = optional_env_nonempty("TRUSTTUNNEL_DEBUG_KEEP_TEMP_FILES")
             .map(|raw| {
                 matches!(
@@ -582,11 +664,18 @@ impl Config {
             metrics_address,
             metrics_push_enabled,
             telemetry_push_enabled,
+            speedtest_enabled,
             metrics_push_interval,
             telemetry_push_interval,
+            speedtest_interval,
             lk_metrics_path,
             lk_telemetry_snapshots_path,
             endpoint_metrics_url,
+            speedtest_url,
+            speedtest_download_mb,
+            speedtest_upload_mb,
+            speedtest_timeout,
+            speedtest_history_limit,
             debug_preserve_temp_files,
             debug_verbose_export_logs,
             validation_strict_mode,
@@ -721,6 +810,8 @@ struct Agent {
     db_worker_health: DbWorkerHealthState,
     metrics: Arc<AgentMetrics>,
     observability_state: ObservabilityState,
+    speedtest_state: Arc<Mutex<SpeedtestState>>,
+    speedtest_running: Arc<AtomicBool>,
     sync_report_backoff: Duration,
     sync_report_next_retry_at: Instant,
 }
@@ -729,6 +820,123 @@ struct Agent {
 struct ObservabilityState {
     last_endpoint_traffic: Option<EndpointTrafficSample>,
     last_error_total: Option<ErrorTotalSample>,
+}
+
+#[derive(Clone, Debug)]
+struct SpeedtestProbeSample {
+    collected_at: chrono::DateTime<chrono::Utc>,
+    target_url: String,
+    download_mbps: u64,
+    upload_mbps: u64,
+    download_duration_ms: u64,
+    upload_duration_ms: u64,
+    downloaded_bytes: u64,
+    uploaded_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+struct SpeedtestErrorSample {
+    at: chrono::DateTime<chrono::Utc>,
+    message: String,
+}
+
+#[derive(Clone, Debug)]
+struct SpeedtestSnapshot {
+    enabled: bool,
+    status: &'static str,
+    target_url: Option<String>,
+    samples: usize,
+    last_result: Option<SpeedtestProbeSample>,
+    rolling_average_download_mbps: Option<u64>,
+    rolling_average_upload_mbps: Option<u64>,
+    peak_download_mbps: Option<u64>,
+    peak_upload_mbps: Option<u64>,
+    last_error: Option<SpeedtestErrorSample>,
+}
+
+#[derive(Debug)]
+struct SpeedtestState {
+    enabled: bool,
+    history_limit: usize,
+    status: &'static str,
+    target_url: Option<String>,
+    samples: VecDeque<SpeedtestProbeSample>,
+    last_error: Option<SpeedtestErrorSample>,
+}
+
+impl SpeedtestState {
+    fn new(enabled: bool, history_limit: usize) -> Self {
+        Self {
+            enabled,
+            history_limit: history_limit.max(1),
+            status: if enabled { "pending" } else { "disabled" },
+            target_url: None,
+            samples: VecDeque::new(),
+            last_error: None,
+        }
+    }
+
+    fn record_success(&mut self, sample: SpeedtestProbeSample) {
+        self.enabled = true;
+        self.status = "ok";
+        self.target_url = Some(sample.target_url.clone());
+        self.last_error = None;
+        self.samples.push_back(sample);
+        while self.samples.len() > self.history_limit {
+            self.samples.pop_front();
+        }
+    }
+
+    fn record_error(&mut self, enabled: bool, target_url: Option<String>, message: String) {
+        self.enabled = enabled;
+        self.target_url = target_url;
+        self.status = if enabled { "error" } else { "disabled" };
+        self.last_error = Some(SpeedtestErrorSample {
+            at: chrono::Utc::now(),
+            message,
+        });
+    }
+
+    fn snapshot(&self) -> SpeedtestSnapshot {
+        let samples = self.samples.len();
+        let last_result = self.samples.back().cloned();
+        let rolling_average_download_mbps = if samples > 0 {
+            Some(
+                self.samples
+                    .iter()
+                    .map(|sample| sample.download_mbps)
+                    .sum::<u64>()
+                    / samples as u64,
+            )
+        } else {
+            None
+        };
+        let rolling_average_upload_mbps = if samples > 0 {
+            Some(
+                self.samples
+                    .iter()
+                    .map(|sample| sample.upload_mbps)
+                    .sum::<u64>()
+                    / samples as u64,
+            )
+        } else {
+            None
+        };
+        let peak_download_mbps = self.samples.iter().map(|sample| sample.download_mbps).max();
+        let peak_upload_mbps = self.samples.iter().map(|sample| sample.upload_mbps).max();
+        SpeedtestSnapshot {
+            enabled: self.enabled,
+            status: self.status,
+            target_url: self.target_url.clone(),
+            samples,
+            last_result,
+            rolling_average_download_mbps,
+            rolling_average_upload_mbps,
+            peak_download_mbps,
+            peak_upload_mbps,
+            last_error: self.last_error.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -764,6 +972,7 @@ struct ObservabilitySample {
     endpoint_metrics_url: Option<String>,
     endpoint_inbound_bytes: Option<u64>,
     endpoint_outbound_bytes: Option<u64>,
+    speedtest: SpeedtestSnapshot,
 }
 
 #[derive(Debug)]
@@ -848,6 +1057,11 @@ impl Agent {
         );
 
         let metrics = Arc::new(AgentMetrics::new(&node_metadata.node_external_id)?);
+        let speedtest_state = Arc::new(Mutex::new(SpeedtestState::new(
+            cfg.speedtest_enabled,
+            cfg.speedtest_history_limit,
+        )));
+        let speedtest_running = Arc::new(AtomicBool::new(false));
 
         let workspace = RuntimeWorkspace::new(
             cfg.trusttunnel_runtime_dir.clone(),
@@ -864,6 +1078,8 @@ impl Agent {
             db_worker_health: DbWorkerHealthState::default(),
             metrics,
             observability_state: ObservabilityState::default(),
+            speedtest_state,
+            speedtest_running,
             sync_report_backoff: SYNC_REPORT_INITIAL_BACKOFF,
             sync_report_next_retry_at: Instant::now(),
         })
@@ -1009,6 +1225,8 @@ impl Agent {
         metrics_push_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut telemetry_push_tick = interval(self.cfg.telemetry_push_interval);
         telemetry_push_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut speedtest_tick = interval(self.cfg.speedtest_interval);
+        speedtest_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut backoff = Duration::from_secs(1);
         let mut pending_plan: Option<sidecar_sync::ReconcilePlan> = None;
         loop {
@@ -1025,6 +1243,10 @@ impl Agent {
                 }
                 _ = telemetry_push_tick.tick(), if self.cfg.telemetry_push_enabled => {
                     self.push_telemetry_snapshot().await;
+                    continue;
+                }
+                _ = speedtest_tick.tick(), if self.cfg.speedtest_enabled => {
+                    self.start_speedtest_probe();
                     continue;
                 }
             };
@@ -1809,6 +2031,8 @@ impl Agent {
         metrics_push_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut telemetry_push_tick = interval(self.cfg.telemetry_push_interval);
         telemetry_push_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut speedtest_tick = interval(self.cfg.speedtest_interval);
+        speedtest_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut sync_report_tick = interval(Duration::from_secs(1));
         sync_report_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -1840,6 +2064,9 @@ impl Agent {
                 }
                 _ = telemetry_push_tick.tick(), if self.cfg.telemetry_push_enabled => {
                     self.push_telemetry_snapshot().await;
+                }
+                _ = speedtest_tick.tick(), if self.cfg.speedtest_enabled => {
+                    self.start_speedtest_probe();
                 }
                 _ = sync_report_tick.tick() => {
                     self.flush_pending_sync_reports().await;
@@ -2576,6 +2803,23 @@ impl Agent {
     async fn push_telemetry_snapshot(&mut self) {
         let sample = self.collect_observability_sample().await;
         let snapshot_at = sample.collected_at.to_rfc3339();
+        let speedtest_last_result = sample.speedtest.last_result.as_ref().map(|item| {
+            serde_json::json!({
+                "collected_at": item.collected_at.to_rfc3339(),
+                "download_mbps": item.download_mbps,
+                "upload_mbps": item.upload_mbps,
+                "download_duration_ms": item.download_duration_ms,
+                "upload_duration_ms": item.upload_duration_ms,
+                "downloaded_bytes": item.downloaded_bytes,
+                "uploaded_bytes": item.uploaded_bytes,
+            })
+        });
+        let speedtest_last_error = sample.speedtest.last_error.as_ref().map(|item| {
+            serde_json::json!({
+                "at": item.at.to_rfc3339(),
+                "message": item.message,
+            })
+        });
         let raw_payload = serde_json::json!({
             "agent_version": self.cfg.agent_version.clone(),
             "runtime_version": self.cfg.runtime_version.clone(),
@@ -2594,6 +2838,22 @@ impl Agent {
                 "outbound_bytes": sample.endpoint_outbound_bytes,
             },
             "agent_metrics": collect_agent_metric_snapshot(&self.metrics.registry),
+            "speedtest": {
+                "enabled": sample.speedtest.enabled,
+                "status": sample.speedtest.status,
+                "target_url": sample.speedtest.target_url.clone(),
+                "samples": sample.speedtest.samples,
+                "last_result": speedtest_last_result,
+                "rolling_average": {
+                    "download_mbps": sample.speedtest.rolling_average_download_mbps,
+                    "upload_mbps": sample.speedtest.rolling_average_upload_mbps,
+                },
+                "peak": {
+                    "download_mbps": sample.speedtest.peak_download_mbps,
+                    "upload_mbps": sample.speedtest.peak_upload_mbps,
+                },
+                "last_error": speedtest_last_error,
+            },
         });
         let payload = TelemetrySnapshotPayload {
             source: "external",
@@ -2631,6 +2891,67 @@ impl Agent {
                 );
             }
         }
+    }
+
+    fn start_speedtest_probe(&self) {
+        if !self.cfg.speedtest_enabled {
+            return;
+        }
+        if self
+            .speedtest_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let speedtest_state = Arc::clone(&self.speedtest_state);
+        let speedtest_running = Arc::clone(&self.speedtest_running);
+        let node_external_id = self.cfg.node_external_id.clone();
+        let link_config_path = self.resolve_runtime_path(&self.cfg.trusttunnel_link_config_file);
+        let endpoint_config_path = self.resolve_runtime_path(&self.cfg.trusttunnel_config_file);
+        let explicit_speedtest_url = self.cfg.speedtest_url.clone();
+        let download_mb = self.cfg.speedtest_download_mb;
+        let upload_mb = self.cfg.speedtest_upload_mb;
+        let timeout = self.cfg.speedtest_timeout;
+
+        tokio::spawn(async move {
+            let result = run_speedtest_probe(
+                &node_external_id,
+                explicit_speedtest_url.as_deref(),
+                &link_config_path,
+                &endpoint_config_path,
+                download_mb,
+                upload_mb,
+                timeout,
+            )
+            .await;
+
+            let mut state = speedtest_state.lock().await;
+            match result {
+                Ok(sample) => {
+                    println!(
+                        "phase=speedtest_probe_ok node={} download_mbps={} upload_mbps={} target_url={}",
+                        node_external_id,
+                        sample.download_mbps,
+                        sample.upload_mbps,
+                        sample.target_url
+                    );
+                    state.record_success(sample);
+                }
+                Err(err) => {
+                    println!(
+                        "phase=speedtest_probe_failed node={} status={} target_url={} reason={}",
+                        node_external_id,
+                        if err.enabled { "enabled" } else { "disabled" },
+                        err.target_url.as_deref().unwrap_or("n/a"),
+                        err.message
+                    );
+                    state.record_error(err.enabled, err.target_url, err.message);
+                }
+            }
+            speedtest_running.store(false, Ordering::Release);
+        });
     }
 
     async fn collect_observability_sample(&mut self) -> ObservabilitySample {
@@ -2698,6 +3019,7 @@ impl Agent {
             total: current_error_total,
             collected_at: now_instant,
         });
+        let speedtest = self.speedtest_state.lock().await.snapshot();
 
         ObservabilitySample {
             collected_at,
@@ -2713,6 +3035,7 @@ impl Agent {
             endpoint_outbound_bytes: endpoint_metrics
                 .as_ref()
                 .and_then(|item| item.outbound_bytes),
+            speedtest,
         }
     }
 
@@ -2790,8 +3113,9 @@ impl Agent {
         );
         let payload_keys = payload_key_list(&payload);
         let reason_summary = summarize_register_reason(status, &response_body);
+        let response_preview = compact_http_response_body(&response_body);
         let details = format!(
-            "register failure: status={status} endpoint={endpoint} payload_keys={payload_keys} reason={reason_summary} response_body={response_body}"
+            "register failure: status={status} endpoint={endpoint} payload_keys={payload_keys} reason={reason_summary} response_preview={response_preview}"
         );
 
         if is_temporary_http_status(status) {
@@ -3835,6 +4159,266 @@ impl RuntimeStatus {
             memory_percent: 0.0,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct SpeedtestTarget {
+    base_url: String,
+    display_url: String,
+    request_host: Option<String>,
+    resolved_addr: Option<SocketAddr>,
+}
+
+#[derive(Clone, Debug)]
+struct SpeedtestProbeFailure {
+    enabled: bool,
+    target_url: Option<String>,
+    message: String,
+}
+
+async fn run_speedtest_probe(
+    node_external_id: &str,
+    explicit_speedtest_url: Option<&str>,
+    link_config_path: &Path,
+    endpoint_config_path: &Path,
+    download_mb: u32,
+    upload_mb: u32,
+    timeout: Duration,
+) -> Result<SpeedtestProbeSample, SpeedtestProbeFailure> {
+    let target = derive_speedtest_target(
+        node_external_id,
+        explicit_speedtest_url,
+        link_config_path,
+        endpoint_config_path,
+    )
+    .await?;
+    let client = build_speedtest_client(&target, timeout).map_err(|message| SpeedtestProbeFailure {
+        enabled: true,
+        target_url: Some(target.display_url.clone()),
+        message,
+    })?;
+    let download_url = format!("{}/{}mb.bin", target.base_url, download_mb);
+    let upload_url = format!("{}/upload.html", target.base_url);
+    let (download_duration_ms, downloaded_bytes) = execute_speedtest_download(&client, &download_url)
+        .await
+        .map_err(|message| SpeedtestProbeFailure {
+            enabled: true,
+            target_url: Some(target.display_url.clone()),
+            message,
+        })?;
+    let (upload_duration_ms, uploaded_bytes) = execute_speedtest_upload(&client, &upload_url, upload_mb)
+        .await
+        .map_err(|message| SpeedtestProbeFailure {
+            enabled: true,
+            target_url: Some(target.display_url.clone()),
+            message,
+        })?;
+
+    Ok(SpeedtestProbeSample {
+        collected_at: chrono::Utc::now(),
+        target_url: target.display_url,
+        download_mbps: compute_throughput_mbps(downloaded_bytes, download_duration_ms),
+        upload_mbps: compute_throughput_mbps(uploaded_bytes, upload_duration_ms),
+        download_duration_ms,
+        upload_duration_ms,
+        downloaded_bytes,
+        uploaded_bytes,
+    })
+}
+
+async fn derive_speedtest_target(
+    node_external_id: &str,
+    explicit_speedtest_url: Option<&str>,
+    link_config_path: &Path,
+    endpoint_config_path: &Path,
+) -> Result<SpeedtestTarget, SpeedtestProbeFailure> {
+    if let Some(url) = explicit_speedtest_url {
+        let normalized = normalize_base_url(url).ok_or_else(|| SpeedtestProbeFailure {
+            enabled: true,
+            target_url: None,
+            message: "TRUSTTUNNEL_SPEEDTEST_URL must be a valid http(s) URL".to_string(),
+        })?;
+        return Ok(SpeedtestTarget {
+            base_url: normalized.clone(),
+            display_url: normalized,
+            request_host: None,
+            resolved_addr: None,
+        });
+    }
+
+    let speedtest_path =
+        load_speedtest_path_from_config(endpoint_config_path)
+            .await
+            .map_err(|message| SpeedtestProbeFailure {
+                enabled: false,
+                target_url: None,
+                message,
+            })?;
+    let link_cfg = LinkGenerationConfig::load_from_file_or_legacy_env(link_config_path, node_external_id)
+        .map_err(|message| SpeedtestProbeFailure {
+            enabled: true,
+            target_url: None,
+            message,
+        })?;
+    let address_host = link_cfg.address_host();
+    let request_host = link_cfg
+        .custom_sni()
+        .unwrap_or_else(|| link_cfg.cert_domain().to_string());
+    let port = link_cfg.port().unwrap_or(443);
+    let base_url = format_https_base_url(&request_host, port, &speedtest_path);
+    let resolved_addr = if normalize_host(&address_host) != normalize_host(&request_host) {
+        Some(
+            resolve_speedtest_socket_addr(&address_host, port)
+                .await
+                .map_err(|message| SpeedtestProbeFailure {
+                    enabled: true,
+                    target_url: Some(base_url.clone()),
+                    message,
+                })?,
+        )
+    } else {
+        None
+    };
+
+    Ok(SpeedtestTarget {
+        base_url: base_url.clone(),
+        display_url: base_url,
+        request_host: Some(request_host),
+        resolved_addr,
+    })
+}
+
+fn build_speedtest_client(target: &SpeedtestTarget, timeout: Duration) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder().timeout(timeout).no_proxy();
+    if let (Some(request_host), Some(resolved_addr)) = (&target.request_host, target.resolved_addr) {
+        builder = builder.resolve(request_host, resolved_addr);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("failed to build speedtest HTTP client: {e}"))
+}
+
+async fn execute_speedtest_download(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<(u64, u64), String> {
+    let started_at = Instant::now();
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("speedtest download request failed: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "speedtest download returned HTTP {}",
+            response.status()
+        ));
+    }
+    let body = response
+        .bytes()
+        .await
+        .map_err(|e| format!("failed to read speedtest download body: {e}"))?;
+    let duration_ms = started_at.elapsed().as_millis().max(1) as u64;
+    Ok((duration_ms, body.len() as u64))
+}
+
+async fn execute_speedtest_upload(
+    client: &reqwest::Client,
+    url: &str,
+    upload_mb: u32,
+) -> Result<(u64, u64), String> {
+    let bytes = vec![0_u8; (upload_mb as usize) * 1024 * 1024];
+    let uploaded_bytes = bytes.len() as u64;
+    let started_at = Instant::now();
+    let response = client
+        .post(url)
+        .header("content-length", uploaded_bytes.to_string())
+        .body(bytes)
+        .send()
+        .await
+        .map_err(|e| format!("speedtest upload request failed: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "speedtest upload returned HTTP {}",
+            response.status()
+        ));
+    }
+    let duration_ms = started_at.elapsed().as_millis().max(1) as u64;
+    Ok((duration_ms, uploaded_bytes))
+}
+
+async fn load_speedtest_path_from_config(config_path: &Path) -> Result<String, String> {
+    let raw = fs::read_to_string(config_path).await.map_err(|e| {
+        format!(
+            "failed to read endpoint config for speedtest {}: {e}",
+            config_path.display()
+        )
+    })?;
+    let doc = raw
+        .parse::<toml_edit::Document>()
+        .map_err(|e| format!("failed to parse endpoint config {}: {e}", config_path.display()))?;
+    let enabled = doc
+        .get("speedtest_enable")
+        .and_then(|item| item.as_bool())
+        .unwrap_or(false);
+    if !enabled {
+        return Err(
+            "speedtest is disabled in endpoint config (set speedtest_enable = true)".to_string(),
+        );
+    }
+    let path = doc
+        .get("speedtest_path")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("/speedtest");
+    Ok(if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    })
+}
+
+async fn resolve_speedtest_socket_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    lookup_host((host, port))
+        .await
+        .map_err(|e| format!("failed to resolve speedtest address {host}:{port}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("no socket address resolved for speedtest target {host}:{port}"))
+}
+
+fn format_https_base_url(host: &str, port: u16, path: &str) -> String {
+    let host_part = if port == 443 {
+        host.to_string()
+    } else {
+        format!("{host}:{port}")
+    };
+    format!("https://{host_part}{}", path.trim_end_matches('/'))
+}
+
+fn normalize_host(host: &str) -> String {
+    host.trim().trim_matches(&['[', ']'][..]).to_ascii_lowercase()
+}
+
+fn normalize_base_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+fn compute_throughput_mbps(bytes: u64, duration_ms: u64) -> u64 {
+    if bytes == 0 || duration_ms == 0 {
+        return 0;
+    }
+    (((bytes as f64) * 8.0) / (duration_ms as f64 / 1000.0) / 1_000_000.0)
+        .round()
+        .max(0.0) as u64
 }
 
 async fn serve_metrics(metrics: Arc<AgentMetrics>, address: SocketAddr) -> Result<(), String> {
@@ -5102,6 +5686,18 @@ fn summarize_register_reason(status: StatusCode, body: &str) -> &'static str {
     "unexpected_http_status"
 }
 
+fn compact_http_response_body(body: &str) -> String {
+    let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return "empty".to_string();
+    }
+    const MAX_LEN: usize = 180;
+    if collapsed.len() <= MAX_LEN {
+        return collapsed;
+    }
+    format!("{}…", &collapsed[..MAX_LEN])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5418,9 +6014,16 @@ message_queue_capacity = 4096
             telemetry_push_enabled: true,
             metrics_push_interval: DEFAULT_METRICS_PUSH_INTERVAL,
             telemetry_push_interval: DEFAULT_TELEMETRY_PUSH_INTERVAL,
+            speedtest_enabled: false,
+            speedtest_interval: DEFAULT_SPEEDTEST_INTERVAL,
             lk_metrics_path: DEFAULT_NODE_METRICS_PATH.to_string(),
             lk_telemetry_snapshots_path: DEFAULT_TELEMETRY_SNAPSHOTS_PATH.to_string(),
             endpoint_metrics_url: None,
+            speedtest_url: None,
+            speedtest_download_mb: DEFAULT_SPEEDTEST_DOWNLOAD_MB,
+            speedtest_upload_mb: DEFAULT_SPEEDTEST_UPLOAD_MB,
+            speedtest_timeout: DEFAULT_SPEEDTEST_TIMEOUT,
+            speedtest_history_limit: DEFAULT_SPEEDTEST_HISTORY_LIMIT,
             debug_preserve_temp_files: false,
             debug_verbose_export_logs: false,
             validation_strict_mode: false,
@@ -5542,9 +6145,16 @@ upload_buffer_size = 32768
             telemetry_push_enabled: true,
             metrics_push_interval: DEFAULT_METRICS_PUSH_INTERVAL,
             telemetry_push_interval: DEFAULT_TELEMETRY_PUSH_INTERVAL,
+            speedtest_enabled: false,
+            speedtest_interval: DEFAULT_SPEEDTEST_INTERVAL,
             lk_metrics_path: DEFAULT_NODE_METRICS_PATH.to_string(),
             lk_telemetry_snapshots_path: DEFAULT_TELEMETRY_SNAPSHOTS_PATH.to_string(),
             endpoint_metrics_url: None,
+            speedtest_url: None,
+            speedtest_download_mb: DEFAULT_SPEEDTEST_DOWNLOAD_MB,
+            speedtest_upload_mb: DEFAULT_SPEEDTEST_UPLOAD_MB,
+            speedtest_timeout: DEFAULT_SPEEDTEST_TIMEOUT,
+            speedtest_history_limit: DEFAULT_SPEEDTEST_HISTORY_LIMIT,
             debug_preserve_temp_files,
             debug_verbose_export_logs: false,
             validation_strict_mode,
@@ -5797,9 +6407,16 @@ upload_buffer_size = 32768
             telemetry_push_enabled: true,
             metrics_push_interval: DEFAULT_METRICS_PUSH_INTERVAL,
             telemetry_push_interval: DEFAULT_TELEMETRY_PUSH_INTERVAL,
+            speedtest_enabled: false,
+            speedtest_interval: DEFAULT_SPEEDTEST_INTERVAL,
             lk_metrics_path: DEFAULT_NODE_METRICS_PATH.to_string(),
             lk_telemetry_snapshots_path: DEFAULT_TELEMETRY_SNAPSHOTS_PATH.to_string(),
             endpoint_metrics_url: None,
+            speedtest_url: None,
+            speedtest_download_mb: DEFAULT_SPEEDTEST_DOWNLOAD_MB,
+            speedtest_upload_mb: DEFAULT_SPEEDTEST_UPLOAD_MB,
+            speedtest_timeout: DEFAULT_SPEEDTEST_TIMEOUT,
+            speedtest_history_limit: DEFAULT_SPEEDTEST_HISTORY_LIMIT,
             debug_preserve_temp_files: false,
             debug_verbose_export_logs: false,
             validation_strict_mode: false,
@@ -5904,9 +6521,16 @@ upload_buffer_size = 32768
             telemetry_push_enabled: true,
             metrics_push_interval: DEFAULT_METRICS_PUSH_INTERVAL,
             telemetry_push_interval: DEFAULT_TELEMETRY_PUSH_INTERVAL,
+            speedtest_enabled: false,
+            speedtest_interval: DEFAULT_SPEEDTEST_INTERVAL,
             lk_metrics_path: DEFAULT_NODE_METRICS_PATH.to_string(),
             lk_telemetry_snapshots_path: DEFAULT_TELEMETRY_SNAPSHOTS_PATH.to_string(),
             endpoint_metrics_url: None,
+            speedtest_url: None,
+            speedtest_download_mb: DEFAULT_SPEEDTEST_DOWNLOAD_MB,
+            speedtest_upload_mb: DEFAULT_SPEEDTEST_UPLOAD_MB,
+            speedtest_timeout: DEFAULT_SPEEDTEST_TIMEOUT,
+            speedtest_history_limit: DEFAULT_SPEEDTEST_HISTORY_LIMIT,
             debug_preserve_temp_files: false,
             debug_verbose_export_logs: false,
             validation_strict_mode: false,
@@ -5995,9 +6619,16 @@ upload_buffer_size = 32768
             telemetry_push_enabled: true,
             metrics_push_interval: DEFAULT_METRICS_PUSH_INTERVAL,
             telemetry_push_interval: DEFAULT_TELEMETRY_PUSH_INTERVAL,
+            speedtest_enabled: false,
+            speedtest_interval: DEFAULT_SPEEDTEST_INTERVAL,
             lk_metrics_path: DEFAULT_NODE_METRICS_PATH.to_string(),
             lk_telemetry_snapshots_path: DEFAULT_TELEMETRY_SNAPSHOTS_PATH.to_string(),
             endpoint_metrics_url: None,
+            speedtest_url: None,
+            speedtest_download_mb: DEFAULT_SPEEDTEST_DOWNLOAD_MB,
+            speedtest_upload_mb: DEFAULT_SPEEDTEST_UPLOAD_MB,
+            speedtest_timeout: DEFAULT_SPEEDTEST_TIMEOUT,
+            speedtest_history_limit: DEFAULT_SPEEDTEST_HISTORY_LIMIT,
             debug_preserve_temp_files: false,
             debug_verbose_export_logs: false,
             validation_strict_mode: false,
@@ -6199,9 +6830,16 @@ upload_buffer_size = 32768
             telemetry_push_enabled: true,
             metrics_push_interval: DEFAULT_METRICS_PUSH_INTERVAL,
             telemetry_push_interval: DEFAULT_TELEMETRY_PUSH_INTERVAL,
+            speedtest_enabled: false,
+            speedtest_interval: DEFAULT_SPEEDTEST_INTERVAL,
             lk_metrics_path: DEFAULT_NODE_METRICS_PATH.to_string(),
             lk_telemetry_snapshots_path: DEFAULT_TELEMETRY_SNAPSHOTS_PATH.to_string(),
             endpoint_metrics_url: None,
+            speedtest_url: None,
+            speedtest_download_mb: DEFAULT_SPEEDTEST_DOWNLOAD_MB,
+            speedtest_upload_mb: DEFAULT_SPEEDTEST_UPLOAD_MB,
+            speedtest_timeout: DEFAULT_SPEEDTEST_TIMEOUT,
+            speedtest_history_limit: DEFAULT_SPEEDTEST_HISTORY_LIMIT,
             debug_preserve_temp_files: false,
             debug_verbose_export_logs: false,
             validation_strict_mode: false,
@@ -6708,9 +7346,16 @@ upload_buffer_size = 32768
             telemetry_push_enabled: true,
             metrics_push_interval: DEFAULT_METRICS_PUSH_INTERVAL,
             telemetry_push_interval: DEFAULT_TELEMETRY_PUSH_INTERVAL,
+            speedtest_enabled: false,
+            speedtest_interval: DEFAULT_SPEEDTEST_INTERVAL,
             lk_metrics_path: DEFAULT_NODE_METRICS_PATH.to_string(),
             lk_telemetry_snapshots_path: DEFAULT_TELEMETRY_SNAPSHOTS_PATH.to_string(),
             endpoint_metrics_url: None,
+            speedtest_url: None,
+            speedtest_download_mb: DEFAULT_SPEEDTEST_DOWNLOAD_MB,
+            speedtest_upload_mb: DEFAULT_SPEEDTEST_UPLOAD_MB,
+            speedtest_timeout: DEFAULT_SPEEDTEST_TIMEOUT,
+            speedtest_history_limit: DEFAULT_SPEEDTEST_HISTORY_LIMIT,
             debug_preserve_temp_files: false,
             debug_verbose_export_logs: false,
             validation_strict_mode: false,
@@ -7881,9 +8526,16 @@ upload_buffer_size = 32768
             telemetry_push_enabled: true,
             metrics_push_interval: DEFAULT_METRICS_PUSH_INTERVAL,
             telemetry_push_interval: DEFAULT_TELEMETRY_PUSH_INTERVAL,
+            speedtest_enabled: false,
+            speedtest_interval: DEFAULT_SPEEDTEST_INTERVAL,
             lk_metrics_path: DEFAULT_NODE_METRICS_PATH.to_string(),
             lk_telemetry_snapshots_path: DEFAULT_TELEMETRY_SNAPSHOTS_PATH.to_string(),
             endpoint_metrics_url: None,
+            speedtest_url: None,
+            speedtest_download_mb: DEFAULT_SPEEDTEST_DOWNLOAD_MB,
+            speedtest_upload_mb: DEFAULT_SPEEDTEST_UPLOAD_MB,
+            speedtest_timeout: DEFAULT_SPEEDTEST_TIMEOUT,
+            speedtest_history_limit: DEFAULT_SPEEDTEST_HISTORY_LIMIT,
             debug_preserve_temp_files: false,
             debug_verbose_export_logs: false,
             validation_strict_mode: false,
@@ -7902,5 +8554,39 @@ upload_buffer_size = 32768
     fn db_worker_tick_kind_has_stable_log_labels() {
         assert_eq!(DbWorkerTickKind::Reconcile.as_str(), "reconcile");
         assert_eq!(DbWorkerTickKind::Apply.as_str(), "apply");
+    }
+
+    #[test]
+    fn compact_http_response_body_strips_markup_noise() {
+        let body = "<html><body><h1>503 Service Temporarily Unavailable</h1><center>nginx</center></body></html>";
+        let compact = compact_http_response_body(body);
+        assert!(compact.contains("503 Service Temporarily Unavailable"));
+        assert!(!compact.contains('\n'));
+    }
+
+    #[test]
+    fn compute_throughput_mbps_uses_bytes_and_duration() {
+        assert_eq!(compute_throughput_mbps(12_500_000, 1_000), 100);
+        assert_eq!(compute_throughput_mbps(0, 1_000), 0);
+        assert_eq!(compute_throughput_mbps(12_500_000, 0), 0);
+    }
+
+    #[tokio::test]
+    async fn load_speedtest_path_from_config_requires_enabled_flag() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("vpn.toml");
+        fs::write(
+            &config_path,
+            r#"
+listen_address = "0.0.0.0:443"
+speedtest_enable = true
+speedtest_path = "/speed"
+"#,
+        )
+        .await
+        .unwrap();
+
+        let actual = load_speedtest_path_from_config(&config_path).await.unwrap();
+        assert_eq!(actual, "/speed");
     }
 }

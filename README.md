@@ -571,6 +571,13 @@ Optional:
 - `LK_METRICS_PATH` (default `/internal/trusttunnel/metrics`)
 - `LK_TELEMETRY_SNAPSHOTS_PATH` (default `/internal/telemetry/snapshots`)
 - `TRUSTTUNNEL_ENDPOINT_METRICS_URL` (optional override for scraping endpoint Prometheus metrics; otherwise derived from `[metrics].address` in `vpn.toml`)
+- `AGENT_SPEEDTEST_ENABLED` (default `false`; enables periodic sidecar speedtest probes)
+- `AGENT_SPEEDTEST_INTERVAL_SEC` (default `300`)
+- `TRUSTTUNNEL_SPEEDTEST_URL` (optional explicit probe base URL; otherwise derived from `tt-link.toml` plus endpoint speedtest config)
+- `AGENT_SPEEDTEST_DOWNLOAD_MB` (default `25`)
+- `AGENT_SPEEDTEST_UPLOAD_MB` (default `10`)
+- `AGENT_SPEEDTEST_TIMEOUT_SEC` (default `20`)
+- `AGENT_SPEEDTEST_HISTORY_LIMIT` (default `24`)
 - `TRUSTTUNNEL_BOOTSTRAP_CREDENTIALS_FILE` (read-only bootstrap credentials source)
 - `TRUSTTUNNEL_APPLY_CMD` (command executed after runtime credentials update)
 - `TRUSTTUNNEL_ENDPOINT_BIN` (default `/usr/local/bin/trusttunnel_endpoint`; falls back to `trusttunnel_endpoint` from `PATH` only when default path is unavailable)
@@ -634,6 +641,8 @@ Classic agent sidecar observability:
 - Sidecar sync pass summaries include stable counters: `found`, `generated`, `updated`, `missing`, `skipped`, `errors` (plus `new`, `stale`, `deleted`).
 - Internal Prometheus endpoint is exposed on `AGENT_METRICS_ADDRESS` via `GET /metrics`.
 - `classic_agent` can also push LK-facing node metrics and telemetry snapshots on a schedule, keyed by `external_node_id`; endpoint traffic counters are scraped from `TRUSTTUNNEL_ENDPOINT_METRICS_URL` or derived from `[metrics].address` in `vpn.toml`.
+- Speedtest telemetry can include `status`, `target_url`, sample count, and `last/average/peak` download-upload throughput in LK snapshots.
+- Register failures now keep only a compact `response_preview` in logs, which avoids flooding the operator console with raw HTML upstream pages.
 - Metrics include:
   - `classic_agent_reconcile_total{node,revision,status,error_class}`
   - `classic_agent_apply_total{node,revision,status,error_class}`

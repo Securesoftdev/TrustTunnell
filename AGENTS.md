@@ -126,6 +126,8 @@ their members.
 
 - Always check that changes in `lib/` or `deeplink/` are synchronized with
   `setup_wizard` behavior and flags.
+- When touching `tools/classic_agent/`, keep telemetry, env, and logging docs in
+  sync across `README.md`, `tools/classic_agent/README.md`, and `CHANGELOG.md`.
 
 ## Changelog
 
@@ -190,6 +192,13 @@ protocol/deep-link format, library API) when relevant.
    `snake_case` to match existing configuration style.
 
    **Rationale**: consistency with the existing config surface.
+
+4. Sidecar background probes and lifecycle diagnostics MUST stay operator
+   readable: gate them through env/config, prefer concise summaries at info
+   level, and compact raw HTTP/HTML error bodies before logging them.
+
+   **Rationale**: `classic_agent` logs are the primary incident console and must
+   remain useful without external filtering.
 
 4. Markdown files MUST pass `markdownlint` (configured in
    `.markdownlint.json`). Run `make lint-md` before submitting docs.

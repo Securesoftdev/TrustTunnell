@@ -143,6 +143,13 @@ Optional:
 - `LK_METRICS_PATH` (default `/internal/trusttunnel/metrics`)
 - `LK_TELEMETRY_SNAPSHOTS_PATH` (default `/internal/telemetry/snapshots`)
 - `TRUSTTUNNEL_ENDPOINT_METRICS_URL` (optional override for scraping endpoint Prometheus metrics)
+- `AGENT_SPEEDTEST_ENABLED` (default `false`)
+- `AGENT_SPEEDTEST_INTERVAL_SEC` (default `300`)
+- `TRUSTTUNNEL_SPEEDTEST_URL` (optional explicit probe base URL; otherwise derived from `tt-link.toml` and endpoint speedtest config)
+- `AGENT_SPEEDTEST_DOWNLOAD_MB` (default `25`)
+- `AGENT_SPEEDTEST_UPLOAD_MB` (default `10`)
+- `AGENT_SPEEDTEST_TIMEOUT_SEC` (default `20`)
+- `AGENT_SPEEDTEST_HISTORY_LIMIT` (default `24`)
 - `TRUSTTUNNEL_BOOTSTRAP_CREDENTIALS_FILE`
 - `TRUSTTUNNEL_APPLY_CMD`
 - `TRUSTTUNNEL_ENDPOINT_BINARY`
@@ -270,6 +277,10 @@ Diagnostics include contract mode:
   and keeps LK payloads limited to a clean single-line `tt://` deeplink.
 - Prometheus endpoint: `GET /metrics` on `AGENT_METRICS_ADDRESS`.
 - LK metric delivery: periodic `POST /internal/trusttunnel/metrics` and `POST /internal/telemetry/snapshots`, keyed by `external_node_id`, with optional endpoint Prometheus scraping for active sessions and bandwidth.
+- Speedtest telemetry can attach `status`, `target_url`, `samples`, `last_result`,
+  `rolling_average`, `peak`, and `last_error` to LK telemetry snapshots.
+- Register failures keep a compact `response_preview` instead of dumping raw
+  upstream HTML into lifecycle logs.
 - Metrics:
   - `classic_agent_reconcile_total{node,revision,status,error_class}`
   - `classic_agent_apply_total{node,revision,status,error_class}`
