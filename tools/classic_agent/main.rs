@@ -1453,6 +1453,14 @@ impl Agent {
             if plan.stats.missing_credentials > 0 {
                 plan.stats.skipped += plan.stats.missing_credentials;
             }
+            if plan.stats.errors == 0
+                && plan.stats.missing_credentials == 0
+                && plan.stats.stale_credentials == 0
+                && plan.stats.deleted_credentials == 0
+            {
+                self.db_worker_health.inventory_status = DbWorkerSignalStatus::Ok;
+                self.db_worker_health.artifacts_status = DbWorkerSignalStatus::Ok;
+            }
             println!(
                 "phase=export_write_skipped pass={} reason=no_reconcile_changes",
                 pass
@@ -7630,6 +7638,8 @@ upload_buffer_size = 32768
         if fs::try_exists(&state_path).await.unwrap() {
             fs::remove_file(&state_path).await.unwrap();
         }
+        agent.db_worker_health.inventory_status = DbWorkerSignalStatus::Degraded;
+        agent.db_worker_health.artifacts_status = DbWorkerSignalStatus::Degraded;
         agent.cfg.lk_write_contract = LkWriteContract::Api;
         agent.cfg.lk_db_dsn = "http://127.0.0.1:9".to_string();
         agent.cfg.lk_service_token = Some("token".to_string());
@@ -7643,6 +7653,8 @@ upload_buffer_size = 32768
             .unwrap();
 
         assert!(!fs::try_exists(&state_path).await.unwrap());
+        assert_eq!(agent.db_worker_health.inventory_status, DbWorkerSignalStatus::Ok);
+        assert_eq!(agent.db_worker_health.artifacts_status, DbWorkerSignalStatus::Ok);
     }
 
     #[tokio::test]

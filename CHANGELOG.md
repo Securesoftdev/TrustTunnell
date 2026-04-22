@@ -2,6 +2,7 @@
 
 ## 1.0.28
 
+- [Fix] `classic_agent` now restores db-worker heartbeat health to `ok` on clean no-change reconcile passes, so one transient bootstrap retry no longer leaves a healthy node stuck in permanent `degraded` status inside LK.
 - [Feature] `classic_agent` now supports env-driven periodic speedtest probes and attaches last/average/peak throughput snapshots to LK telemetry.
 - [Fix] `classic_agent` now skips steady-state reconcile export/write passes when no runtime changes are pending, preventing needless full TT-link regeneration and repeated LK bulk reposts on every apply tick.
 - [Fix] `classic_agent` register payload now includes TT endpoint metadata (`public_host`, `endpoint_ip`, `port`, `cert_domain`, `custom_sni`) derived from `tt-link.toml`, so LK auto-registered nodes no longer fall back to placeholder `0.0.0.0` endpoint values.
