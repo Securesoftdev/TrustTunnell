@@ -1030,9 +1030,37 @@ impl Agent {
             .map_err(|e| format!("failed to build HTTP client: {e}"))?;
 
         let state = load_state(&cfg.agent_state_path).await.unwrap_or_default();
+        let registration_link_metadata = LinkGenerationConfig::load_from_file_or_legacy_env(
+            &resolve_runtime_path(
+                &cfg.trusttunnel_runtime_dir,
+                &cfg.trusttunnel_link_config_file,
+            ),
+            &cfg.node_external_id,
+        )
+        .ok();
         let node_metadata = NodeMetadata {
             node_external_id: cfg.node_external_id.clone(),
             node_hostname: cfg.node_hostname.clone(),
+            public_host: registration_link_metadata
+                .as_ref()
+                .map(|link_cfg| link_cfg.address_host()),
+            endpoint_ip: registration_link_metadata.as_ref().and_then(|link_cfg| {
+                let host = link_cfg.address_host();
+                if host.parse::<IpAddr>().is_ok() {
+                    Some(host)
+                } else {
+                    None
+                }
+            }),
+            port: registration_link_metadata
+                .as_ref()
+                .and_then(|link_cfg| link_cfg.port()),
+            cert_domain: registration_link_metadata
+                .as_ref()
+                .map(|link_cfg| link_cfg.cert_domain().to_string()),
+            custom_sni: registration_link_metadata
+                .as_ref()
+                .and_then(|link_cfg| link_cfg.custom_sni()),
             node_stage: cfg.node_stage.clone(),
             node_cluster: cfg.node_cluster.clone(),
             node_namespace: cfg.node_namespace.clone(),
@@ -1419,6 +1447,42 @@ impl Agent {
             self.mark_runtime_as_primary().await?;
             persist_state(&self.cfg.agent_state_path, &self.state).await?;
             self.db_worker_health.candidate_validation_valid = true;
+        }
+
+        if matches!(pass_kind, sidecar_sync::PassKind::Reconcile) && !plan.changed {
+            if plan.stats.missing_credentials > 0 {
+                plan.stats.skipped += plan.stats.missing_credentials;
+            }
+            println!(
+                "phase=export_write_skipped pass={} reason=no_reconcile_changes",
+                pass
+            );
+            self.update_sidecar_sync_metrics(pass, &plan.stats);
+            println!(
+                "sidecar sync pass={} found={} generated={} updated={} skipped={} errors={} new={} missing={} stale={} deleted={}",
+                pass,
+                plan.stats.found,
+                plan.stats.generated,
+                plan.stats.updated,
+                plan.stats.skipped,
+                plan.stats.errors,
+                plan.stats.new_credentials,
+                plan.stats.missing_credentials,
+                plan.stats.stale_credentials,
+                plan.stats.deleted_credentials
+            );
+            log_event(
+                if plan.stats.errors == 0 {
+                    "info"
+                } else {
+                    "error"
+                },
+                self.state.applied_revision.as_deref().unwrap_or("none"),
+                &node,
+                "sidecar_sync_pass",
+                pass,
+            );
+            return Ok(());
         }
 
         println!("phase=export_write_start pass={}", pass);
@@ -7556,6 +7620,64 @@ upload_buffer_size = 32768
             .unwrap_err();
         assert!(err.contains("inventory ingest returned HTTP 500"));
         assert!(!fs::try_exists(&state_path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn reconcile_apply_without_changes_skips_export_write() {
+        let tmp_dir = TempDir::new().unwrap();
+        let mut agent = make_db_worker_agent_for_validation_tests(&tmp_dir, false).await;
+        let state_path = agent.workspace.inventory_state_path();
+        if fs::try_exists(&state_path).await.unwrap() {
+            fs::remove_file(&state_path).await.unwrap();
+        }
+        agent.cfg.lk_write_contract = LkWriteContract::Api;
+        agent.cfg.lk_db_dsn = "http://127.0.0.1:9".to_string();
+        agent.cfg.lk_service_token = Some("token".to_string());
+
+        agent
+            .run_sidecar_apply_export_write_phase(
+                sidecar_sync::PassKind::Reconcile,
+                Some(sidecar_sync::ReconcilePlan::default()),
+            )
+            .await
+            .unwrap();
+
+        assert!(!fs::try_exists(&state_path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_apply_without_changes_still_exports_inventory() {
+        let tmp_dir = TempDir::new().unwrap();
+        let mut agent = make_db_worker_agent_for_validation_tests(&tmp_dir, false).await;
+        fs::write(
+            &agent.cfg.runtime_credentials_path,
+            b"[[client]]\nusername=\"alice\"\npassword=\"one\"\n",
+        )
+        .await
+        .unwrap();
+        let state_path = agent.workspace.inventory_state_path();
+        if fs::try_exists(&state_path).await.unwrap() {
+            fs::remove_file(&state_path).await.unwrap();
+        }
+
+        let (endpoint, _request_handle) = run_multi_request_server(vec![
+            (200, r#"{"accepted":true}"#.to_string()),
+            (200, r#"{"accepted":true}"#.to_string()),
+        ])
+        .await;
+        agent.cfg.lk_write_contract = LkWriteContract::Api;
+        agent.cfg.lk_db_dsn = endpoint;
+        agent.cfg.lk_service_token = Some("token".to_string());
+
+        agent
+            .run_sidecar_apply_export_write_phase(
+                sidecar_sync::PassKind::Bootstrap,
+                Some(sidecar_sync::ReconcilePlan::default()),
+            )
+            .await
+            .unwrap();
+
+        assert!(fs::try_exists(&state_path).await.unwrap());
     }
 
     #[cfg(feature = "legacy-lk-http")]

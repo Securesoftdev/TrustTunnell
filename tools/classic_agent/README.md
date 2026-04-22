@@ -67,7 +67,10 @@ Executed every `AGENT_RECONCILE_INTERVAL_SEC`:
 Executed every `AGENT_APPLY_INTERVAL_SEC`:
 
 - applies the latest prepared reconcile plan when changes were detected;
-- runs inventory export and LK bulk upsert/deactivate.
+- runs inventory export and LK bulk upsert/deactivate;
+- skips the export/write stage entirely on reconcile ticks when the runtime
+  plan is unchanged, so sidecar does not regenerate or repost the full
+  `tt://` inventory on every steady-state cycle.
 
 ## Runtime modes
 
@@ -277,6 +280,7 @@ Diagnostics include contract mode:
   and keeps LK payloads limited to a clean single-line `tt://` deeplink.
 - Prometheus endpoint: `GET /metrics` on `AGENT_METRICS_ADDRESS`.
 - LK metric delivery: periodic `POST /internal/trusttunnel/metrics` and `POST /internal/telemetry/snapshots`, keyed by `external_node_id`, with optional endpoint Prometheus scraping for active sessions and bandwidth.
+- Lifecycle register payload also includes endpoint metadata derived from `tt-link.toml`: `public_host`, `endpoint_ip`, `port`, `cert_domain`, `custom_sni`. LK uses these fields to keep auto-registered nodes in sync with the actual IP/SNI client contract.
 - Speedtest telemetry can attach `status`, `target_url`, `samples`, `last_result`,
   `rolling_average`, `peak`, and `last_error` to LK telemetry snapshots.
 - Register failures keep a compact `response_preview` instead of dumping raw

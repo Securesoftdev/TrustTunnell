@@ -14,6 +14,11 @@
 > SecureSoft platform-level documentation is maintained in
 > `Securesoftdev/securesoft-docs`. This repository keeps runtime, protocol,
 > configuration, endpoint, and sidecar documentation close to the code.
+>
+> In SecureSoft sidecar mode, steady-state reconcile ticks do not regenerate or
+> repost the full `tt://` inventory when the runtime plan is unchanged; full
+> export/write runs only on bootstrap, on changed reconcile plans, or on
+> explicit operator-forced regeneration.
 
 ---
 
@@ -641,6 +646,7 @@ Classic agent sidecar observability:
 - Sidecar sync pass summaries include stable counters: `found`, `generated`, `updated`, `missing`, `skipped`, `errors` (plus `new`, `stale`, `deleted`).
 - Internal Prometheus endpoint is exposed on `AGENT_METRICS_ADDRESS` via `GET /metrics`.
 - `classic_agent` can also push LK-facing node metrics and telemetry snapshots on a schedule, keyed by `external_node_id`; endpoint traffic counters are scraped from `TRUSTTUNNEL_ENDPOINT_METRICS_URL` or derived from `[metrics].address` in `vpn.toml`.
+- Lifecycle register payload now carries endpoint metadata from `tt-link.toml`: `public_host`, `endpoint_ip`, `port`, `cert_domain`, `custom_sni`. This keeps LK auto-registered TT nodes aligned with the real client deep-link contract.
 - Speedtest telemetry can include `status`, `target_url`, sample count, and `last/average/peak` download-upload throughput in LK snapshots.
 - Register failures now keep only a compact `response_preview` in logs, which avoids flooding the operator console with raw HTML upstream pages.
 - Metrics include:

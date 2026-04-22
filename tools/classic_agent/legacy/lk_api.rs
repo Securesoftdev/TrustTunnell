@@ -226,6 +226,11 @@ impl LkApiClient {
 pub struct NodeMetadata {
     pub node_external_id: String,
     pub node_hostname: String,
+    pub public_host: Option<String>,
+    pub endpoint_ip: Option<String>,
+    pub port: Option<u16>,
+    pub cert_domain: Option<String>,
+    pub custom_sni: Option<String>,
     pub node_stage: Option<String>,
     pub node_cluster: Option<String>,
     pub node_namespace: Option<String>,
@@ -326,6 +331,16 @@ pub struct OnboardingPayload<'a> {
     pub agent_version: &'a str,
     pub runtime_version: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_host: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_ip: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cert_domain: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_sni: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stage: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cluster: Option<&'a str>,
@@ -405,6 +420,11 @@ impl<'a> OnboardingPayload<'a> {
             hostname: &metadata.node_hostname,
             agent_version,
             runtime_version,
+            public_host: metadata.public_host.as_deref(),
+            endpoint_ip: metadata.endpoint_ip.as_deref(),
+            port: metadata.port,
+            cert_domain: metadata.cert_domain.as_deref(),
+            custom_sni: metadata.custom_sni.as_deref(),
             stage: metadata.node_stage.as_deref(),
             cluster: metadata.node_cluster.as_deref(),
             namespace: metadata.node_namespace.as_deref(),
@@ -616,6 +636,11 @@ mod tests {
         let metadata = NodeMetadata {
             node_external_id: "".to_string(),
             node_hostname: "node-1".to_string(),
+            public_host: None,
+            endpoint_ip: None,
+            port: None,
+            cert_domain: None,
+            custom_sni: None,
             node_stage: Some("prod".to_string()),
             node_cluster: Some("c1".to_string()),
             node_namespace: Some("ns".to_string()),
@@ -631,6 +656,11 @@ mod tests {
         let metadata = NodeMetadata {
             node_external_id: "ext-1".to_string(),
             node_hostname: "node-1".to_string(),
+            public_host: Some("89.110.81.194".to_string()),
+            endpoint_ip: Some("89.110.81.194".to_string()),
+            port: Some(443),
+            cert_domain: Some("cdn.securesoft.dev".to_string()),
+            custom_sni: Some("cdn.securesoft.dev".to_string()),
             node_stage: Some("prod".to_string()),
             node_cluster: Some("cluster-a".to_string()),
             node_namespace: Some("edge".to_string()),
@@ -645,12 +675,43 @@ mod tests {
         assert_eq!(value["hostname"], "node-1");
         assert_eq!(value["agent_version"], "2.0.0");
         assert_eq!(value["runtime_version"], "runtime-2");
+        assert_eq!(value["public_host"], "89.110.81.194");
+        assert_eq!(value["endpoint_ip"], "89.110.81.194");
+        assert_eq!(value["port"], 443);
+        assert_eq!(value["cert_domain"], "cdn.securesoft.dev");
+        assert_eq!(value["custom_sni"], "cdn.securesoft.dev");
         assert_eq!(value["stage"], "prod");
         assert_eq!(value["cluster"], "cluster-a");
         assert_eq!(value["namespace"], "edge");
         assert_eq!(value["rollout_group"], "blue");
         assert!(value.get("node_identity").is_none());
         assert!(value.get("trusttunnel_runtime_dir").is_none());
+    }
+
+    #[test]
+    fn onboarding_payload_omits_optional_endpoint_fields_when_missing() {
+        let metadata = NodeMetadata {
+            node_external_id: "ext-2".to_string(),
+            node_hostname: "node-2".to_string(),
+            public_host: None,
+            endpoint_ip: None,
+            port: None,
+            cert_domain: None,
+            custom_sni: None,
+            node_stage: None,
+            node_cluster: None,
+            node_namespace: None,
+            node_rollout_group: None,
+        };
+
+        let payload = OnboardingPayload::from_metadata(&metadata, "2.0.0", "runtime-2");
+        let value = serde_json::to_value(payload).unwrap();
+
+        assert!(value.get("public_host").is_none());
+        assert!(value.get("endpoint_ip").is_none());
+        assert!(value.get("port").is_none());
+        assert!(value.get("cert_domain").is_none());
+        assert!(value.get("custom_sni").is_none());
     }
 
     #[test]
