@@ -294,8 +294,13 @@ impl Core {
                 let tls_listener = tls_listener.clone();
                 async move {
                     let mut stream = stream;
-                    let client_ip = match Self::read_proxy_protocol_client_ip(&mut stream, client_addr)
-                        .await
+                    let handshake_timeout = context.settings.tls_handshake_timeout;
+                    let client_ip = match tokio::time::timeout(
+                        handshake_timeout,
+                        Self::read_proxy_protocol_client_ip(&mut stream, client_addr),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err(io::Error::from(ErrorKind::TimedOut)))
                     {
                         Ok(ip) => ip,
                         Err(e) => {
@@ -309,7 +314,6 @@ impl Core {
                         }
                     };
                     log_id!(trace, client_id, "Starting TLS handshake");
-                    let handshake_timeout = context.settings.tls_handshake_timeout;
                     match tokio::time::timeout(handshake_timeout, tls_listener.listen(stream))
                         .await
                         .unwrap_or_else(|_| Err(io::Error::from(ErrorKind::TimedOut)))
@@ -346,9 +350,17 @@ impl Core {
         const MAX_PROXY_LINE: usize = 108;
 
         let mut prefix = [0_u8; 5];
-        let n = stream.peek(&mut prefix).await?;
-        if n < PROXY_PREFIX.len() || &prefix[..PROXY_PREFIX.len()] != PROXY_PREFIX {
-            return Ok(net_utils::unmap_ipv6(fallback_addr.ip()));
+        loop {
+            let n = stream.peek(&mut prefix).await?;
+            if n == 0 {
+                return Ok(net_utils::unmap_ipv6(fallback_addr.ip()));
+            }
+            if !PROXY_PREFIX.starts_with(&prefix[..n.min(PROXY_PREFIX.len())]) {
+                return Ok(net_utils::unmap_ipv6(fallback_addr.ip()));
+            }
+            if n >= PROXY_PREFIX.len() {
+                break;
+            }
         }
 
         let mut line = Vec::with_capacity(MAX_PROXY_LINE);
