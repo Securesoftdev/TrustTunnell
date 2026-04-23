@@ -17,8 +17,11 @@ const METRICS_PATH: &str = "/metrics";
 pub(crate) struct Metrics {
     _registry: prometheus::Registry,
     client_sessions: prometheus::IntGaugeVec,
+    account_client_sessions: prometheus::IntGaugeVec,
     inbound_traffic: prometheus::IntCounterVec,
     outbound_traffic: prometheus::IntCounterVec,
+    account_inbound_traffic: prometheus::IntCounterVec,
+    account_outbound_traffic: prometheus::IntCounterVec,
     outbound_tcp_sockets: prometheus::IntGauge,
     outbound_udp_sockets: prometheus::IntGauge,
 }
@@ -26,6 +29,13 @@ pub(crate) struct Metrics {
 pub(crate) struct ClientSessionsCounter {
     metrics: Arc<Metrics>,
     protocol: Protocol,
+}
+
+pub(crate) struct AccountClientSessionsCounter {
+    metrics: Arc<Metrics>,
+    username: String,
+    protocol: Protocol,
+    client_ip: String,
 }
 
 pub(crate) struct OutboundTcpSocketCounter {
@@ -47,6 +57,13 @@ impl Metrics {
                 registry,
             )
             .map_err(prometheus_to_io_error)?,
+            account_client_sessions: prometheus::register_int_gauge_vec_with_registry!(
+                "account_client_sessions",
+                "Number of active client sessions by authenticated account and client IP",
+                &["username", "protocol_type", "client_ip"],
+                registry,
+            )
+            .map_err(prometheus_to_io_error)?,
             inbound_traffic: prometheus::register_int_counter_vec_with_registry!(
                 "inbound_traffic_bytes",
                 "Total number of bytes uploaded by clients",
@@ -58,6 +75,20 @@ impl Metrics {
                 "outbound_traffic_bytes",
                 "Total number of bytes downloaded by clients",
                 &["protocol_type"],
+                registry,
+            )
+            .map_err(prometheus_to_io_error)?,
+            account_inbound_traffic: prometheus::register_int_counter_vec_with_registry!(
+                "account_inbound_traffic_bytes",
+                "Total number of bytes uploaded by authenticated account and client IP",
+                &["username", "protocol_type", "client_ip"],
+                registry,
+            )
+            .map_err(prometheus_to_io_error)?,
+            account_outbound_traffic: prometheus::register_int_counter_vec_with_registry!(
+                "account_outbound_traffic_bytes",
+                "Total number of bytes downloaded by authenticated account and client IP",
+                &["username", "protocol_type", "client_ip"],
                 registry,
             )
             .map_err(prometheus_to_io_error)?,
@@ -81,6 +112,15 @@ impl Metrics {
         ClientSessionsCounter::new(self, protocol)
     }
 
+    pub fn account_client_sessions_counter(
+        self: Arc<Self>,
+        username: String,
+        protocol: Protocol,
+        client_ip: String,
+    ) -> AccountClientSessionsCounter {
+        AccountClientSessionsCounter::new(self, username, protocol, client_ip)
+    }
+
     pub fn outbound_tcp_socket_counter(self: Arc<Self>) -> OutboundTcpSocketCounter {
         OutboundTcpSocketCounter::new(self)
     }
@@ -98,6 +138,30 @@ impl Metrics {
     pub fn add_outbound_bytes(&self, protocol: Protocol, n: usize) {
         self.outbound_traffic
             .with_label_values(&[protocol.as_str()])
+            .inc_by(n as u64);
+    }
+
+    pub fn add_account_inbound_bytes(
+        &self,
+        username: &str,
+        protocol: Protocol,
+        client_ip: &str,
+        n: usize,
+    ) {
+        self.account_inbound_traffic
+            .with_label_values(&[username, protocol.as_str(), client_ip])
+            .inc_by(n as u64);
+    }
+
+    pub fn add_account_outbound_bytes(
+        &self,
+        username: &str,
+        protocol: Protocol,
+        client_ip: &str,
+        n: usize,
+    ) {
+        self.account_outbound_traffic
+            .with_label_values(&[username, protocol.as_str(), client_ip])
             .inc_by(n as u64);
     }
 
@@ -129,6 +193,36 @@ impl Drop for ClientSessionsCounter {
         self.metrics
             .client_sessions
             .with_label_values(&[self.protocol.as_str()])
+            .dec();
+    }
+}
+
+impl AccountClientSessionsCounter {
+    fn new(
+        metrics: Arc<Metrics>,
+        username: String,
+        protocol: Protocol,
+        client_ip: String,
+    ) -> Self {
+        metrics
+            .account_client_sessions
+            .with_label_values(&[&username, protocol.as_str(), &client_ip])
+            .inc();
+
+        Self {
+            metrics,
+            username,
+            protocol,
+            client_ip,
+        }
+    }
+}
+
+impl Drop for AccountClientSessionsCounter {
+    fn drop(&mut self) {
+        self.metrics
+            .account_client_sessions
+            .with_label_values(&[&self.username, self.protocol.as_str(), &self.client_ip])
             .dec();
     }
 }

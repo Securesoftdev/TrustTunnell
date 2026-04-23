@@ -9,6 +9,8 @@ use crate::pipe::DuplexPipe;
 use crate::{
     authentication, core, datagram_pipe, downstream, forwarder, log_id, log_utils, pipe, udp_pipe,
 };
+use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
+use base64::Engine;
 use std::fmt::{Display, Formatter};
 use std::io;
 use std::io::ErrorKind;
@@ -131,14 +133,7 @@ impl Tunnel {
             let tls_domain = self.downstream.tls_domain().to_string();
             let authentication_policy = self.authentication_policy.clone();
             let log_id = self.id.clone();
-            let update_metrics = {
-                let metrics = context.metrics.clone();
-                let protocol = self.downstream.protocol();
-                move |direction, n| match direction {
-                    pipe::SimplexDirection::Incoming => metrics.add_inbound_bytes(protocol, n),
-                    pipe::SimplexDirection::Outgoing => metrics.add_outbound_bytes(protocol, n),
-                }
-            };
+            let protocol = self.downstream.protocol();
 
             // For proxy-basic connections, lazily acquire the connection slot on the first
             // authenticated request. This means the limit applies to active tunnels that have
@@ -258,7 +253,7 @@ impl Tunnel {
                             request,
                             forwarder_auth,
                             tls_domain,
-                            update_metrics,
+                            protocol,
                         )
                         .await
                         {
@@ -277,7 +272,7 @@ impl Tunnel {
                             request,
                             forwarder_auth,
                             tls_domain,
-                            update_metrics,
+                            protocol,
                         )
                         .await
                         {
@@ -296,13 +291,13 @@ impl Tunnel {
         }
     }
 
-    async fn on_tcp_connect_request<F: Fn(pipe::SimplexDirection, usize) + Send + Clone>(
+    async fn on_tcp_connect_request(
         context: Arc<core::Context>,
         forwarder: Arc<Mutex<Box<dyn Forwarder>>>,
         request: Box<dyn PendingTcpConnectRequest>,
         forwarder_auth: Option<authentication::Source<'static>>,
         tls_domain: String,
-        update_metrics: F,
+        protocol: crate::tls_demultiplexer::Protocol,
     ) -> Result<
         (),
         (
@@ -327,17 +322,20 @@ impl Tunnel {
             }
         };
 
+        let client_address = match request.client_address() {
+            Ok(x) => x,
+            Err(e) => {
+                return Err((
+                    Some(request),
+                    "Failed to get client address",
+                    ConnectionError::Io(e),
+                ))
+            }
+        };
+        let account_username = auth_username(&forwarder_auth);
+        let client_ip = client_address.to_string();
         let meta = forwarder::TcpConnectionMeta {
-            client_address: match request.client_address() {
-                Ok(x) => x,
-                Err(e) => {
-                    return Err((
-                        Some(request),
-                        "Failed to get client address",
-                        ConnectionError::Io(e),
-                    ))
-                }
-            },
+            client_address,
             destination,
             tls_domain,
             auth: forwarder_auth,
@@ -382,6 +380,33 @@ impl Tunnel {
             Err(e) => return Err((None, "Failed to complete request", ConnectionError::Io(e))),
         };
 
+        let _account_session_guard = account_username.as_ref().map(|username| {
+            context.metrics.clone().account_client_sessions_counter(
+                username.clone(),
+                protocol,
+                client_ip.clone(),
+            )
+        });
+        let update_metrics = {
+            let metrics = context.metrics.clone();
+            let username = account_username.clone();
+            let client_ip = client_ip.clone();
+            move |direction, n| match direction {
+                pipe::SimplexDirection::Incoming => {
+                    metrics.add_inbound_bytes(protocol, n);
+                    if let Some(username) = username.as_deref() {
+                        metrics.add_account_inbound_bytes(username, protocol, &client_ip, n);
+                    }
+                }
+                pipe::SimplexDirection::Outgoing => {
+                    metrics.add_outbound_bytes(protocol, n);
+                    if let Some(username) = username.as_deref() {
+                        metrics.add_account_outbound_bytes(username, protocol, &client_ip, n);
+                    }
+                }
+            }
+        };
+
         let mut pipe = DuplexPipe::new(
             (pipe::SimplexDirection::Outgoing, dstr_rx, fwd_tx),
             (pipe::SimplexDirection::Incoming, fwd_rx, dstr_tx),
@@ -404,13 +429,13 @@ impl Tunnel {
         }
     }
 
-    async fn on_datagram_mux_request<F: Fn(pipe::SimplexDirection, usize) + Send + Clone + Sync>(
+    async fn on_datagram_mux_request(
         context: Arc<core::Context>,
         forwarder: Arc<Mutex<Box<dyn Forwarder>>>,
         request: Box<dyn PendingDatagramMultiplexerRequest>,
         forwarder_auth: Option<authentication::Source<'static>>,
         tls_domain: String,
-        update_metrics: F,
+        protocol: crate::tls_demultiplexer::Protocol,
     ) -> Result<
         (),
         (
@@ -431,6 +456,8 @@ impl Tunnel {
             }
         };
         let user_agent = request.user_agent();
+        let account_username = auth_username(&forwarder_auth);
+        let client_ip = client_address.to_string();
 
         if let Some(auth) = &forwarder_auth {
             let authenticator = forwarder.lock().unwrap().datagram_mux_authenticator();
@@ -446,6 +473,33 @@ impl Tunnel {
                 return Err((Some(request), "Failed to authenticate", e));
             }
         }
+
+        let _account_session_guard = account_username.as_ref().map(|username| {
+            context.metrics.clone().account_client_sessions_counter(
+                username.clone(),
+                protocol,
+                client_ip.clone(),
+            )
+        });
+        let update_metrics = {
+            let metrics = context.metrics.clone();
+            let username = account_username.clone();
+            let client_ip = client_ip.clone();
+            move |direction, n| match direction {
+                pipe::SimplexDirection::Incoming => {
+                    metrics.add_inbound_bytes(protocol, n);
+                    if let Some(username) = username.as_deref() {
+                        metrics.add_account_inbound_bytes(username, protocol, &client_ip, n);
+                    }
+                }
+                pipe::SimplexDirection::Outgoing => {
+                    metrics.add_outbound_bytes(protocol, n);
+                    if let Some(username) = username.as_deref() {
+                        metrics.add_account_outbound_bytes(username, protocol, &client_ip, n);
+                    }
+                }
+            }
+        };
 
         let mut pipe: Box<dyn datagram_pipe::DuplexPipe> = match request.promote_to_next_state() {
             Ok(downstream::DatagramPipeHalves::Udp(dstr_source, dstr_sink)) => {
@@ -526,5 +580,21 @@ impl Tunnel {
                 ConnectionError::Io(e),
             )),
         }
+    }
+}
+
+fn auth_username(source: &Option<authentication::Source<'static>>) -> Option<String> {
+    let encoded = match source.as_ref()? {
+        authentication::Source::ProxyBasic(value) => value.as_ref(),
+        authentication::Source::Sni(value) => value.as_ref(),
+    };
+    let decoded = BASE64_ENGINE.decode(encoded.as_bytes()).ok()?;
+    let pair = String::from_utf8(decoded).ok()?;
+    let (username, _) = pair.split_once(':')?;
+    let username = username.trim();
+    if username.is_empty() {
+        None
+    } else {
+        Some(username.to_string())
     }
 }

@@ -17,9 +17,10 @@ use exporter::{EndpointExportOptions, EndpointLinkExporter};
 use legacy::lk_api::{
     Account, AccountExportPayload, HeartbeatPayload, HeartbeatStats, LkApiClient,
     NodeMetricsPayload, NodeMetadata, OnboardingPayload, SyncPayload, SyncReportPayload,
-    SyncResponse, TelemetryInfraPayload, TelemetryNodePayload, TelemetrySnapshotPayload,
-    DEFAULT_HEARTBEAT_PATH, DEFAULT_NODE_METRICS_PATH, DEFAULT_REGISTER_PATH,
-    DEFAULT_SYNC_PATH_TEMPLATE, DEFAULT_SYNC_REPORT_PATH, DEFAULT_TELEMETRY_SNAPSHOTS_PATH,
+    SyncResponse, TelemetryAccountActivityPayload, TelemetryInfraPayload, TelemetryNodePayload,
+    TelemetrySnapshotPayload, DEFAULT_HEARTBEAT_PATH, DEFAULT_NODE_METRICS_PATH,
+    DEFAULT_REGISTER_PATH, DEFAULT_SYNC_PATH_TEMPLATE, DEFAULT_SYNC_REPORT_PATH,
+    DEFAULT_TELEMETRY_SNAPSHOTS_PATH,
 };
 use link_config::LinkGenerationConfig;
 use lk_bulk_writer::{LkArtifactRecord, LkBulkWriter, LkWriteContract};
@@ -820,6 +821,7 @@ struct Agent {
 struct ObservabilityState {
     last_endpoint_traffic: Option<EndpointTrafficSample>,
     last_error_total: Option<ErrorTotalSample>,
+    last_system_cpu: Option<SystemCpuSample>,
 }
 
 #[derive(Clone, Debug)]
@@ -953,10 +955,33 @@ struct ErrorTotalSample {
 }
 
 #[derive(Clone, Debug)]
+struct SystemCpuSample {
+    idle: u64,
+    total: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SystemResourceSample {
+    cpu_percent: Option<f64>,
+    memory_percent: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
 struct EndpointMetricsSnapshot {
     active_connections: Option<u64>,
     inbound_bytes: Option<u64>,
     outbound_bytes: Option<u64>,
+    account_activity: Vec<EndpointAccountActivity>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct EndpointAccountActivity {
+    username: String,
+    protocol: String,
+    client_ip: String,
+    active_connections: u64,
+    inbound_bytes_total: u64,
+    outbound_bytes_total: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -972,6 +997,7 @@ struct ObservabilitySample {
     endpoint_metrics_url: Option<String>,
     endpoint_inbound_bytes: Option<u64>,
     endpoint_outbound_bytes: Option<u64>,
+    endpoint_account_activity: Vec<EndpointAccountActivity>,
     speedtest: SpeedtestSnapshot,
 }
 
@@ -2927,6 +2953,20 @@ impl Agent {
                 "last_error": speedtest_last_error,
             },
         });
+        let account_activity: Vec<TelemetryAccountActivityPayload<'_>> = sample
+            .endpoint_account_activity
+            .iter()
+            .map(|item| TelemetryAccountActivityPayload {
+                external_node_id: &self.cfg.node_external_id,
+                username: &item.username,
+                protocol: &item.protocol,
+                client_ip: &item.client_ip,
+                active_connections: item.active_connections,
+                inbound_bytes_total: item.inbound_bytes_total,
+                outbound_bytes_total: item.outbound_bytes_total,
+                observed_at: &snapshot_at,
+            })
+            .collect();
         let payload = TelemetrySnapshotPayload {
             source: "external",
             snapshot_at: &snapshot_at,
@@ -2941,10 +2981,14 @@ impl Agent {
                 }),
                 raw: Some(raw_payload),
             }],
+            account_activity,
         };
         println!(
-            "phase=telemetry_snapshot_sent node={} source=external active_connections={} bandwidth_mbps={}",
-            self.cfg.node_external_id, sample.active_connections, sample.bandwidth_mbps
+            "phase=telemetry_snapshot_sent node={} source=external active_connections={} bandwidth_mbps={} account_activity={}",
+            self.cfg.node_external_id,
+            sample.active_connections,
+            sample.bandwidth_mbps,
+            sample.endpoint_account_activity.len()
         );
         match self.lk_api.push_telemetry_snapshot(&payload).await {
             Ok(()) => {
@@ -3028,6 +3072,7 @@ impl Agent {
 
     async fn collect_observability_sample(&mut self) -> ObservabilitySample {
         let runtime_status = self.collect_runtime_status();
+        let system_resources = self.collect_system_resource_sample();
         let collected_at = chrono::Utc::now();
         let endpoint_metrics_url = self.resolve_endpoint_metrics_url().await;
         let endpoint_metrics = if let Some(url) = endpoint_metrics_url.as_deref() {
@@ -3096,8 +3141,12 @@ impl Agent {
         ObservabilitySample {
             collected_at,
             active_connections,
-            cpu_percent: runtime_status.cpu_percent,
-            memory_percent: runtime_status.memory_percent,
+            cpu_percent: system_resources
+                .cpu_percent
+                .unwrap_or(runtime_status.cpu_percent),
+            memory_percent: system_resources
+                .memory_percent
+                .unwrap_or(runtime_status.memory_percent),
             bandwidth_mbps,
             tunnel_establish_rate,
             error_rate,
@@ -3107,7 +3156,33 @@ impl Agent {
             endpoint_outbound_bytes: endpoint_metrics
                 .as_ref()
                 .and_then(|item| item.outbound_bytes),
+            endpoint_account_activity: endpoint_metrics
+                .as_ref()
+                .map(|item| item.account_activity.clone())
+                .unwrap_or_default(),
             speedtest,
+        }
+    }
+
+    fn collect_system_resource_sample(&mut self) -> SystemResourceSample {
+        let cpu_sample = read_system_cpu_sample();
+        let cpu_percent = cpu_sample.as_ref().and_then(|current| {
+            let previous = self.observability_state.last_system_cpu.as_ref()?;
+            let total_delta = current.total.saturating_sub(previous.total);
+            let idle_delta = current.idle.saturating_sub(previous.idle);
+            if total_delta == 0 {
+                return None;
+            }
+            let busy_delta = total_delta.saturating_sub(idle_delta);
+            Some(((busy_delta as f64 / total_delta as f64) * 100.0 * 100.0).round() / 100.0)
+        });
+        if let Some(sample) = cpu_sample {
+            self.observability_state.last_system_cpu = Some(sample);
+        }
+
+        SystemResourceSample {
+            cpu_percent,
+            memory_percent: read_system_memory_percent(),
         }
     }
 
@@ -3143,6 +3218,7 @@ impl Agent {
             active_connections: parse_prometheus_sum_metric(&body, "client_sessions"),
             inbound_bytes: parse_prometheus_sum_metric(&body, "inbound_traffic_bytes"),
             outbound_bytes: parse_prometheus_sum_metric(&body, "outbound_traffic_bytes"),
+            account_activity: parse_endpoint_account_activity_metrics(&body),
         })
     }
 
@@ -4574,6 +4650,134 @@ fn parse_prometheus_sum_metric(body: &str, metric_name: &str) -> Option<u64> {
     }
 }
 
+fn parse_endpoint_account_activity_metrics(body: &str) -> Vec<EndpointAccountActivity> {
+    let mut by_key: BTreeMap<(String, String, String), EndpointAccountActivity> = BTreeMap::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some(sample) = parse_prometheus_sample(trimmed) else {
+            continue;
+        };
+        if !matches!(
+            sample.name.as_str(),
+            "account_client_sessions"
+                | "account_inbound_traffic_bytes"
+                | "account_inbound_traffic_bytes_total"
+                | "account_outbound_traffic_bytes"
+                | "account_outbound_traffic_bytes_total"
+        ) {
+            continue;
+        }
+        let Some(username) = sample.labels.get("username").filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let protocol = sample
+            .labels
+            .get("protocol_type")
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        let client_ip = sample
+            .labels
+            .get("client_ip")
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        let key = (username.clone(), protocol.clone(), client_ip.clone());
+        let item = by_key.entry(key).or_insert_with(|| EndpointAccountActivity {
+            username: username.clone(),
+            protocol,
+            client_ip,
+            ..Default::default()
+        });
+        let value = sample.value.round().max(0.0) as u64;
+        match sample.name.as_str() {
+            "account_client_sessions" => item.active_connections = value,
+            "account_inbound_traffic_bytes" | "account_inbound_traffic_bytes_total" => {
+                item.inbound_bytes_total = value
+            }
+            "account_outbound_traffic_bytes" | "account_outbound_traffic_bytes_total" => {
+                item.outbound_bytes_total = value
+            }
+            _ => {}
+        }
+    }
+
+    by_key.into_values().collect()
+}
+
+struct PrometheusSample {
+    name: String,
+    labels: BTreeMap<String, String>,
+    value: f64,
+}
+
+fn parse_prometheus_sample(line: &str) -> Option<PrometheusSample> {
+    let (metric_part, value_part) = line.rsplit_once(' ')?;
+    let value = value_part.trim().parse::<f64>().ok()?;
+    let (name, labels) = if let Some((name, rest)) = metric_part.split_once('{') {
+        let labels = rest.strip_suffix('}')?;
+        (name, parse_prometheus_labels(labels))
+    } else {
+        (metric_part, BTreeMap::new())
+    };
+    Some(PrometheusSample {
+        name: name.trim().to_string(),
+        labels,
+        value,
+    })
+}
+
+fn parse_prometheus_labels(input: &str) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+    let mut key = String::new();
+    let mut value = String::new();
+    let mut in_key = true;
+    let mut in_quotes = false;
+    let mut escaped = false;
+
+    for ch in input.chars() {
+        if escaped {
+            if in_key {
+                key.push(ch);
+            } else {
+                value.push(ch);
+            }
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_quotes => escaped = true,
+            '"' => in_quotes = !in_quotes,
+            '=' if in_key && !in_quotes => in_key = false,
+            ',' if !in_quotes => {
+                let normalized_key = key.trim().to_string();
+                if !normalized_key.is_empty() {
+                    labels.insert(normalized_key, value.clone());
+                }
+                key.clear();
+                value.clear();
+                in_key = true;
+            }
+            _ => {
+                if in_key {
+                    key.push(ch);
+                } else {
+                    value.push(ch);
+                }
+            }
+        }
+    }
+
+    let normalized_key = key.trim().to_string();
+    if !normalized_key.is_empty() {
+        labels.insert(normalized_key, value);
+    }
+    labels
+}
+
 async fn derive_endpoint_metrics_url_from_config(config_path: &Path) -> Option<String> {
     let raw = fs::read_to_string(config_path).await.ok()?;
     let doc = raw.parse::<toml_edit::Document>().ok()?;
@@ -5215,6 +5419,54 @@ fn read_memory_percent(pid: u32) -> Option<f64> {
         return None;
     }
     Some((rss_kb / total_kb * 100.0 * 100.0).round() / 100.0)
+}
+
+fn read_system_cpu_sample() -> Option<SystemCpuSample> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    let cpu = stat.lines().find(|line| line.starts_with("cpu "))?;
+    let parts = cpu.split_whitespace().skip(1).collect::<Vec<_>>();
+    if parts.len() < 4 {
+        return None;
+    }
+    let values = parts
+        .iter()
+        .filter_map(|part| part.parse::<u64>().ok())
+        .collect::<Vec<_>>();
+    if values.len() < 4 {
+        return None;
+    }
+    let idle = values
+        .get(3)
+        .copied()
+        .unwrap_or(0)
+        .saturating_add(values.get(4).copied().unwrap_or(0));
+    let total = values.iter().copied().sum::<u64>();
+    Some(SystemCpuSample { idle, total })
+}
+
+fn read_system_memory_percent() -> Option<f64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let mut total_kb = None;
+    let mut available_kb = None;
+    for line in meminfo.lines() {
+        if line.starts_with("MemTotal:") {
+            total_kb = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse::<f64>().ok());
+        } else if line.starts_with("MemAvailable:") {
+            available_kb = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse::<f64>().ok());
+        }
+    }
+    let total_kb = total_kb?;
+    let available_kb = available_kb?;
+    if total_kb <= 0.0 {
+        return None;
+    }
+    Some((((total_kb - available_kb).max(0.0) / total_kb) * 100.0 * 100.0).round() / 100.0)
 }
 
 fn count_active_clients(credentials_file: &Path) -> Option<u64> {

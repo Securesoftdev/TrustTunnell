@@ -388,6 +388,8 @@ pub struct TelemetrySnapshotPayload<'a> {
     pub source: &'static str,
     pub snapshot_at: &'a str,
     pub node_telemetry: Vec<TelemetryNodePayload<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub account_activity: Vec<TelemetryAccountActivityPayload<'a>>,
 }
 
 #[derive(Serialize)]
@@ -406,6 +408,18 @@ pub struct TelemetryInfraPayload {
     pub memory_usage_percent: u64,
     pub bandwidth_mbps: u64,
     pub active_connections: u64,
+}
+
+#[derive(Serialize)]
+pub struct TelemetryAccountActivityPayload<'a> {
+    pub external_node_id: &'a str,
+    pub username: &'a str,
+    pub protocol: &'a str,
+    pub client_ip: &'a str,
+    pub active_connections: u64,
+    pub inbound_bytes_total: u64,
+    pub outbound_bytes_total: u64,
+    pub observed_at: &'a str,
 }
 
 impl<'a> OnboardingPayload<'a> {
