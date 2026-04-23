@@ -23,10 +23,11 @@ use crate::{
 use socket2::{Domain, Protocol as SockProtocol, SockRef, Socket, Type};
 use std::io;
 use std::io::ErrorKind;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch;
 
 #[derive(Debug)]
@@ -292,6 +293,21 @@ impl Core {
                 let context = self.context.clone();
                 let tls_listener = tls_listener.clone();
                 async move {
+                    let mut stream = stream;
+                    let client_ip = match Self::read_proxy_protocol_client_ip(&mut stream, client_addr)
+                        .await
+                    {
+                        Ok(ip) => ip,
+                        Err(e) => {
+                            log_id!(
+                                debug,
+                                client_id,
+                                "Failed to parse PROXY protocol header, using socket peer address: {}",
+                                e
+                            );
+                            net_utils::unmap_ipv6(client_addr.ip())
+                        }
+                    };
                     log_id!(trace, client_id, "Starting TLS handshake");
                     let handshake_timeout = context.settings.tls_handshake_timeout;
                     match tokio::time::timeout(handshake_timeout, tls_listener.listen(stream))
@@ -307,7 +323,7 @@ impl Core {
                             if let Err((client_id, message)) = Core::on_new_tls_connection(
                                 context.clone(),
                                 acceptor,
-                                net_utils::unmap_ipv6(client_addr.ip()),
+                                client_ip,
                                 client_id,
                             )
                             .await
@@ -320,6 +336,61 @@ impl Core {
                 }
             });
         }
+    }
+
+    async fn read_proxy_protocol_client_ip(
+        stream: &mut TcpStream,
+        fallback_addr: SocketAddr,
+    ) -> io::Result<IpAddr> {
+        const PROXY_PREFIX: &[u8] = b"PROXY";
+        const MAX_PROXY_LINE: usize = 108;
+
+        let mut prefix = [0_u8; 5];
+        let n = stream.peek(&mut prefix).await?;
+        if n < PROXY_PREFIX.len() || &prefix[..PROXY_PREFIX.len()] != PROXY_PREFIX {
+            return Ok(net_utils::unmap_ipv6(fallback_addr.ip()));
+        }
+
+        let mut line = Vec::with_capacity(MAX_PROXY_LINE);
+        while line.len() < MAX_PROXY_LINE {
+            let mut byte = [0_u8; 1];
+            stream.read_exact(&mut byte).await?;
+            line.push(byte[0]);
+            if byte[0] == b'\n' {
+                break;
+            }
+        }
+
+        if !line.ends_with(b"\r\n") {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "PROXY protocol header is not CRLF-terminated",
+            ));
+        }
+
+        let line = std::str::from_utf8(&line)
+            .map_err(|_| io::Error::new(ErrorKind::InvalidData, "PROXY header is not UTF-8"))?;
+        let mut parts = line.trim_end().split_whitespace();
+        let signature = parts.next();
+        let family = parts.next();
+        let source_ip = parts.next();
+        if signature != Some("PROXY") {
+            return Ok(net_utils::unmap_ipv6(fallback_addr.ip()));
+        }
+        if family == Some("UNKNOWN") {
+            return Ok(net_utils::unmap_ipv6(fallback_addr.ip()));
+        }
+
+        source_ip
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "PROXY source IP is missing"))?
+            .parse::<IpAddr>()
+            .map(net_utils::unmap_ipv6)
+            .map_err(|e| {
+                io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("invalid PROXY source IP: {e}"),
+                )
+            })
     }
 
     async fn listen_udp(&self) -> io::Result<()> {
