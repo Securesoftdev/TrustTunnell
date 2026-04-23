@@ -206,7 +206,7 @@ impl AccountClientSessionsCounter {
     ) -> Self {
         metrics
             .account_client_sessions
-            .with_label_values(&[&username, protocol.as_str(), &client_ip])
+            .with_label_values(&[username.as_str(), protocol.as_str(), client_ip.as_str()])
             .inc();
 
         Self {
@@ -222,7 +222,11 @@ impl Drop for AccountClientSessionsCounter {
     fn drop(&mut self) {
         self.metrics
             .account_client_sessions
-            .with_label_values(&[&self.username, self.protocol.as_str(), &self.client_ip])
+            .with_label_values(&[
+                self.username.as_str(),
+                self.protocol.as_str(),
+                self.client_ip.as_str(),
+            ])
             .dec();
     }
 }
