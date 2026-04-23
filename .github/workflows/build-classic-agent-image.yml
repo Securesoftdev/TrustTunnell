@@ -1,4 +1,4 @@
-name: Build classic agent image
+name: Build TrustTunnel runtime images
 
 on:
   push:
@@ -36,7 +36,7 @@ env:
   PUBLISH_NAMESPACE: ${{ github.repository_owner }}
 
 jobs:
-  classic-agent-image:
+  runtime-images:
     runs-on: ubuntu-latest
     if: github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'skipci:')
     permissions:
@@ -85,6 +85,16 @@ jobs:
             type=raw,value=run-${{ github.run_id }}-${{ github.run_attempt }}
             type=raw,value=latest,enable={{is_default_branch}}
 
+      - name: Extract endpoint image metadata
+        id: endpoint-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.PUBLISH_REGISTRY }}/${{ env.PUBLISH_NAMESPACE }}/trusttunnel-endpoint
+          tags: |
+            type=sha,format=short,prefix=
+            type=raw,value=run-${{ github.run_id }}-${{ github.run_attempt }}
+            type=raw,value=latest,enable={{is_default_branch}}
+
       - name: Build classic agent image
         id: classic-build
         uses: docker/build-push-action@v6
@@ -94,6 +104,19 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.classic-meta.outputs.tags }}
           labels: ${{ steps.classic-meta.outputs.labels }}
+          build-args: |
+            BUILD_GIT_SHA=${{ github.sha }}
+            BUILD_TIMESTAMP=${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Build endpoint image
+        id: endpoint-build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: trusttunnel-endpoint
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.endpoint-meta.outputs.tags }}
+          labels: ${{ steps.endpoint-meta.outputs.labels }}
           build-args: |
             BUILD_GIT_SHA=${{ github.sha }}
             BUILD_TIMESTAMP=${{ github.run_id }}-${{ github.run_attempt }}
@@ -108,4 +131,5 @@ jobs:
           fi
           if [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "classic-agent image digest=${{ steps.classic-build.outputs.digest }}"
+            echo "endpoint image digest=${{ steps.endpoint-build.outputs.digest }}"
           fi
