@@ -55,16 +55,15 @@ struct RespondStream {
 
 impl<IO> Http2Codec<IO>
 where
-    IO: AsyncRead + AsyncWrite + Unpin + net_utils::PeerAddr,
+    IO: AsyncRead + AsyncWrite + Unpin,
 {
     pub fn new(
         core_settings: Arc<Settings>,
         transport_stream: IO,
+        client_address: IpAddr,
         parent_id_chain: log_utils::IdChain<u64>,
     ) -> io::Result<Self> {
         let http2_settings = core_settings.listen_protocols.http2.as_ref().unwrap();
-
-        let client_address = transport_stream.peer_addr()?.ip();
 
         Ok(Self {
             state: State::Handshake(

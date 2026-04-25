@@ -575,6 +575,7 @@ impl Core {
                         tls_connection_meta.protocol,
                         core_settings,
                         stream,
+                        client_ip,
                         tunnel_id.clone(),
                     ) {
                         Ok(x) => x,
@@ -595,6 +596,7 @@ impl Core {
                         tls_connection_meta.protocol,
                         core_settings,
                         stream,
+                        client_ip,
                         client_id.clone(),
                     ) {
                         Ok(x) => x,
@@ -614,6 +616,7 @@ impl Core {
                         tls_connection_meta.protocol,
                         core_settings,
                         stream,
+                        client_ip,
                         client_id.clone(),
                     ) {
                         Ok(x) => x,
@@ -634,6 +637,7 @@ impl Core {
                         tls_connection_meta.protocol,
                         core_settings,
                         stream,
+                        client_ip,
                         client_id.clone(),
                     ) {
                         Ok(x) => x,
@@ -832,6 +836,7 @@ impl Core {
         protocol: tls_demultiplexer::Protocol,
         core_settings: Arc<Settings>,
         io: IO,
+        client_address: IpAddr,
         log_id: log_utils::IdChain<u64>,
     ) -> io::Result<Box<dyn HttpCodec>>
     where
@@ -839,10 +844,10 @@ impl Core {
     {
         match protocol {
             tls_demultiplexer::Protocol::Http1 => {
-                Ok(Box::new(Http1Codec::new(core_settings, io, log_id)))
+                Ok(Box::new(Http1Codec::new(core_settings, io, client_address, log_id)))
             }
             tls_demultiplexer::Protocol::Http2 => {
-                Ok(Box::new(Http2Codec::new(core_settings, io, log_id)?))
+                Ok(Box::new(Http2Codec::new(core_settings, io, client_address, log_id)?))
             }
             tls_demultiplexer::Protocol::Http3 => unreachable!(),
         }

@@ -19,6 +19,7 @@ pub(crate) const MAX_HEADERS_NUM: usize = 32;
 pub(crate) struct Http1Codec<IO> {
     state: State,
     transport_stream: IO,
+    client_address: IpAddr,
     /// Receives messages from [`StreamSink.download_tx`]
     download_rx: mpsc::Receiver<Bytes>,
     /// See [`StreamSink.download_tx`]
@@ -87,6 +88,7 @@ where
     pub fn new(
         core_settings: Arc<Settings>,
         transport_stream: IO,
+        client_address: IpAddr,
         parent_id_chain: log_utils::IdChain<u64>,
     ) -> Self {
         let (download_tx, download_rx) = mpsc::channel(1);
@@ -97,6 +99,7 @@ where
                 buffer: BytesMut::with_capacity(MAX_RAW_HEADERS_SIZE),
             }),
             transport_stream,
+            client_address,
             download_rx,
             download_tx: Some(download_tx),
             download_eof: Arc::new(Notify::new()),
@@ -158,7 +161,7 @@ where
                 Ok(RequestStatus::Complete(Box::new(Stream {
                     source: StreamSource {
                         request,
-                        client_address: self.transport_stream.peer_addr()?.ip(),
+                        client_address: self.client_address,
                         upload_rx: self.upload_rx.take().unwrap(),
                         id: id.clone(),
                     },

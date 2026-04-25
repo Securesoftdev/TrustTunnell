@@ -306,7 +306,13 @@ async fn handle_request(
     io: TcpStream,
     log_id: log_utils::IdChain<u64>,
 ) {
-    let mut codec = Http1Codec::new(context.settings.clone(), io, log_id.clone());
+    let client_address = io.peer_addr().map(|addr| addr.ip())?;
+    let mut codec = Http1Codec::new(
+        context.settings.clone(),
+        io,
+        client_address,
+        log_id.clone(),
+    );
     let timeout = context.settings.metrics.as_ref().unwrap().request_timeout;
     let stream = match tokio::time::timeout(timeout, codec.listen()).await {
         Ok(Ok(Some(x))) => {
