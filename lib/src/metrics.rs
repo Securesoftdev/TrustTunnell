@@ -306,7 +306,13 @@ async fn handle_request(
     io: TcpStream,
     log_id: log_utils::IdChain<u64>,
 ) {
-    let client_address = io.peer_addr().map(|addr| addr.ip())?;
+    let client_address = match io.peer_addr() {
+        Ok(addr) => addr.ip(),
+        Err(e) => {
+            log_id!(debug, log_id, "Failed to read client address: {}", e);
+            return;
+        }
+    };
     let mut codec = Http1Codec::new(
         context.settings.clone(),
         io,
