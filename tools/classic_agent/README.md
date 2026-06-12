@@ -9,6 +9,10 @@ inventory-driven sidecar synchronization.
 - Sidecar (`classic_agent`) is responsible for link inventory and sync.
 - `tt://` links are generated only via the endpoint export command
   (`trusttunnel_endpoint ... --format deeplink`), never by sidecar-side URI construction.
+- In the SecureSoft LK model, this sidecar exports the classic TT side of access.
+  LK may pair it with a separate Happ/Xray logical node on the same physical
+  `endpoint_ip`, but Windows/Android bootstrap still consumes only the `tt://`
+  artifact produced here.
 
 ## Sidecar modes
 

@@ -19,6 +19,11 @@
 > repost the full `tt://` inventory when the runtime plan is unchanged; full
 > export/write runs only on bootstrap, on changed reconcile plans, or on
 > explicit operator-forced regeneration.
+>
+> SecureSoft LK treats classic TT and Happ/Xray as two logical protocols that may
+> share one physical endpoint. This repository owns the classic TT `tt://` export;
+> LK pairs any Happ/Xray side by physical `endpoint_ip` and keeps it out of
+> Windows/Android bootstrap.
 
 ---
 
