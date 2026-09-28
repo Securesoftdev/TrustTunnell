@@ -13,7 +13,7 @@ clap = "4.5"
 console-subscriber = { version = "0.1.9", optional = true }
 hex = "0.4"
 log = "0.4.19"
-rustls = { version = "0.23.37", features = ["logging"] }
+rustls = { version = "0.23.45", features = ["logging"] }
 nix = { version = "0.28.0", features = ["resource"] }
 sentry = { version = "0.46.0", default-features = false, features = ["backtrace", "panic", "reqwest", "rustls", "contexts"] }
 tokio = { version = "1.42", features = ["rt-multi-thread", "signal"] }
