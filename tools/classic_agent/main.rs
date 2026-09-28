@@ -255,6 +255,7 @@ struct Config {
     runtime_entrypoint_ack_interval: Duration,
     runtime_entrypoint_ack_probe_timeout: Duration,
     runtime_entrypoint_id: Option<String>,
+    runtime_entrypoint_ack_targets: Vec<RuntimeEntrypointAckTarget>,
     access_pair_target_sync_enabled: bool,
     access_pair_target_sync_interval: Duration,
     access_pair_target_lease_seconds: u64,
@@ -628,6 +629,8 @@ impl Config {
             );
         }
         let runtime_entrypoint_id = optional_env_nonempty("TRUSTTUNNEL_ENTRYPOINT_ID");
+        let runtime_entrypoint_ack_targets =
+            parse_runtime_entrypoint_ack_targets_env("TRUSTTUNNEL_RUNTIME_ENTRYPOINT_ACK_TARGETS")?;
         let access_pair_target_sync_enabled =
             env_flag_enabled("TRUSTTUNNEL_ACCESS_PAIR_TARGET_SYNC_ENABLED");
         let access_pair_target_sync_interval =
@@ -784,6 +787,7 @@ impl Config {
             runtime_entrypoint_ack_interval,
             runtime_entrypoint_ack_probe_timeout,
             runtime_entrypoint_id,
+            runtime_entrypoint_ack_targets,
             access_pair_target_sync_enabled,
             access_pair_target_sync_interval,
             access_pair_target_lease_seconds,
@@ -4099,8 +4103,15 @@ impl Agent {
             }
         };
         let observed_at = chrono::Utc::now().to_rfc3339();
-        let observation =
-            match build_runtime_entrypoint_observation(&self.cfg, &link_cfg, &observed_at).await {
+        for target in runtime_entrypoint_ack_targets(&self.cfg, &link_cfg) {
+            let observation = match build_runtime_entrypoint_observation(
+                &self.cfg,
+                &link_cfg,
+                &target,
+                &observed_at,
+            )
+            .await
+            {
                 Ok(item) => item,
                 Err(err) => {
                     log_error(
@@ -4110,34 +4121,38 @@ impl Agent {
                         "probe_failed",
                         &err,
                     );
-                    return;
+                    continue;
                 }
             };
-        let payload = observation.as_payload();
-        println!(
-            "phase=runtime_entrypoint_ack_sent node={} entrypoint={} observed={}:{} bind_scope={} listen_ok={}",
-            self.cfg.node_external_id,
-            observation.entrypoint_id.as_deref().unwrap_or("<unknown>"),
-            observation.observed_host,
-            observation.observed_port,
-            observation.bind_scope,
-            observation.listen_ok
-        );
-        match self.lk_api.push_runtime_entrypoint_ack(&payload).await {
-            Ok(()) => {
-                println!(
-                    "phase=runtime_entrypoint_ack_accepted node={} ack_id={} listen_ok={}",
-                    self.cfg.node_external_id, observation.ack_id, observation.listen_ok
-                );
-            }
-            Err(err) => {
-                log_error(
-                    self.state.applied_revision.as_deref().unwrap_or("none"),
-                    &self.cfg.node_external_id,
-                    "runtime_entrypoint_ack_push_failed",
-                    "lk_api_error",
-                    &err,
-                );
+            let payload = observation.as_payload();
+            println!(
+                "phase=runtime_entrypoint_ack_sent node={} entrypoint={} observed={}:{} bind_scope={} listen_ok={}",
+                self.cfg.node_external_id,
+                observation.entrypoint_id.as_deref().unwrap_or("<unknown>"),
+                observation.observed_host,
+                observation.observed_port,
+                observation.bind_scope,
+                observation.listen_ok
+            );
+            match self.lk_api.push_runtime_entrypoint_ack(&payload).await {
+                Ok(()) => {
+                    println!(
+                        "phase=runtime_entrypoint_ack_accepted node={} ack_id={} entrypoint={} listen_ok={}",
+                        self.cfg.node_external_id,
+                        observation.ack_id,
+                        observation.entrypoint_id.as_deref().unwrap_or("<unknown>"),
+                        observation.listen_ok
+                    );
+                }
+                Err(err) => {
+                    log_error(
+                        self.state.applied_revision.as_deref().unwrap_or("none"),
+                        &self.cfg.node_external_id,
+                        "runtime_entrypoint_ack_push_failed",
+                        "lk_api_error",
+                        &err,
+                    );
+                }
             }
         }
     }
@@ -5291,6 +5306,22 @@ struct PendingRouteActionAck {
     occurred_at: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RuntimeEntrypointAckTarget {
+    entrypoint_id: Option<String>,
+    observed_host: String,
+    observed_port: u16,
+}
+
+impl RuntimeEntrypointAckTarget {
+    fn label(&self) -> String {
+        self.entrypoint_id
+            .as_deref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("{}:{}", self.observed_host, self.observed_port))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct RuntimeEntrypointObservation {
     ack_id: String,
@@ -5543,10 +5574,11 @@ struct SpeedtestProbeFailure {
 async fn build_runtime_entrypoint_observation(
     cfg: &Config,
     link_cfg: &LinkGenerationConfig,
+    target: &RuntimeEntrypointAckTarget,
     observed_at: &str,
 ) -> Result<RuntimeEntrypointObservation, String> {
-    let observed_host = link_cfg.address_host();
-    let observed_port = link_cfg.port().unwrap_or(443);
+    let observed_host = target.observed_host.clone();
+    let observed_port = target.observed_port;
     let listen = load_runtime_listen_observation(
         &cfg.trusttunnel_config_file,
         &observed_host,
@@ -5564,11 +5596,8 @@ async fn build_runtime_entrypoint_observation(
         false
     };
     let listen_ok = listen.bind_covers_advertised_endpoint && probe_ok;
-    let entrypoint_id = cfg.runtime_entrypoint_id.clone();
-    let fallback_entrypoint_label = link_cfg.server_address();
-    let entrypoint_label = entrypoint_id
-        .as_deref()
-        .unwrap_or(fallback_entrypoint_label.as_str());
+    let entrypoint_id = target.entrypoint_id.clone();
+    let entrypoint_label = target.label();
     let runtime_id = format!(
         "classic_agent:{}:{}",
         cfg.node_external_id, entrypoint_label
@@ -5611,6 +5640,24 @@ async fn build_runtime_entrypoint_observation(
         evidence,
         last_ack_at: observed_at.to_string(),
     })
+}
+
+fn runtime_entrypoint_ack_targets(
+    cfg: &Config,
+    link_cfg: &LinkGenerationConfig,
+) -> Vec<RuntimeEntrypointAckTarget> {
+    let mut targets = vec![RuntimeEntrypointAckTarget {
+        entrypoint_id: cfg.runtime_entrypoint_id.clone(),
+        observed_host: link_cfg.address_host(),
+        observed_port: link_cfg.port().unwrap_or(443),
+    }];
+    for target in &cfg.runtime_entrypoint_ack_targets {
+        if targets.iter().any(|existing| existing == target) {
+            continue;
+        }
+        targets.push(target.clone());
+    }
+    targets
 }
 
 async fn load_runtime_listen_observation(
@@ -7374,6 +7421,43 @@ fn split_host_port(raw: &str) -> Result<(String, u16), String> {
     ))
 }
 
+fn parse_runtime_entrypoint_ack_targets_env(
+    name: &str,
+) -> Result<Vec<RuntimeEntrypointAckTarget>, String> {
+    let Some(raw) = optional_env_nonempty(name) else {
+        return Ok(Vec::new());
+    };
+    raw.split(';')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| parse_runtime_entrypoint_ack_target(name, item))
+        .collect()
+}
+
+fn parse_runtime_entrypoint_ack_target(
+    name: &str,
+    raw: &str,
+) -> Result<RuntimeEntrypointAckTarget, String> {
+    let (entrypoint_id, endpoint) = if let Some((id, endpoint)) = raw.split_once('=') {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(format!(
+                "{name} contains target with empty entrypoint id: {raw}"
+            ));
+        }
+        (Some(id.to_string()), endpoint.trim())
+    } else {
+        (None, raw.trim())
+    };
+    let (observed_host, observed_port) =
+        split_host_port(endpoint).map_err(|err| format!("{name} target {raw}: {err}"))?;
+    Ok(RuntimeEntrypointAckTarget {
+        entrypoint_id,
+        observed_host,
+        observed_port,
+    })
+}
+
 fn should_import_bootstrap_credentials(
     has_bootstrap_source: bool,
     runtime_primary_marker_exists: bool,
@@ -8002,6 +8086,7 @@ message_queue_capacity = 4096
             runtime_entrypoint_ack_interval: DEFAULT_RUNTIME_ENTRYPOINT_ACK_INTERVAL,
             runtime_entrypoint_ack_probe_timeout: DEFAULT_RUNTIME_ENTRYPOINT_ACK_PROBE_TIMEOUT,
             runtime_entrypoint_id: None,
+            runtime_entrypoint_ack_targets: Vec::new(),
             access_pair_target_sync_enabled: false,
             access_pair_target_sync_interval: DEFAULT_ACCESS_PAIR_TARGET_SYNC_INTERVAL,
             access_pair_target_lease_seconds: DEFAULT_ACCESS_PAIR_TARGET_LEASE_SECONDS,
@@ -8080,6 +8165,7 @@ message_queue_capacity = 4096
             runtime_entrypoint_ack_interval: DEFAULT_RUNTIME_ENTRYPOINT_ACK_INTERVAL,
             runtime_entrypoint_ack_probe_timeout: DEFAULT_RUNTIME_ENTRYPOINT_ACK_PROBE_TIMEOUT,
             runtime_entrypoint_id: entrypoint_id.map(ToString::to_string),
+            runtime_entrypoint_ack_targets: Vec::new(),
             access_pair_target_sync_enabled: false,
             access_pair_target_sync_interval: DEFAULT_ACCESS_PAIR_TARGET_SYNC_INTERVAL,
             access_pair_target_lease_seconds: DEFAULT_ACCESS_PAIR_TARGET_LEASE_SECONDS,
@@ -8222,6 +8308,7 @@ upload_buffer_size = 32768
             runtime_entrypoint_ack_interval: DEFAULT_RUNTIME_ENTRYPOINT_ACK_INTERVAL,
             runtime_entrypoint_ack_probe_timeout: DEFAULT_RUNTIME_ENTRYPOINT_ACK_PROBE_TIMEOUT,
             runtime_entrypoint_id: None,
+            runtime_entrypoint_ack_targets: Vec::new(),
             access_pair_target_sync_enabled: false,
             access_pair_target_sync_interval: DEFAULT_ACCESS_PAIR_TARGET_SYNC_INTERVAL,
             access_pair_target_lease_seconds: DEFAULT_ACCESS_PAIR_TARGET_LEASE_SECONDS,
@@ -8497,6 +8584,7 @@ upload_buffer_size = 32768
             runtime_entrypoint_ack_interval: DEFAULT_RUNTIME_ENTRYPOINT_ACK_INTERVAL,
             runtime_entrypoint_ack_probe_timeout: DEFAULT_RUNTIME_ENTRYPOINT_ACK_PROBE_TIMEOUT,
             runtime_entrypoint_id: None,
+            runtime_entrypoint_ack_targets: Vec::new(),
             access_pair_target_sync_enabled: false,
             access_pair_target_sync_interval: DEFAULT_ACCESS_PAIR_TARGET_SYNC_INTERVAL,
             access_pair_target_lease_seconds: DEFAULT_ACCESS_PAIR_TARGET_LEASE_SECONDS,
@@ -8624,6 +8712,7 @@ upload_buffer_size = 32768
             runtime_entrypoint_ack_interval: DEFAULT_RUNTIME_ENTRYPOINT_ACK_INTERVAL,
             runtime_entrypoint_ack_probe_timeout: DEFAULT_RUNTIME_ENTRYPOINT_ACK_PROBE_TIMEOUT,
             runtime_entrypoint_id: None,
+            runtime_entrypoint_ack_targets: Vec::new(),
             access_pair_target_sync_enabled: false,
             access_pair_target_sync_interval: DEFAULT_ACCESS_PAIR_TARGET_SYNC_INTERVAL,
             access_pair_target_lease_seconds: DEFAULT_ACCESS_PAIR_TARGET_LEASE_SECONDS,
@@ -8735,6 +8824,7 @@ upload_buffer_size = 32768
             runtime_entrypoint_ack_interval: DEFAULT_RUNTIME_ENTRYPOINT_ACK_INTERVAL,
             runtime_entrypoint_ack_probe_timeout: DEFAULT_RUNTIME_ENTRYPOINT_ACK_PROBE_TIMEOUT,
             runtime_entrypoint_id: None,
+            runtime_entrypoint_ack_targets: Vec::new(),
             access_pair_target_sync_enabled: false,
             access_pair_target_sync_interval: DEFAULT_ACCESS_PAIR_TARGET_SYNC_INTERVAL,
             access_pair_target_lease_seconds: DEFAULT_ACCESS_PAIR_TARGET_LEASE_SECONDS,
@@ -8959,6 +9049,7 @@ upload_buffer_size = 32768
             runtime_entrypoint_ack_interval: DEFAULT_RUNTIME_ENTRYPOINT_ACK_INTERVAL,
             runtime_entrypoint_ack_probe_timeout: DEFAULT_RUNTIME_ENTRYPOINT_ACK_PROBE_TIMEOUT,
             runtime_entrypoint_id: None,
+            runtime_entrypoint_ack_targets: Vec::new(),
             access_pair_target_sync_enabled: false,
             access_pair_target_sync_interval: DEFAULT_ACCESS_PAIR_TARGET_SYNC_INTERVAL,
             access_pair_target_lease_seconds: DEFAULT_ACCESS_PAIR_TARGET_LEASE_SECONDS,
@@ -9945,6 +10036,7 @@ upload_buffer_size = 32768
             runtime_entrypoint_ack_interval: DEFAULT_RUNTIME_ENTRYPOINT_ACK_INTERVAL,
             runtime_entrypoint_ack_probe_timeout: DEFAULT_RUNTIME_ENTRYPOINT_ACK_PROBE_TIMEOUT,
             runtime_entrypoint_id: None,
+            runtime_entrypoint_ack_targets: Vec::new(),
             access_pair_target_sync_enabled: false,
             access_pair_target_sync_interval: DEFAULT_ACCESS_PAIR_TARGET_SYNC_INTERVAL,
             access_pair_target_lease_seconds: DEFAULT_ACCESS_PAIR_TARGET_LEASE_SECONDS,
@@ -11063,6 +11155,22 @@ upload_buffer_size = 32768
         assert!(err.contains("host:port or [ipv6]:port"));
     }
 
+    #[test]
+    fn parses_runtime_entrypoint_ack_target_with_colon_in_id() {
+        let target = parse_runtime_entrypoint_ack_target(
+            "TRUSTTUNNEL_RUNTIME_ENTRYPOINT_ACK_TARGETS",
+            "infra-b-tt:rescue-ip-80-85-247-253=80.85.247.253:443",
+        )
+        .unwrap();
+
+        assert_eq!(
+            target.entrypoint_id.as_deref(),
+            Some("infra-b-tt:rescue-ip-80-85-247-253")
+        );
+        assert_eq!(target.observed_host, "80.85.247.253");
+        assert_eq!(target.observed_port, 443);
+    }
+
     #[tokio::test]
     async fn runtime_entrypoint_observation_reports_live_specific_ip_listener() {
         let tmp_dir = TempDir::new().unwrap();
@@ -11087,8 +11195,12 @@ upload_buffer_size = 32768
         .unwrap();
         let cfg = runtime_ack_test_config(&runtime_dir, &config_path, Some("entrypoint-a"));
 
+        let target = runtime_entrypoint_ack_targets(&cfg, &link_cfg)
+            .into_iter()
+            .next()
+            .unwrap();
         let observation =
-            build_runtime_entrypoint_observation(&cfg, &link_cfg, "2026-08-13T12:00:00Z")
+            build_runtime_entrypoint_observation(&cfg, &link_cfg, &target, "2026-08-13T12:00:00Z")
                 .await
                 .unwrap();
 
@@ -11100,6 +11212,56 @@ upload_buffer_size = 32768
             observation.as_payload().contract_version,
             "entrypoint_runtime_ack.v1"
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_entrypoint_ack_targets_include_link_config_and_extra_targets() {
+        let tmp_dir = TempDir::new().unwrap();
+        let runtime_dir = tmp_dir.path().join("runtime");
+        fs::create_dir_all(&runtime_dir).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let _accept_task = tokio::spawn(async move {
+            loop {
+                let Ok(_) = listener.accept().await else {
+                    break;
+                };
+            }
+        });
+        let config_path = runtime_dir.join("vpn.toml");
+        fs::write(
+            &config_path,
+            format!("listen_address = \"{}\"\n", listen_addr),
+        )
+        .await
+        .unwrap();
+        let link_cfg = toml::from_str::<LinkGenerationConfig>(&format!(
+            "node_external_id = \"node-1\"\naddress_host = \"127.0.0.1\"\nport = {}\ncert_domain = \"node-1.example\"\ncustom_sni = \"node-1.example\"\nprotocol = \"http2\"\n",
+            listen_addr.port()
+        ))
+        .unwrap();
+        let mut cfg = runtime_ack_test_config(&runtime_dir, &config_path, Some("entrypoint-a"));
+        cfg.runtime_entrypoint_ack_targets = vec![RuntimeEntrypointAckTarget {
+            entrypoint_id: Some("entrypoint-b".to_string()),
+            observed_host: "127.0.0.1".to_string(),
+            observed_port: listen_addr.port(),
+        }];
+
+        let targets = runtime_entrypoint_ack_targets(&cfg, &link_cfg);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].entrypoint_id.as_deref(), Some("entrypoint-a"));
+        assert_eq!(targets[1].entrypoint_id.as_deref(), Some("entrypoint-b"));
+
+        let observation = build_runtime_entrypoint_observation(
+            &cfg,
+            &link_cfg,
+            &targets[1],
+            "2026-08-13T12:00:00Z",
+        )
+        .await
+        .unwrap();
+        assert!(observation.listen_ok);
+        assert_eq!(observation.entrypoint_id.as_deref(), Some("entrypoint-b"));
     }
 
     #[tokio::test]
@@ -11117,8 +11279,12 @@ upload_buffer_size = 32768
         .unwrap();
         let cfg = runtime_ack_test_config(&runtime_dir, &config_path, None);
 
+        let target = runtime_entrypoint_ack_targets(&cfg, &link_cfg)
+            .into_iter()
+            .next()
+            .unwrap();
         let observation =
-            build_runtime_entrypoint_observation(&cfg, &link_cfg, "2026-08-13T12:00:00Z")
+            build_runtime_entrypoint_observation(&cfg, &link_cfg, &target, "2026-08-13T12:00:00Z")
                 .await
                 .unwrap();
 
@@ -11283,6 +11449,7 @@ upload_buffer_size = 32768
             runtime_entrypoint_ack_interval: DEFAULT_RUNTIME_ENTRYPOINT_ACK_INTERVAL,
             runtime_entrypoint_ack_probe_timeout: DEFAULT_RUNTIME_ENTRYPOINT_ACK_PROBE_TIMEOUT,
             runtime_entrypoint_id: None,
+            runtime_entrypoint_ack_targets: Vec::new(),
             access_pair_target_sync_enabled: false,
             access_pair_target_sync_interval: DEFAULT_ACCESS_PAIR_TARGET_SYNC_INTERVAL,
             access_pair_target_lease_seconds: DEFAULT_ACCESS_PAIR_TARGET_LEASE_SECONDS,

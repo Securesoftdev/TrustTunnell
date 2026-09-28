@@ -161,6 +161,7 @@ Optional:
 - `TRUSTTUNNEL_RUNTIME_ENTRYPOINT_ACK_INTERVAL_SEC` (default `30`)
 - `TRUSTTUNNEL_RUNTIME_ENTRYPOINT_ACK_PROBE_TIMEOUT_SEC` (default `2`)
 - `TRUSTTUNNEL_ENTRYPOINT_ID` (optional stable LK entrypoint id, for example `infra-b-tt:rescue-ip-80-85-247-253`)
+- `TRUSTTUNNEL_RUNTIME_ENTRYPOINT_ACK_TARGETS` (optional semicolon-separated additional ACK targets in `entrypoint_id=host:port` format; use `[ipv6]:port` for IPv6)
 - `LK_RUNTIME_ENTRYPOINT_ACK_PATH` (default `/internal/trusttunnel/v1/nodes/runtime-entrypoint-acks`)
 - `TRUSTTUNNEL_ACCESS_PAIR_TARGET_SYNC_ENABLED` (default `false`; enables LK access-pair target lease polling and ACK delivery)
 - `TRUSTTUNNEL_ACCESS_PAIR_TARGET_SYNC_INTERVAL_SEC` (default `10`)
@@ -220,6 +221,9 @@ Runtime entrypoint ACK is opt-in. With
 local TCP connect probe to the advertised host/port, and posts
 `entrypoint_runtime_ack.v1` to LK. This ACK is evidence only; LK decides whether
 an entrypoint can be used for route actions or rescue failover.
+`TRUSTTUNNEL_RUNTIME_ENTRYPOINT_ACK_TARGETS` lets one sidecar also ACK
+additional public entrypoints that share the same runtime listener, for example
+`infra-b-tt:main=5.35.37.242:443;infra-b-tt:rescue=80.85.247.253:443`.
 
 Access-pair target sync is opt-in. With
 `TRUSTTUNNEL_ACCESS_PAIR_TARGET_SYNC_ENABLED=true`, `classic_agent` leases
