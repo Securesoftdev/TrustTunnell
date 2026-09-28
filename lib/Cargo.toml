@@ -34,7 +34,7 @@ prometheus = { version = "0.14", features = ["process"] }
 quiche = { version = "0.24.5", features = ["qlog", "boringssl-boring-crate"] }
 rand = "0.8"
 ring = "0.17.12"
-rustls = { version = "0.23.37", features = ["logging"] }
+rustls = { version = "0.23.45", features = ["logging"] }
 rustls-native-certs = "0.7"
 rustls-pki-types = "1.13.2"
 serde = "1.0.164"
@@ -49,7 +49,7 @@ trusttunnel-deeplink = { path = "../deeplink" }
 
 [dev-dependencies]
 hyper = { version = "0.14.26", features = ["http1", "http2", "client", "server", "runtime", "stream"] }
-rustls = { version = "0.23.37", features = ["logging"] }
+rustls = { version = "0.23.45", features = ["logging"] }
 tempfile = "3"
 
 [features]

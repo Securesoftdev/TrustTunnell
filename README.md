@@ -592,6 +592,7 @@ Optional:
 - `TRUSTTUNNEL_RUNTIME_ENTRYPOINT_ACK_INTERVAL_SEC` (default `30`)
 - `TRUSTTUNNEL_RUNTIME_ENTRYPOINT_ACK_PROBE_TIMEOUT_SEC` (default `2`)
 - `TRUSTTUNNEL_ENTRYPOINT_ID` (optional stable LK entrypoint id)
+- `TRUSTTUNNEL_RUNTIME_ENTRYPOINT_ACK_TARGETS` (optional semicolon-separated additional ACK targets in `entrypoint_id=host:port` format)
 - `LK_RUNTIME_ENTRYPOINT_ACK_PATH` (default `/internal/trusttunnel/v1/nodes/runtime-entrypoint-acks`)
 - `TRUSTTUNNEL_ACCESS_PAIR_TARGET_SYNC_ENABLED` (default `false`; enables LK access-pair target lease polling and ACK delivery)
 - `TRUSTTUNNEL_ACCESS_PAIR_TARGET_SYNC_INTERVAL_SEC` (default `10`)

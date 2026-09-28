@@ -3,6 +3,7 @@
 ## 1.0.28
 
 - [Fix] `allow_private_network_connections = false` no longer blocks the configured `[reverse_proxy]` origin; private client destinations remain forbidden.
+- [Fix] `classic_agent` runtime entrypoint ACK can now cover multiple configured public entrypoints from one sidecar via `TRUSTTUNNEL_RUNTIME_ENTRYPOINT_ACK_TARGETS`, so LK can validate rescue and alternate IPs instead of only the primary `tt-link.toml` address.
 - [Fix] `classic_agent` route action ACKs now report `apply_drain` as `applied` only after a configured drain hook exits successfully; missing hooks are reported as `skipped` with `drain_hook_not_configured`.
 - [Feature] `classic_agent` can now opt into LK access-pair target lease polling and ACK delivery, reporting `applied` only after signed-auth keyring readiness or validated registry credential materialization.
 - [Feature] `classic_agent` can now opt into `entrypoint_runtime_ack.v1` delivery, proving the advertised TT host/port is covered by the runtime bind and local TCP listener probe before LK uses it for rescue route actions.
